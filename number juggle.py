@@ -2,6 +2,7 @@ import re
 import sys
 
 # Uses: py -m pip install --user ortools make sure to install that before trying to run this code
+
 # ============================================================
 # ALIASES
 # ============================================================
@@ -13,6 +14,11 @@ ALIASES = {
 def norm(s):
     key = re.sub(r"\s+", "", s).upper()
     return ALIASES.get(key, key)
+
+# ============================================================
+# SETTINGS
+# ============================================================
+MIN_WEIGHT = 4   # No item in any bundle may be assigned less than this
 
 # ============================================================
 # SOLVER 1: OR-Tools CP-SAT (preferred — fast + complete)
@@ -28,17 +34,23 @@ def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
     Solve using Google OR-Tools CP-SAT.
     Returns a list of bundle assignments in the same format as the recursive solver,
     or None if no solution exists.
+    Every item in every bundle must be >= MIN_WEIGHT.
     """
     model = cp_model.CpModel()
+
+    # Smallest allowed value that is both >= MIN_WEIGHT and a multiple of step
+    min_units = -(-MIN_WEIGHT // step)   # ceiling division
 
     # Decision variable for each (bundle, item) pair: integer count of `step` units.
     x = {}
     for bi, b in enumerate(bundles):
         for it in b["items"]:
             max_units = min(remaining[it] // step, b["total"] // step)
-            if max_units < 0:
-                max_units = 0
-            x[(bi, it)] = model.NewIntVar(0, max_units, f"x_{bi}_{it}")
+            if max_units < min_units:
+                # This item can't reach the minimum in this bundle.
+                # The whole bundle+step combination is infeasible.
+                return None
+            x[(bi, it)] = model.NewIntVar(min_units, max_units, f"x_{bi}_{it}")
 
     # Each bundle's assigned weights must sum exactly to its total
     for bi, b in enumerate(bundles):
@@ -87,26 +99,29 @@ ITER_LIMIT = 500_000
 _iter_count = 0
 _partition_cache = {}
 
-def partitions_capped_uncached(total, caps, step):
+def partitions_capped_uncached(total, caps, step, min_weight=MIN_WEIGHT):
     k = len(caps)
+    # Smallest multiple of step that is >= min_weight
+    floor = ((min_weight + step - 1) // step) * step
+
     if k == 1:
-        if step <= total <= caps[0] and total % step == 0:
+        if floor <= total <= caps[0] and total % step == 0:
             yield (total,)
         return
-    lo = step
-    hi = min(caps[0], total - step * (k - 1))
+    lo = floor
+    hi = min(caps[0], total - floor * (k - 1))
     if hi < lo:
         return
     for first in range(lo, hi + 1, step):
-        for rest in partitions_capped_uncached(total - first, caps[1:], step):
+        for rest in partitions_capped_uncached(total - first, caps[1:], step, min_weight):
             yield (first,) + rest
 
-def partitions_capped_cached(total, caps, step):
-    key = (total, tuple(caps), step)
+def partitions_capped_cached(total, caps, step, min_weight=MIN_WEIGHT):
+    key = (total, tuple(caps), step, min_weight)
     cached = _partition_cache.get(key)
     if cached is not None:
         return cached
-    result = tuple(partitions_capped_uncached(total, caps, step))
+    result = tuple(partitions_capped_uncached(total, caps, step, min_weight))
     _partition_cache[key] = result
     return result
 
@@ -257,12 +272,26 @@ if result is None:
     print("\nNo solution found.")
     sys.exit()
 
+# --- Reject any solution with a weight below the effective minimum ---
+effective_min = ((MIN_WEIGHT + used_step - 1) // used_step) * used_step
+bad = []
+for b in result:
+    for it, w in b["weights"].items():
+        if w < effective_min:
+            bad.append((b["load"], it, w))
+if bad:
+    print(f"\n[!] Solver returned weights below the minimum of {effective_min}:")
+    for load, it, w in bad:
+        print(f"    Load {load}: {display.get(it, it)} = {w}")
+    print("    Rejecting solution.")
+    sys.exit()
+
 all_bundles = locked + result
 
 # ============================================================
 # Print
 # ============================================================
-print(f"\n=== SOLUTION ===\n")
+print(f"\n=== SOLUTION (minimum weight {MIN_WEIGHT}, multiples of {used_step}) ===\n")
 
 per_load = {}
 item_totals = {k: 0 for k in totals}
