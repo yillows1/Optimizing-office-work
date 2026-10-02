@@ -1,22 +1,15 @@
 import win32com.client
 import os
 import io
-import json
 import tempfile
 import re
 import difflib
-import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
 
-stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
-if callable(stdout_reconfigure):
-    stdout_reconfigure(errors="replace")
-
 # --- Config ---
 LIST_FILE = "receivedList.txt"
-LOG_FILE = os.environ.get("SCAN_RESULTS_OUTPUT", "scan_results.txt")
-JSON_RESULTS_FILE = os.environ.get("SCAN_RESULTS_JSON")
+LOG_FILE = "scan_results.txt"
 
 # Fuzzy matching settings
 FUZZY_ENABLED = True       # set to False to disable near-miss detection
@@ -24,19 +17,13 @@ FUZZY_THRESHOLD = 0.85    # 0.0 = anything, 1.0 = exact. 0.85 ~ "one char off"
 FUZZY_MIN_LEN = 6          # skip fuzzy matching for terms shorter than this
 
 # --- Load search terms ---
-SEARCH_TERMS = [
-    term.strip()
-    for term in os.environ.get("SCAN_SEARCH_TERMS", "").splitlines()
-    if term.strip()
-]
-if not SEARCH_TERMS:
-    if not os.path.exists(LIST_FILE):
-        print(f"Could not find {LIST_FILE} in the current folder.")
-        input("Press Enter to exit...")
-        exit(1)
+if not os.path.exists(LIST_FILE):
+    print(f"Could not find {LIST_FILE} in the current folder.")
+    input("Press Enter to exit...")
+    exit(1)
 
-    with open(LIST_FILE, "r", encoding="utf-8") as f:
-        SEARCH_TERMS = [line.strip() for line in f if line.strip()]
+with open(LIST_FILE, "r", encoding="utf-8") as f:
+    SEARCH_TERMS = [line.strip() for line in f if line.strip()]
 
 if not SEARCH_TERMS:
     print(f"{LIST_FILE} is empty.")
@@ -87,8 +74,6 @@ fuzzy_by_email = defaultdict(lambda: defaultdict(set))
 found_terms = set()
 scanned_count = 0
 skipped_count = 0
-gui_exact_matches = []
-gui_near_matches = []
 
 def read_attachment_bytes(attachment):
     try:
@@ -136,47 +121,6 @@ def find_terms_in_text(text):
         return set()
     lowered = text.lower()
     return {term for term in SEARCH_TERMS if term.lower() in lowered}
-
-RITM_RE = re.compile(r"\bRITM[\s:#-]*\d+\b", re.IGNORECASE)
-
-def find_ritms_in_text(text):
-    return sorted({
-        re.sub(r"[^A-Za-z0-9]", "", match).upper()
-        for match in RITM_RE.findall(text or "")
-    })
-
-def find_location_address_in_text(text):
-    lines = (text or "").splitlines()
-    for index, line in enumerate(lines):
-        match = re.search(r"\bLocation\b\s*:?\s*(.*)", line, re.IGNORECASE)
-        if not match:
-            continue
-
-        address = match.group(1).strip()
-        for following_line in lines[index + 1:index + 4]:
-            address_parts = [part.strip() for part in address.split(",")]
-            if len(address_parts) >= 3 and address_parts[2]:
-                break
-            following_line = following_line.strip()
-            if not following_line:
-                continue
-            if re.search(r"\b[A-Za-z][A-Za-z ]*\s*:", following_line):
-                break
-            address = f"{address} {following_line}".strip()
-
-        parts = [part.strip() for part in address.split(",")]
-        if len(parts) < 3 or not parts[1] or not parts[2]:
-            continue
-        return ", ".join(parts)
-    return ""
-
-def find_location_in_text(text):
-    parts = [part.strip() for part in find_location_address_in_text(text).split(",")]
-    if len(parts) < 3 or not parts[1] or not parts[2]:
-        return ""
-    state_match = re.match(r"([A-Za-z]{2})\b", parts[2])
-    state = state_match.group(1).upper() if state_match else parts[2].split()[0]
-    return f"{parts[1]} {state}"
 
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -272,34 +216,6 @@ for folder in folders_to_scan:
         file_contents = {}
         # filename -> set of terms found exactly in that specific file
         file_found_terms = defaultdict(set)
-        if JSON_RESULTS_FILE:
-            try:
-                email_subject = str(message.Subject or "")
-            except Exception:
-                email_subject = ""
-            try:
-                email_body = str(message.Body or "")
-            except Exception:
-                email_body = ""
-            try:
-                sender_name = str(message.SenderName or "")
-            except Exception:
-                sender_name = ""
-            try:
-                sender_email = str(message.SenderEmailAddress or "")
-            except Exception:
-                sender_email = ""
-            try:
-                entry_id = str(message.EntryID or "")
-            except Exception:
-                entry_id = ""
-            try:
-                store_id = str(folder.StoreID or "")
-            except Exception:
-                store_id = ""
-            received_text = str(message.ReceivedTime)
-            subject_ritms = find_ritms_in_text(email_subject)
-            email_ritms = find_ritms_in_text(f"{email_subject}\n{email_body}")
 
         for attachment in message.Attachments:
             filename = attachment.FileName
@@ -310,45 +226,6 @@ for folder in folders_to_scan:
             content = extract_text_from_bytes(data, filename)
             file_contents[filename] = content
             hits = find_terms_in_text(content)
-
-            if JSON_RESULTS_FILE:
-                if hits:
-                    attachment_ritms = find_ritms_in_text(content)
-                    for term in hits:
-                        gui_exact_matches.append({
-                            "term": term,
-                            "filename": filename,
-                            "subject": email_subject,
-                            "sender": sender_name,
-                            "sender_email": sender_email,
-                            "entry_id": entry_id,
-                            "store_id": store_id,
-                            "folder": folder.Name,
-                            "received": received_text,
-                            "ritms": sorted(set(attachment_ritms) | set(email_ritms)),
-                            "subject_ritms": subject_ritms,
-                            "location": find_location_in_text(content),
-                            "location_address": find_location_address_in_text(content),
-                        })
-                if FUZZY_ENABLED and content:
-                    exact_terms = {term.casefold() for term in hits}
-                    unmatched_terms = [
-                        term for term in SEARCH_TERMS
-                        if term.casefold() not in exact_terms
-                    ]
-                    near_matches = find_near_misses(content, unmatched_terms)
-                    for term, guesses in near_matches.items():
-                        for guess, ratio in guesses:
-                            gui_near_matches.append({
-                                "term": term,
-                                "guess": guess,
-                                "similarity": round(ratio, 3),
-                                "filename": filename,
-                                "subject": email_subject,
-                                "folder": folder.Name,
-                                "received": received_text,
-                                "subject_ritms": subject_ritms,
-                            })
 
             if hits:
                 email_terms |= hits
@@ -553,15 +430,6 @@ if truly_missing:
 
 with open(LOG_FILE, "w", encoding="utf-8") as f:
     f.write("\n".join(lines))
-
-if JSON_RESULTS_FILE:
-    with open(JSON_RESULTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(
-            {"exact_matches": gui_exact_matches, "near_matches": gui_near_matches},
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
 
 print(f"\nReport saved to: {LOG_FILE}")
 input("\nPress Enter to exit...")

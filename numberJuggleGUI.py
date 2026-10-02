@@ -7,7 +7,6 @@ from PySide6.QtWidgets import (
     QHeaderView, QMessageBox, QSpinBox, QAbstractItemView, QGroupBox,
     QListWidget, QListWidgetItem, QInputDialog, QComboBox
 )
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QTextCursor
 
 # ============================================================
@@ -45,10 +44,10 @@ def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
             max_units = min(remaining[it] // step, b["total"] // step)
             if max_units < min_units:
                 return None
-            x[(bi, it)] = model.NewIntVar(min_units, max_units, f"x_{bi}_{it}")
+            x[(bi, it)] = model.new_int_var(min_units, max_units, f"x_{bi}_{it}")
 
     for bi, b in enumerate(bundles):
-        model.Add(sum(x[(bi, it)] * step for it in b["items"]) == b["total"])
+        model.add(sum(x[(bi, it)] * step for it in b["items"]) == b["total"])
 
     for item, need in remaining.items():
         contributors = [
@@ -58,7 +57,7 @@ def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
             if it == item
         ]
         if contributors:
-            model.Add(sum(contributors) == need)
+            model.add(sum(contributors) == need)
         else:
             if need != 0:
                 return None
@@ -173,9 +172,9 @@ class SolverWindow(QMainWindow):
 
         self.items_table = QTableWidget(0, 2)
         self.items_table.setHorizontalHeaderLabels(["Item Name", "Total Weight"])
-        self.items_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.items_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.items_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.items_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.items_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.items_table.setMaximumHeight(180)
         items_layout.addWidget(self.items_table)
 
@@ -223,9 +222,9 @@ class SolverWindow(QMainWindow):
 
         self.bundles_table = QTableWidget(0, 2)
         self.bundles_table.setHorizontalHeaderLabels(["Items (comma-sep)", "Total Weight"])
-        self.bundles_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.bundles_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.bundles_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.bundles_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.bundles_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.bundles_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.bundles_table.itemChanged.connect(self.on_bundle_cell_changed)
         right.addWidget(self.bundles_table, stretch=1)
 
@@ -442,7 +441,7 @@ class SolverWindow(QMainWindow):
     # --------------------------------------------------------
     def log(self, text):
         self.output.insertPlainText(text + "\n")
-        self.output.moveCursor(QTextCursor.End)
+        self.output.moveCursor(QTextCursor.MoveOperation.End)
 
     def read_items(self):
         totals = {}
@@ -602,6 +601,10 @@ class SolverWindow(QMainWindow):
 
         if result is None:
             self.log("\nNo solution found.")
+            return
+
+        if used_step is None:
+            self.log("\nSolver returned a solution without a step size.")
             return
 
         effective_min = ((MIN_WEIGHT + used_step - 1) // used_step) * used_step

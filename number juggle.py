@@ -8,7 +8,6 @@ import sys
 # ============================================================
 ALIASES = {
     "99FO": "99FO", "FO99": "99FO",
-    "69S":  "69S",  "69":   "69S",
 }
 
 def norm(s):
@@ -18,7 +17,52 @@ def norm(s):
 # ============================================================
 # SETTINGS
 # ============================================================
-MIN_WEIGHT = 4   # No item in any bundle may be assigned less than this
+MIN_WEIGHT = 3   # No item in any bundle may be assigned less than this
+
+# ============================================================
+# SAFE INPUT HELPERS
+# ============================================================
+def ask_int(prompt, allow_back=False, min_value=None, max_value=None):
+    while True:
+        raw = input(prompt).strip()
+        if allow_back and raw.lower() == "back":
+            return "back"
+        try:
+            val = int(raw)
+        except ValueError:
+            print("  [!] Wrong input — please enter a whole number.")
+            continue
+        if min_value is not None and val < min_value:
+            print(f"  [!] Must be at least {min_value}.")
+            continue
+        if max_value is not None and val > max_value:
+            print(f"  [!] Must be at most {max_value}.")
+            continue
+        return val
+
+def ask_str(prompt, allow_back=False, validator=None):
+    while True:
+        raw = input(prompt).strip()
+        if allow_back and raw.lower() == "back":
+            return "back"
+        if not raw:
+            print("  [!] Can't be empty. Try again.")
+            continue
+        if validator is not None and not validator(raw):
+            print("  [!] Wrong input — try again (or type 'back' to revise).")
+            continue
+        return raw
+
+def ask_yes_no(prompt, default="n"):
+    while True:
+        raw = input(prompt).strip().lower()
+        if not raw:
+            raw = default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("  [!] Please answer y or n.")
 
 # ============================================================
 # SOLVER 1: OR-Tools CP-SAT (preferred — fast + complete)
@@ -30,35 +74,20 @@ except ImportError:
     HAS_ORTOOLS = False
 
 def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
-    """
-    Solve using Google OR-Tools CP-SAT.
-    Returns a list of bundle assignments in the same format as the recursive solver,
-    or None if no solution exists.
-    Every item in every bundle must be >= MIN_WEIGHT.
-    """
     model = cp_model.CpModel()
+    min_units = -(-MIN_WEIGHT // step)
 
-    # Smallest allowed value that is both >= MIN_WEIGHT and a multiple of step
-    min_units = -(-MIN_WEIGHT // step)   # ceiling division
-
-    # Decision variable for each (bundle, item) pair: integer count of `step` units.
     x = {}
     for bi, b in enumerate(bundles):
         for it in b["items"]:
             max_units = min(remaining[it] // step, b["total"] // step)
             if max_units < min_units:
-                # This item can't reach the minimum in this bundle.
-                # The whole bundle+step combination is infeasible.
                 return None
-            x[(bi, it)] = model.NewIntVar(min_units, max_units, f"x_{bi}_{it}")
+            x[(bi, it)] = model.new_int_var(min_units, max_units, f"x_{bi}_{it}")
 
-    # Each bundle's assigned weights must sum exactly to its total
     for bi, b in enumerate(bundles):
-        model.Add(
-            sum(x[(bi, it)] * step for it in b["items"]) == b["total"]
-        )
+        model.add(sum(x[(bi, it)] * step for it in b["items"]) == b["total"])
 
-    # Each item's total across all bundles must equal its remaining amount
     for item, need in remaining.items():
         contributors = [
             x[(bi, it)] * step
@@ -67,10 +96,10 @@ def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
             if it == item
         ]
         if contributors:
-            model.Add(sum(contributors) == need)
+            model.add(sum(contributors) == need)
         else:
             if need != 0:
-                return None  # leftover item that no bundle can consume
+                return None
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
@@ -79,7 +108,6 @@ def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return None
 
-    # Rebuild assignment in the same format as the recursive solver
     result = []
     for bi, b in enumerate(bundles):
         weights = {}
@@ -93,7 +121,7 @@ def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
     return result
 
 # ============================================================
-# SOLVER 2: Recursive fallback (used only if OR-Tools isn't installed)
+# SOLVER 2: Recursive fallback
 # ============================================================
 ITER_LIMIT = 500_000
 _iter_count = 0
@@ -101,9 +129,7 @@ _partition_cache = {}
 
 def partitions_capped_uncached(total, caps, step, min_weight=MIN_WEIGHT):
     k = len(caps)
-    # Smallest multiple of step that is >= min_weight
     floor = ((min_weight + step - 1) // step) * step
-
     if k == 1:
         if floor <= total <= caps[0] and total % step == 0:
             yield (total,)
@@ -168,35 +194,208 @@ def solve_recursive(bundles, remaining, step, totals):
     return None
 
 # ============================================================
-# INPUT: items and totals
+# INPUT: items and totals (with back/undo)
 # ============================================================
 print("Enter item types and their TOTAL weights.")
-print("Format: name,weight  (blank line to finish)")
+print("Format: name,weight   (blank line to finish, or 'back' to undo last item)")
+
 totals = {}
 display = {}
+entry_order = []
+
 while True:
     line = input("  > ").strip()
     if not line:
+        if not totals:
+            print("  [!] You need at least one item before finishing.")
+            continue
         break
-    name_raw, w = line.split(",")
+
+    if line.lower() == "back":
+        if not entry_order:
+            print("  [!] Nothing to undo.")
+            continue
+        last = entry_order.pop()
+        totals.pop(last, None)
+        display.pop(last, None)
+        print(f"  [removed last item: {last}]")
+        continue
+
+    if "," not in line:
+        print("  [!] Wrong input — use the format: name,weight")
+        continue
+
+    name_raw, w = line.split(",", 1)
+    name_raw = name_raw.strip()
+    w = w.strip()
+
+    if not name_raw:
+        print("  [!] Item name can't be empty.")
+        continue
+
+    try:
+        weight_val = int(w)
+    except ValueError:
+        print("  [!] Weight must be a whole number.")
+        continue
+
+    if weight_val <= 0:
+        print("  [!] Weight must be positive.")
+        continue
+
     key = norm(name_raw)
-    totals[key] = int(w.strip())
-    display[key] = name_raw.strip()
+    totals[key] = weight_val
+    display[key] = name_raw
+    if key not in entry_order:
+        entry_order.append(key)
+    print(f"  [set {name_raw} = {weight_val}]")
 
 # ============================================================
-# INPUT: loads
+# INPUT: loads (with back support)
 # ============================================================
-num_loads = int(input("\nHow many loads? "))
+while True:
+    num_loads_raw = input("\nHow many loads? (or 'back' to redo items): ").strip()
+    if num_loads_raw.lower() == "back":
+        print("\n--- Redo item totals ---")
+        totals.clear()
+        display.clear()
+        entry_order.clear()
+        print("Enter item types and their TOTAL weights.")
+        print("Format: name,weight   (blank line to finish, or 'back' to undo last item)")
+        while True:
+            line = input("  > ").strip()
+            if not line:
+                if not totals:
+                    print("  [!] You need at least one item.")
+                    continue
+                break
+            if line.lower() == "back":
+                if not entry_order:
+                    print("  [!] Nothing to undo.")
+                    continue
+                last = entry_order.pop()
+                totals.pop(last, None)
+                display.pop(last, None)
+                print(f"  [removed last item: {last}]")
+                continue
+            if "," not in line:
+                print("  [!] Wrong input — use: name,weight")
+                continue
+            name_raw, w = line.split(",", 1)
+            name_raw = name_raw.strip()
+            w = w.strip()
+            if not name_raw:
+                print("  [!] Item name can't be empty.")
+                continue
+            try:
+                weight_val = int(w)
+            except ValueError:
+                print("  [!] Weight must be a whole number.")
+                continue
+            if weight_val <= 0:
+                print("  [!] Weight must be positive.")
+                continue
+            key = norm(name_raw)
+            totals[key] = weight_val
+            display[key] = name_raw
+            if key not in entry_order:
+                entry_order.append(key)
+            print(f"  [set {name_raw} = {weight_val}]")
+        continue
+
+    try:
+        num_loads = int(num_loads_raw)
+    except ValueError:
+        print("  [!] Wrong input — enter a whole number.")
+        continue
+    if num_loads <= 0:
+        print("  [!] Must be at least 1 load.")
+        continue
+    break
 
 raw_bundles = []
-for i in range(num_loads):
+i = 0
+while i < num_loads:
     load = chr(ord("A") + i)
-    n = int(input(f"\nLoad {load}: how many bundles? "))
-    for j in range(n):
-        items_str = input(f"  Bundle {j+1} item types (comma-sep): ")
-        items = [norm(s) for s in items_str.split(",")]
-        total = int(input(f"  Bundle {j+1} total weight: "))
-        raw_bundles.append((load, items, total))
+
+    # --- Ask how many bundles for THIS load ---
+    n = None
+    while n is None:
+        n_raw = input(f"\nLoad {load}: how many bundles? "
+                      f"(or 'back' to redo this load, 'prev' to redo previous load) ").strip()
+
+        if n_raw.lower() == "back":
+            raw_bundles[:] = [b for b in raw_bundles if b[0] != load]
+            print(f"  [cleared bundles for Load {load}, re-asking count]")
+            continue
+
+        if n_raw.lower() == "prev":
+            if i == 0:
+                print("  [!] No previous load to redo.")
+                continue
+            prev_load = chr(ord("A") + i - 1)
+            raw_bundles[:] = [b for b in raw_bundles if b[0] != prev_load]
+            print(f"  [cleared Load {prev_load}, going back]")
+            i -= 1
+            n = "break_outer"
+            break
+
+        try:
+            n = int(n_raw)
+        except ValueError:
+            print("  [!] Wrong input — enter a whole number.")
+            continue
+        if n <= 0:
+            print("  [!] Must be at least 1 bundle.")
+            n = None
+            continue
+
+    if n == "break_outer":
+        continue
+
+    # --- Gather bundles for this load ---
+    load_bundles = []
+    j = 0
+    while j < n:
+        items_str = input(f"  Bundle {j+1} item types "
+                          f"(or 'back' to redo previous bundle): ").strip()
+
+        if items_str.lower() == "back":
+            if not load_bundles:
+                print("  [!] Nothing to undo in this load.")
+                continue
+            load_bundles.pop()
+            j -= 1
+            continue
+
+        items = [norm(s) for s in items_str.split(",") if s.strip()]
+        if not items:
+            print("  [!] Wrong input — list at least one item.")
+            continue
+        unknown = [it for it in items if it not in totals]
+        if unknown:
+            print(f"  [!] Unknown items: {unknown}")
+            print(f"      Known items: {list(display.values())}")
+            continue
+
+        total_raw = input(f"  Bundle {j+1} total weight "
+                          f"(or 'back' to redo this bundle): ").strip()
+        if total_raw.lower() == "back":
+            continue
+        try:
+            total = int(total_raw)
+        except ValueError:
+            print("  [!] Weight must be a whole number. Redoing this bundle.")
+            continue
+        if total <= 0:
+            print("  [!] Weight must be positive. Redoing this bundle.")
+            continue
+
+        load_bundles.append((load, items, total))
+        j += 1
+
+    raw_bundles.extend(load_bundles)
+    i += 1
 
 # ============================================================
 # Lock single-item bundles
@@ -235,7 +434,6 @@ used_step = None
 
 if HAS_ORTOOLS:
     print("\n[using OR-Tools CP-SAT solver]")
-    # Try finer steps first — coarser steps are more likely to be infeasible
     for step in (1, 5, 10):
         print(f"[trying step={step} ...]", flush=True)
         try:
@@ -270,6 +468,10 @@ else:
 
 if result is None:
     print("\nNo solution found.")
+    sys.exit()
+
+if used_step is None:
+    print("\nSolver returned a solution without a step size.")
     sys.exit()
 
 # --- Reject any solution with a weight below the effective minimum ---
