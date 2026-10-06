@@ -9,7 +9,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from PySide6.QtCore import QEvent, QThread, Qt, Signal
 from PySide6.QtGui import QKeyEvent
@@ -237,6 +237,224 @@ def write_scrap_pickup_template(record: PackingListRecord, destination: Path) ->
     return destination
 
 
+def _packing_list_identifier(record: PackingListRecord) -> str:
+    if record["letter"]:
+        return f"{record['packing_list']}-{record['letter']}"
+    return record["packing_list"]
+
+
+def _split_driver_and_plate(value: str) -> tuple[str, str]:
+    if "/" not in value:
+        return value.strip(), ""
+    driver, plate = value.split("/", 1)
+    return driver.strip(), plate.strip()
+
+
+def _split_reel_id(description: str) -> tuple[str, str]:
+    cleaned = description.strip()
+    match = re.fullmatch(r"(.*\d)([A-Za-z]+)", cleaned)
+    if match is None:
+        return cleaned, ""
+    return match.group(1), match.group(2).upper()
+
+
+def _reel_summary_sort_key(record: PackingListRecord) -> tuple[int, int, str, str]:
+    receiving_date = parse_date(record["date"]).toordinal()
+    reel_number = re.search(r"-(\d+)R(?:-|$)", record["packing_list"], re.IGNORECASE)
+    reel_order = int(reel_number.group(1)) if reel_number else 1_000_000
+    return (
+        receiving_date,
+        reel_order,
+        record["letter"].casefold(),
+        _packing_list_identifier(record).casefold(),
+    )
+
+
+def _read_reel_summary_record(sheet) -> PackingListRecord | None:
+    identifier = str(sheet.Range("M2").Value or "").strip()
+    if not identifier:
+        return None
+
+    identifier_parts = re.fullmatch(r"(.+)-([A-Za-z]+)", identifier)
+    if identifier_parts is None:
+        packing_list, letter = identifier, ""
+    else:
+        packing_list, letter = identifier_parts.groups()
+
+    received = sheet.Range("M4").Value
+    if isinstance(received, datetime):
+        normalized_date = received.date().isoformat()
+    elif isinstance(received, date):
+        normalized_date = received.isoformat()
+    else:
+        normalized_date = parse_date(str(received)).isoformat()
+
+    items: list[ItemRecord] = []
+    for row in range(12, 43):
+        reel_id = str(sheet.Cells(row, 4).Value or "").strip()
+        if not reel_id:
+            continue
+        reel_size = str(sheet.Cells(row, 5).Value or "").strip()
+        gross = int(float(sheet.Cells(row, 7).Value or 0))
+        tare = int(float(sheet.Cells(row, 8).Value or 0))
+        items.append({
+            "description": f"{reel_id}{reel_size}",
+            "type": str(sheet.Cells(row, 6).Value or "").strip(),
+            "gross": gross,
+            "tare": tare,
+            "net": gross - tare,
+        })
+
+    trucker = str(sheet.Range("F8").Value or "").strip()
+    trailer = str(sheet.Range("F9").Value or "").strip()
+    return {
+        "group": "",
+        "ritm": str(sheet.Range("M5").Value or "").strip(),
+        "letter": letter,
+        "date": normalized_date,
+        "packing_list": packing_list,
+        "location": str(sheet.Range("C7").Value or "").strip(),
+        "location_address": "",
+        "driver_plate": f"{trucker} / {trailer}" if trucker or trailer else "",
+        "items": items,
+    }
+
+
+def write_reel_summary_report(
+    records: list[PackingListRecord],
+    destination: Path,
+) -> Path:
+    template_path = (
+        Path(__file__).resolve().parent / "Excel Bases" / "Reel Summary Report.XLS"
+    )
+    if not template_path.exists():
+        raise FileNotFoundError(f"Reel Summary template not found: {template_path}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_path = destination if destination.exists() else template_path
+    descriptor, staged_name = tempfile.mkstemp(
+        prefix=".reel-summary-", suffix=destination.suffix or ".xls", dir=destination.parent
+    )
+    os.close(descriptor)
+    staged_path = Path(staged_name)
+    try:
+        shutil.copy2(source_path, staged_path)
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.EnableEvents = False
+        workbook = None
+        try:
+            workbook = excel.Workbooks.Open(str(staged_path), UpdateLinks=0, ReadOnly=False)
+            report_records: dict[str, PackingListRecord] = {}
+            reel_sheets: list[Any] = []
+            for sheet in workbook.Worksheets:
+                is_numbered_reel_sheet = re.fullmatch(
+                    r"\d+R(?:\s*\(\d+\))?", sheet.Name, re.IGNORECASE
+                ) is not None
+                identifier = str(sheet.Range("M2").Value or "").strip()
+                is_populated_reel_sheet = bool(identifier) and sheet.Name.casefold().endswith("r")
+                if not is_numbered_reel_sheet and not is_populated_reel_sheet:
+                    continue
+                reel_sheets.append(sheet)
+                previous_record = _read_reel_summary_record(sheet)
+                if previous_record is not None:
+                    key = _packing_list_identifier(previous_record).casefold()
+                    report_records[key] = previous_record
+
+            if not reel_sheets:
+                raise ValueError("The selected workbook does not contain any numbered R tabs.")
+
+            for record in records:
+                identifier = _packing_list_identifier(record)
+                if not identifier:
+                    raise ValueError("A queued packing list is missing its packing-list number.")
+                report_records[identifier.casefold()] = record
+
+            ordered_records = sorted(report_records.values(), key=_reel_summary_sort_key)
+            ordered_sheets = reel_sheets
+            if len(ordered_records) > len(ordered_sheets):
+                raise ValueError(
+                    f"The Reel Summary workbook has {len(ordered_sheets)} R tabs, but "
+                    f"{len(ordered_records)} packing lists need tabs. Start a new report to continue."
+                )
+
+            if any(len(record["items"]) > 31 for record in ordered_records):
+                record = next(record for record in ordered_records if len(record["items"]) > 31)
+                raise ValueError(
+                    f"{_packing_list_identifier(record)} has more reels than the report tab supports."
+                )
+
+            populated_tab_names = [
+                f"{_packing_list_identifier(record)}R" for record in ordered_records
+            ]
+            if any(len(name) > 31 for name in populated_tab_names):
+                raise ValueError("A packing-list number is too long to use as an Excel tab name.")
+            reel_sheet_names = {sheet.Name.casefold() for sheet in ordered_sheets}
+            non_reel_sheet_names = {
+                sheet.Name.casefold()
+                for sheet in workbook.Worksheets
+                if sheet.Name.casefold() not in reel_sheet_names
+            }
+            if any(name.casefold() in non_reel_sheet_names for name in populated_tab_names):
+                raise ValueError("A packing-list tab name conflicts with another workbook tab.")
+
+            existing_names = {sheet.Name.casefold() for sheet in workbook.Worksheets}
+            for index, sheet in enumerate(ordered_sheets, start=1):
+                temporary_name = f"__R_TEMP_{index}"
+                while temporary_name.casefold() in existing_names:
+                    temporary_name += "_"
+                sheet.Name = temporary_name
+                existing_names.add(temporary_name.casefold())
+
+            for sheet in ordered_sheets:
+                for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
+                    sheet.Range(address).Value = ""
+                sheet.Range("D12:H42").ClearContents()
+
+            for sheet, record in zip(ordered_sheets, ordered_records):
+                driver, plate = _split_driver_and_plate(record["driver_plate"])
+                sheet.Range("M2").Value = _packing_list_identifier(record)
+                sheet.Range("M4").Value = datetime.combine(
+                    parse_date(record["date"]), datetime.min.time()
+                )
+                sheet.Range("M4").NumberFormat = "mm/dd/yyyy"
+                sheet.Range("M5").Value = record["ritm"]
+                sheet.Range("C7").Value = record["location"]
+                sheet.Range("I7").Value = sum(item["net"] for item in record["items"])
+                sheet.Range("C8").Value = "N/A"
+                sheet.Range("F8").Value = driver
+                sheet.Range("C9").Value = "N/A"
+                sheet.Range("F9").Value = plate
+
+                for row, item in enumerate(record["items"], start=12):
+                    reel_id, reel_size = _split_reel_id(item["description"])
+                    sheet.Cells(row, 4).Value = reel_id
+                    sheet.Cells(row, 5).Value = reel_size
+                    sheet.Cells(row, 6).Value = item["type"]
+                    sheet.Cells(row, 7).Value = item["gross"]
+                    sheet.Cells(row, 8).Value = item["tare"]
+
+            for index, sheet in enumerate(ordered_sheets, start=1):
+                if index <= len(ordered_records):
+                    sheet.Name = populated_tab_names[index - 1]
+                else:
+                    sheet.Name = f"{index}R"
+
+            excel.CalculateFull()
+            workbook.Save()
+        finally:
+            if workbook is not None:
+                workbook.Close(SaveChanges=False)
+            excel.Quit()
+
+        os.replace(staged_path, destination)
+    finally:
+        if staged_path.exists():
+            staged_path.unlink()
+    return destination
+
+
 class ScannerWorker(QThread):
     scan_complete = Signal(object)
     scan_failed = Signal(str)
@@ -324,6 +542,7 @@ class PackingListApp(QMainWindow):
         self.setMinimumSize(920, 720)
 
         self.records: list[PackingListRecord] = []
+        self.exported_record_ids_by_directory: dict[str, set[str]] = {}
         self.current_items: list[ItemRecord] = []
         self.packing_list_letter_counts: dict[str, int] = {}
         self.groups: dict[str, ScannerGroup] = {}
@@ -364,6 +583,7 @@ class PackingListApp(QMainWindow):
         self.date_input = self._add_field(form, "Date", date.today().isoformat())
         self.packing_list_input = self._add_field(form, "Packing List #")
         self.driver_plate_input = self._add_field(form, "Driver / Plate #")
+        self.driver_plate_input.setPlaceholderText("e.g. Jane Doe / ABC123")
         root.addLayout(form)
 
         item_form = QHBoxLayout()
@@ -1152,17 +1372,38 @@ class PackingListApp(QMainWindow):
             QMessageBox.information(self, "Nothing to save", "Add at least one list to the queue first.")
             return
 
+        records_missing_separator = [
+            _packing_list_identifier(record)
+            for record in self.records
+            if record["driver_plate"].strip() and "/" not in record["driver_plate"]
+        ]
+        if records_missing_separator:
+            QMessageBox.warning(
+                self,
+                "Separate driver and plate",
+                "Enter Driver / Plate # with a slash between the two values "
+                f"(for example, Jane Doe / ABC123) before exporting these list(s): "
+                f"{', '.join(records_missing_separator)}.",
+            )
+            return
+
         default_directory = Path(__file__).resolve().parent / "Reply Attachments"
         selected_directory = QFileDialog.getExistingDirectory(
             self,
-            "Choose where to save packing-list template copies",
+            "Choose where to save packing lists and the Reel Summary Report",
             str(default_directory),
         )
         if not selected_directory:
             return
         destination_directory = Path(selected_directory)
+        directory_key = str(destination_directory.resolve()).casefold()
+        exported_record_ids = self.exported_record_ids_by_directory.get(directory_key, set())
+        records_to_export = [
+            record for record in self.records
+            if _packing_list_identifier(record).casefold() not in exported_record_ids
+        ]
         destinations = []
-        for record in self.records:
+        for record in records_to_export:
             safe_packing_list = re.sub(
                 r"[^A-Za-z0-9._-]+", "_", record["packing_list"]
             ).strip("._-") or "PackingList"
@@ -1188,20 +1429,31 @@ class PackingListApp(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
+        reel_summary_path = destination_directory / "Reel Summary Report.xls"
         try:
-            for record, (packing_list_path, scrap_pickup_path) in zip(self.records, destinations):
+            write_reel_summary_report(self.records, reel_summary_path)
+            for record, (packing_list_path, scrap_pickup_path) in zip(records_to_export, destinations):
                 write_packing_list_template(record, packing_list_path)
                 write_scrap_pickup_template(record, scrap_pickup_path)
         except Exception as error:
             QMessageBox.critical(self, "Could not save files", str(error))
             return
 
-        count = len(self.records)
-        self.status_label.setText(f"Saved {count * 2} workbook(s) to {destination_directory}")
+        exported_record_ids.update(
+            _packing_list_identifier(record).casefold() for record in records_to_export
+        )
+        self.exported_record_ids_by_directory[directory_key] = exported_record_ids
+        count = len(records_to_export)
+        self.status_label.setText(
+            f"Saved {count * 2} packing-list workbook(s) and updated "
+            f"Reel Summary Report.xls in {destination_directory}"
+        )
         QMessageBox.information(
             self,
             "Workbooks saved",
-            f"Saved {count} packing-list and {count} scrap-pickup workbook(s) to:\n{destination_directory}",
+            f"Saved {count} packing-list and {count} scrap-pickup workbook(s), and updated "
+            f"Reel Summary Report.xls with {len(self.records)} queued list(s) in:\n"
+            f"{destination_directory}",
         )
 
 
