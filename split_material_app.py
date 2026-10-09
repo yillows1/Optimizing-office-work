@@ -85,6 +85,24 @@ def parse_frn_date(frn: str) -> date:
     return date(2000 + int(yy), int(mm), int(dd))
 
 
+def _frn_order_key(identifier: str) -> tuple[date, int, str, str]:
+    match = re.fullmatch(
+        r"FRN(\d{6})(?:-(\d+)R)?(?:-([A-Za-z]+))?(?:[RP])?",
+        identifier.strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return date.max, 0, "", identifier.casefold()
+
+    try:
+        frn_date = parse_frn_date(f"FRN{match.group(1)}")
+    except ValueError:
+        return date.max, 0, "", identifier.casefold()
+    sequence = int(match.group(2) or 0)
+    family_letter = (match.group(3) or "").upper()
+    return frn_date, sequence, family_letter, identifier.casefold()
+
+
 def week_range(d: date) -> tuple[date, date]:
     weekday = d.weekday()
     if weekday >= 5:
@@ -294,6 +312,49 @@ def _family_letter_from_tab(name: str, frn: str) -> str | None:
         return None
     m = re.search(r"-([A-Za-z]+)[RP]$", name)
     return m.group(1).upper() if m else None
+
+
+def _sort_family_tabs(workbook) -> None:
+    sheets = [sheet for sheet in workbook.Worksheets]
+    ordered_sheets = list(sheets)
+    positions_by_kind: dict[str, list[int]] = {"R": [], "P": []}
+    family_sheets_by_kind: dict[str, list[tuple[str, object]]] = {
+        "R": [],
+        "P": [],
+    }
+
+    for position, sheet in enumerate(sheets):
+        match = re.fullmatch(
+            r"(FRN\d{6})(?:-(\d+)R)?-([A-Za-z]+)([RP])",
+            sheet.Name.strip(),
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        kind = match.group(4).upper()
+        positions_by_kind[kind].append(position)
+        sequence = match.group(2)
+        identifier = f"{match.group(1)}"
+        if sequence:
+            identifier += f"-{sequence}R"
+        identifier += f"-{match.group(3)}"
+        family_sheets_by_kind[kind].append((identifier, sheet))
+
+    for kind, positions in positions_by_kind.items():
+        sorted_sheets = [
+            sheet
+            for _, sheet in sorted(
+                family_sheets_by_kind[kind],
+                key=lambda entry: _frn_order_key(entry[0]),
+            )
+        ]
+        for position, sheet in zip(positions, sorted_sheets):
+            ordered_sheets[position] = sheet
+
+    for position, expected_sheet in enumerate(ordered_sheets, start=1):
+        current_sheet = workbook.Worksheets(position)
+        if current_sheet.Name != expected_sheet.Name:
+            expected_sheet.Move(Before=current_sheet)
 
 
 @dataclass
@@ -633,39 +694,35 @@ def fill_summary_tab(
         except Exception:
             raise ValueError("No 'Summary' tab found in the workbook.")
 
-        existing_by_ident: dict[str, int] = {}
-        empty_slots: list[int] = []
+        identifiers: list[str] = []
+        seen_identifiers: set[str] = set()
         for i in range(MAX_SLOTS):
             row = FIRST_ROW + STRIDE * i
             value = sheet.Range(f"B{row}").Value
             text = str(value).strip() if value not in (None, "") else ""
             if text:
-                existing_by_ident.setdefault(text.upper(), i)
-            else:
-                empty_slots.append(i)
+                identifiers.append(text)
+                seen_identifiers.add(text.casefold())
 
-        sorted_loads = sorted(loads, key=lambda l: l.letter)
+        for ld in loads:
+            key = ld.identifier.casefold()
+            if key not in seen_identifiers:
+                identifiers.append(ld.identifier)
+                seen_identifiers.add(key)
 
-        assignments: list[tuple[_LoadRow, int]] = []
-        empty_iter = iter(empty_slots)
-        for ld in sorted_loads:
-            key = ld.identifier.upper()
-            if key in existing_by_ident:
-                slot = existing_by_ident[key]
-            else:
-                try:
-                    slot = next(empty_iter)
-                except StopIteration:
-                    raise ValueError(
-                        f"Summary tab has no free PL # slots for {ld.identifier}."
-                    )
-            assignments.append((ld, slot))
+        identifiers.sort(key=_frn_order_key)
+        if len(identifiers) > MAX_SLOTS:
+            raise ValueError(
+                f"Summary tab has {MAX_SLOTS} PL # slots but "
+                f"{len(identifiers)} load entries are present."
+            )
 
-        sorted_slots = sorted(slot for _, slot in assignments)
-        for (ld, _), slot in zip(assignments, sorted_slots):
+        for slot, identifier in enumerate(identifiers):
             row = FIRST_ROW + STRIDE * slot
-            sheet.Range(f"B{row}").Value = ld.identifier
-            written += 1
+            sheet.Range(f"B{row}").Value = identifier
+
+        _sort_family_tabs(workbook)
+        written = len(loads)
 
         if written:
             workbook.Save()

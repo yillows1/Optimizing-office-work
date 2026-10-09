@@ -9,6 +9,7 @@ import tempfile
 import shutil
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -16,10 +17,12 @@ from PySide6.QtCore import QEvent, QThread, Qt, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -30,10 +33,12 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QRadioButton,
-    QTableWidget,
-    QTableWidgetItem,
+    QScrollArea,
     QSpinBox,
     QStyle,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -45,8 +50,11 @@ from reportlab.pdfgen import canvas
 
 
 # ---------------------------------------------------------------------------
-# Constants for the input template
+# Config / paths
 # ---------------------------------------------------------------------------
+
+CONFIG_PATH = Path(__file__).resolve().parent / "scanner_config.json"
+DEFAULT_SUMMARIES_DIR = Path(__file__).resolve().parent / "Summaries"
 
 TEMPLATE_RELATIVE_PATH = Path("Excel Bases") / "Incoming Packing List.xls"
 WORKING_DIR_RELATIVE_PATH = Path("Working")
@@ -64,6 +72,28 @@ IN_DESC_COL = "B"
 IN_MATERIAL_COL = "D"
 IN_GROSS_COL = "E"
 IN_TARE_COL = "F"
+
+MAX_ITEMS_PER_LOAD = 23
+MAX_ITEMS_PER_SUMMARY_TAB = 31
+
+RENAME_EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm"}
+RENAME_PDF_SUFFIXES = {".pdf"}
+
+
+def load_app_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_app_config(data: dict) -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def parse_date(value: str) -> date:
@@ -92,6 +122,10 @@ def normalize_item_type(value: str) -> str:
     return common_types.get(cleaned.casefold(), cleaned.upper())
 
 
+def normalize_ritm(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", value).upper()
+
+
 # ---------------------------------------------------------------------------
 # Week helpers
 # ---------------------------------------------------------------------------
@@ -113,6 +147,63 @@ def summary_filename(monday: date, friday: date) -> str:
         f"{monday.month}.{monday.day}.{monday.strftime('%y')} ~ "
         f"{friday.month}.{friday.day}.{friday.strftime('%y')}.xls"
     )
+
+
+# FRN date parsing (e.g. 'FRN260929-1R' -> date(2026, 9, 29)).
+_FRN_DATE_RE = re.compile(r"FRN(\d{2})(\d{2})(\d{2})", re.IGNORECASE)
+
+
+def _date_from_frn(packing_list_number: str) -> tuple[date | None, str]:
+    if not packing_list_number:
+        return None, "empty packing list number"
+    match = _FRN_DATE_RE.search(packing_list_number)
+    if not match:
+        return None, "no FRN date found"
+    yy, mm, dd = match.groups()
+    try:
+        return date(2000 + int(yy), int(mm), int(dd)), ""
+    except ValueError as error:
+        return None, str(error)
+
+
+# ---------------------------------------------------------------------------
+# Excel helpers (merge-safe)
+# ---------------------------------------------------------------------------
+
+def _safe_write(sheet, address: str, value) -> None:
+    """Write to a cell, targeting the merge anchor if the cell is merged.
+    Prevents Excel's 'we can't do that to a merged cell' error."""
+    rng = sheet.Range(address)
+    try:
+        if rng.MergeCells:
+            rng = rng.MergeArea.Cells(1, 1)
+    except Exception:
+        pass
+    rng.Value = value
+
+
+def _safe_clear(sheet, address: str) -> None:
+    rng = sheet.Range(address)
+    try:
+        if rng.MergeCells:
+            rng = rng.MergeArea.Cells(1, 1)
+    except Exception:
+        pass
+    rng.ClearContents()
+
+
+def _clear_item_range(sheet, first_row: int, last_row: int, first_col: int, last_col: int) -> None:
+    """Clear a block of cells, skipping any cell that's part of a merge
+    to avoid Excel complaining."""
+    for r in range(first_row, last_row + 1):
+        for c in range(first_col, last_col + 1):
+            cell = sheet.Cells(r, c)
+            try:
+                if cell.MergeCells:
+                    continue
+            except Exception:
+                pass
+            cell.ClearContents()
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +298,166 @@ def fetch_attachment_bytes(
     except Exception:
         return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# File-renaming helpers
+# ---------------------------------------------------------------------------
+
+_FRN_IN_TEXT = re.compile(
+    r"(FRN\d{6}-\d+[A-Z]?)(?:-([A-Za-z]+))?",
+    re.IGNORECASE,
+)
+
+
+def _extract_frn_from_text(text: str) -> tuple[str, str]:
+    if not text:
+        return "", ""
+    match = _FRN_IN_TEXT.search(text)
+    if not match:
+        return "", ""
+    frn = match.group(1).upper()
+    letter = (match.group(2) or "").upper()
+    return frn, letter
+
+
+def _extract_frn_from_excel(path: Path, excel=None) -> tuple[str, str]:
+    """
+    Try to pull an FRN from a workbook. If `excel` is provided, reuse that
+    Excel.Application (much faster when scanning a folder); otherwise
+    spin up a temporary one.
+    """
+    owns_excel = excel is None
+    workbook = None
+    try:
+        if owns_excel:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+
+        workbook = excel.Workbooks.Open(
+            str(path), UpdateLinks=0, ReadOnly=True
+        )
+
+        candidates: list[str] = []
+        for sheet in workbook.Worksheets:
+            for address in ("E10", "H10", "M2", "E11", "C10"):
+                value = sheet.Range(address).Value
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    candidates.append(text)
+
+        for text in candidates:
+            frn, letter = _extract_frn_from_text(text)
+            if frn:
+                return frn, letter
+        return "", ""
+    except Exception:
+        return "", ""
+    finally:
+        if workbook is not None:
+            try:
+                workbook.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if owns_excel and excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+
+
+def _extract_frn_from_pdf(path: Path) -> tuple[str, str]:
+    try:
+        reader = PdfReader(str(path))
+        if not reader.pages:
+            return "", ""
+        text = reader.pages[0].extract_text() or ""
+        frn, letter = _extract_frn_from_text(text)
+        return frn, letter
+    except Exception:
+        return "", ""
+
+
+def plan_file_renames(folder: Path, progress=None) -> list[dict]:
+    """
+    `progress` is an optional callable(current, total, filename) used to
+    report progress to a UI.
+    """
+    entries = [
+        e for e in sorted(folder.iterdir())
+        if e.is_file()
+        and not e.name.startswith(".")
+        and not e.name.startswith("~$")
+    ]
+    total = len(entries)
+
+    plans: list[dict] = []
+    excel = None
+    try:
+        # Only spin up Excel if there's at least one spreadsheet to look at.
+        if any(e.suffix.casefold() in RENAME_EXCEL_SUFFIXES for e in entries):
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+
+        for index, entry in enumerate(entries, start=1):
+            if progress is not None:
+                progress(index, total, entry.name)
+
+            stem = entry.stem
+            suffix = entry.suffix
+
+            frn, letter = _extract_frn_from_text(stem)
+            source = "filename" if frn else ""
+
+            if not frn and suffix.casefold() in RENAME_EXCEL_SUFFIXES:
+                frn, letter = _extract_frn_from_excel(entry, excel=excel)
+                if frn:
+                    source = "excel"
+
+            if not frn and suffix.casefold() in RENAME_PDF_SUFFIXES:
+                frn, letter = _extract_frn_from_pdf(entry)
+                if frn:
+                    source = "pdf"
+
+            if not letter:
+                tail_letter = re.search(r"[-_]([A-Za-z])$", stem)
+                if tail_letter:
+                    letter = tail_letter.group(1).upper()
+
+            new_name = ""
+            reason = ""
+
+            if not frn:
+                reason = "No FRN found in filename or file contents"
+            else:
+                new_stem = f"Incoming {frn}"
+                if letter:
+                    new_stem += f"-{letter}"
+                new_name = new_stem + suffix
+                if new_name == entry.name:
+                    reason = "Already named correctly"
+                else:
+                    reason = f"Matched via {source}"
+
+            plans.append({
+                "path": entry,
+                "old_name": entry.name,
+                "new_name": new_name,
+                "frn": frn,
+                "letter": letter,
+                "reason": reason,
+            })
+    finally:
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+    return plans
 
 
 # ---------------------------------------------------------------------------
@@ -310,109 +561,437 @@ class BlankZeroSpinBox(QSpinBox):
 
 
 # ---------------------------------------------------------------------------
-# Address batch dialog
+# Address / RITM batch dialog
 # ---------------------------------------------------------------------------
 
 class AddressBatchDialog(QDialog):
-    """Popup for assigning addresses to unmatched items."""
-
     def __init__(self, parent, items: list[ItemRecord]) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Enter address (optional)")
-        self.setMinimumWidth(520)
-        self.assignments: dict[int, str] = {}
+        self.setWindowTitle("Enter location / Request Item (optional)")
+        self.setMinimumWidth(600)
+
+        self._items: list[ItemRecord] = list(items)
+
+        self.address_assignments: dict[int, str] = {}
+        self.ritm_assignments: dict[int, str] = {}
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "These items were queued as No Request Item / No Location.\n"
-            "Check the IDs you want to give an address, type the address, "
-            "then click Apply to selected."
+            "These items were queued without a matching RITM or location.\n"
+            "Check the IDs you want to assign, fill in the field(s), then click "
+            "Apply. Checked items are removed from all three tabs once applied."
         ))
 
-        self.list_widget = QListWidget()
-        self.list_widget.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-        for index, item in enumerate(items):
-            entry = QListWidgetItem(item["description"])
-            entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            entry.setCheckState(Qt.CheckState.Unchecked)
-            entry.setData(Qt.ItemDataRole.UserRole, index)
-            self.list_widget.addItem(entry)
-        layout.addWidget(self.list_widget)
+        self.tabs = QTabWidget()
 
-        address_row = QHBoxLayout()
-        address_row.addWidget(QLabel("Address:"))
-        self.address_input = QLineEdit()
-        self.address_input.setPlaceholderText(
-            "Street, City, State ZIP  (leave blank for No Location)"
-        )
-        address_row.addWidget(self.address_input, 1)
-        layout.addLayout(address_row)
+        self.lists: list[QListWidget] = []
+        self._build_tab("Location", self._build_location_tab)
+        self._build_tab("Request Item", self._build_ritm_tab)
+        self._build_tab("Both", self._build_both_tab)
 
-        button_row = QHBoxLayout()
-        self.apply_button = QPushButton("Apply to selected")
-        self.apply_button.setStyleSheet(
-            "font-weight: bold; background: #315b52; color: white;"
-        )
-        self.apply_button.clicked.connect(self._apply_to_selected)
-        button_row.addWidget(self.apply_button)
-
-        self.another_button = QPushButton("Another batch")
-        self.another_button.clicked.connect(self._another_batch)
-        button_row.addWidget(self.another_button)
-
-        self.finished_button = QPushButton("Finished")
-        self.finished_button.setStyleSheet("font-weight: bold;")
-        self.finished_button.clicked.connect(self.accept)
-        button_row.addWidget(self.finished_button)
-
-        button_row.addStretch(1)
-        layout.addLayout(button_row)
+        layout.addWidget(self.tabs)
 
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #53645e;")
         layout.addWidget(self.status_label)
 
-    def _selected_rows(self) -> list[int]:
-        rows: list[int] = []
-        for row in range(self.list_widget.count()):
-            item = self.list_widget.item(row)
-            if item.checkState() == Qt.CheckState.Checked:
-                rows.append(row)
-        return rows
+    def _build_tab(self, title: str, builder) -> None:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
 
-    def _apply_to_selected(self) -> None:
-        rows = self._selected_rows()
-        if not rows:
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        for index, item in enumerate(self._items):
+            entry = QListWidgetItem(item["description"])
+            entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            entry.setCheckState(Qt.CheckState.Unchecked)
+            entry.setData(Qt.ItemDataRole.UserRole, index)
+            list_widget.addItem(entry)
+        self.lists.append(list_widget)
+        tab_layout.addWidget(list_widget)
+
+        builder(tab_layout, list_widget)
+
+        self.tabs.addTab(tab, title)
+
+    def _build_location_tab(self, tab_layout, list_widget) -> None:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Location:"))
+        self.location_input = QLineEdit()
+        self.location_input.setPlaceholderText(
+            "Street, City, State ZIP  (leave blank for No Location)"
+        )
+        row.addWidget(self.location_input, 1)
+        tab_layout.addLayout(row)
+        self._add_apply_button(tab_layout, "apply_location")
+
+    def _build_ritm_tab(self, tab_layout, list_widget) -> None:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Request Item:"))
+        self.ritm_input = QLineEdit()
+        self.ritm_input.setPlaceholderText("e.g. RITM0011836256")
+        row.addWidget(self.ritm_input, 1)
+        tab_layout.addLayout(row)
+        self._add_apply_button(tab_layout, "apply_ritm")
+
+    def _build_both_tab(self, tab_layout, list_widget) -> None:
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Location:"))
+        self.both_location_input = QLineEdit()
+        self.both_location_input.setPlaceholderText(
+            "Street, City, State ZIP  (leave blank for No Location)"
+        )
+        row1.addWidget(self.both_location_input, 1)
+        tab_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Request Item:"))
+        self.both_ritm_input = QLineEdit()
+        self.both_ritm_input.setPlaceholderText("e.g. RITM0011836256")
+        row2.addWidget(self.both_ritm_input, 1)
+        tab_layout.addLayout(row2)
+
+        self._add_apply_button(tab_layout, "apply_both")
+
+    def _add_apply_button(self, tab_layout, mode: str) -> None:
+        button_row = QHBoxLayout()
+        apply_button = QPushButton("Apply to selected")
+        apply_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        apply_button.clicked.connect(lambda: self._apply(mode))
+        button_row.addWidget(apply_button)
+
+        another_button = QPushButton("Another batch")
+        another_button.clicked.connect(self._another_batch)
+        button_row.addWidget(another_button)
+
+        finished_button = QPushButton("Finished")
+        finished_button.setStyleSheet("font-weight: bold;")
+        finished_button.clicked.connect(self.accept)
+        button_row.addWidget(finished_button)
+
+        button_row.addStretch(1)
+        tab_layout.addLayout(button_row)
+
+    def _checked_indices(self, list_widget: QListWidget) -> list[int]:
+        indices: list[int] = []
+        for row in range(list_widget.count()):
+            entry = list_widget.item(row)
+            if entry.checkState() == Qt.CheckState.Checked:
+                indices.append(int(entry.data(Qt.ItemDataRole.UserRole)))
+        return indices
+
+    def _remove_from_all_lists(self, indices: set[int]) -> None:
+        for list_widget in self.lists:
+            row = 0
+            while row < list_widget.count():
+                entry = list_widget.item(row)
+                if int(entry.data(Qt.ItemDataRole.UserRole)) in indices:
+                    list_widget.takeItem(row)
+                else:
+                    row += 1
+
+    def _remaining_count(self) -> int:
+        return self.lists[0].count() if self.lists else 0
+
+    def _apply(self, mode: str) -> None:
+        current_tab = self.tabs.currentIndex()
+        list_widget = self.lists[current_tab]
+        indices = self._checked_indices(list_widget)
+
+        if not indices:
             QMessageBox.information(
                 self, "Nothing selected",
-                "Check at least one item ID to apply the address to.",
+                "Check at least one item ID before applying.",
             )
             return
-        address = self.address_input.text().strip()
 
-        for row in sorted(rows, reverse=True):
-            original_index = self.list_widget.item(row).data(
-                Qt.ItemDataRole.UserRole
-            )
-            self.assignments[int(original_index)] = address
-            self.list_widget.takeItem(row)
+        if mode == "apply_location":
+            value = self.location_input.text().strip()
+            for idx in indices:
+                self.address_assignments[idx] = value
+            self.location_input.clear()
+        elif mode == "apply_ritm":
+            value = self.ritm_input.text().strip()
+            if not value:
+                QMessageBox.information(
+                    self, "No RITM entered",
+                    "Type a Request Item number before applying.",
+                )
+                return
+            for idx in indices:
+                self.ritm_assignments[idx] = value
+            self.ritm_input.clear()
+        elif mode == "apply_both":
+            location = self.both_location_input.text().strip()
+            ritm = self.both_ritm_input.text().strip()
+            if not location and not ritm:
+                QMessageBox.information(
+                    self, "Nothing to apply",
+                    "Enter a location and/or a Request Item before applying.",
+                )
+                return
+            for idx in indices:
+                if location:
+                    self.address_assignments[idx] = location
+                if ritm:
+                    self.ritm_assignments[idx] = ritm
+            self.both_location_input.clear()
+            self.both_ritm_input.clear()
 
-        remaining = self.list_widget.count()
+        self._remove_from_all_lists(set(indices))
+        remaining = self._remaining_count()
         if remaining == 0:
             self.status_label.setText(
-                "All items addressed. Click Finished to close."
+                "All items processed. Click Finished to close."
             )
         else:
             self.status_label.setText(
-                f"Applied to {len(rows)} item(s). {remaining} remaining."
+                f"Applied to {len(indices)} item(s). {remaining} remaining."
             )
-        self.address_input.clear()
 
     def _another_batch(self) -> None:
-        self.address_input.clear()
+        self.location_input.clear()
+        self.ritm_input.clear()
+        self.both_location_input.clear()
+        self.both_ritm_input.clear()
         self.status_label.setText(
-            "New batch started. Check items and enter the next address."
+            "New batch started. Check items and enter the next values."
         )
+
+
+# ---------------------------------------------------------------------------
+# Near-match confirmation dialog
+# ---------------------------------------------------------------------------
+
+class NearMatchConfirmDialog(QDialog):
+    def __init__(self, parent, candidate: NearMatch, index: int, total: int) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Possible item match ({index} of {total})")
+        self.setMinimumWidth(560)
+
+        self.accepted: bool = False
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Your item description:"))
+        mine = QLabel(candidate.term)
+        mine.setStyleSheet("font-weight: bold; font-size: 12pt; padding: 4px;")
+        layout.addWidget(mine)
+
+        layout.addWidget(QLabel("Close match found in email attachment:"))
+        theirs = QLabel(candidate.guess)
+        theirs.setStyleSheet("font-weight: bold; font-size: 12pt; padding: 4px;")
+        layout.addWidget(theirs)
+
+        detail = QLabel(
+            f"Similarity: {candidate.similarity:.0%}\n"
+            f"File: {candidate.folder} / {candidate.filename}\n"
+            f"Email: {candidate.subject}\n"
+            f"Received: {candidate.received}"
+        )
+        detail.setStyleSheet("color: #53645e; padding-top: 6px;")
+        layout.addWidget(detail)
+
+        layout.addWidget(QLabel("\nAre these the same item?"))
+
+        buttons = QDialogButtonBox()
+        same_button = buttons.addButton(
+            "Same", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        not_same_button = buttons.addButton(
+            "Not the same", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        same_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white; padding: 6px 16px;"
+        )
+        not_same_button.setStyleSheet("padding: 6px 16px;")
+        buttons.accepted.connect(self._on_same)
+        buttons.rejected.connect(self._on_not_same)
+        layout.addWidget(buttons)
+
+    def _on_same(self) -> None:
+        self.accepted = True
+        self.accept()
+
+    def _on_not_same(self) -> None:
+        self.accepted = False
+        self.reject()
+
+
+# ---------------------------------------------------------------------------
+# Resend picker dialog
+# ---------------------------------------------------------------------------
+
+class ResendPickerDialog(QDialog):
+    def __init__(
+        self,
+        parent,
+        ritm: str,
+        older: ExactMatch,
+        newer: ExactMatch,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Duplicate RITM detected: {ritm}")
+        self.setMinimumWidth(1000)
+        self.chosen: ExactMatch | None = None
+        self.older = older
+        self.newer = newer
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"RITM {ritm} was found in two emails. "
+            "The newer email is preselected. Review both and pick one, "
+            "or choose 'Skip this RITM' to leave it out of the queue."
+        ))
+
+        columns = QHBoxLayout()
+
+        def make_column(title: str, match: ExactMatch, is_newer: bool) -> QWidget:
+            box = QGroupBox(title)
+            box_layout = QVBoxLayout(box)
+
+            def add_field(label: str, value: str) -> None:
+                row = QHBoxLayout()
+                tag = QLabel(f"{label}:")
+                tag.setStyleSheet("font-weight: bold;")
+                tag.setFixedWidth(80)
+                row.addWidget(tag)
+                body = QLabel(value or "(none)")
+                body.setWordWrap(True)
+                row.addWidget(body, 1)
+                box_layout.addLayout(row)
+
+            add_field("Received", match.received)
+            add_field("From", f"{match.sender} <{match.sender_email}>")
+            add_field("Subject", match.subject)
+            add_field("Folder", match.folder)
+            add_field("File", match.filename)
+            add_field("Terms", ", ".join(sorted({match.term})))
+
+            if is_newer:
+                box.setStyleSheet(
+                    "QGroupBox { border: 2px solid #315b52; border-radius: 4px; "
+                    "margin-top: 8px; padding-top: 10px; }"
+                    "QGroupBox::title { subcontrol-origin: margin; "
+                    "subcontrol-position: top left; padding: 0 6px; "
+                    "color: #315b52; font-weight: bold; }"
+                )
+            return box
+
+        self.radio_older = QRadioButton("Use OLDER")
+        self.radio_newer = QRadioButton("Use NEWER")
+        self.radio_newer.setChecked(True)
+
+        older_col = QVBoxLayout()
+        older_col.addWidget(self.radio_older)
+        older_col.addWidget(make_column("OLDER email", older, is_newer=False))
+        columns.addLayout(older_col, 1)
+
+        newer_col = QVBoxLayout()
+        newer_col.addWidget(self.radio_newer)
+        newer_col.addWidget(make_column("NEWER email", newer, is_newer=True))
+        columns.addLayout(newer_col, 1)
+
+        layout.addLayout(columns)
+
+        buttons = QDialogButtonBox()
+        use_btn = buttons.addButton(
+            "Use selected", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        skip_btn = buttons.addButton(
+            "Skip this RITM", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        use_btn.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white; padding: 6px 16px;"
+        )
+        buttons.accepted.connect(self._on_use)
+        buttons.rejected.connect(self._on_skip)
+        layout.addWidget(buttons)
+
+    def _on_use(self) -> None:
+        self.chosen = self.newer if self.radio_newer.isChecked() else self.older
+        self.accept()
+
+    def _on_skip(self) -> None:
+        self.chosen = None
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Rename preview dialog
+# ---------------------------------------------------------------------------
+
+class RenamePreviewDialog(QDialog):
+    def __init__(self, parent, plans: list[dict]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Rename Files")
+        self.setMinimumWidth(820)
+        self.setMinimumHeight(520)
+
+        self.plans = plans
+        self.checkboxes: list[QCheckBox] = []
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Uncheck any file you don't want renamed, then click Apply."
+        ))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(6, 6, 6, 6)
+
+        for plan in plans:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 2, 0, 2)
+
+            box = QCheckBox()
+            can_rename = bool(plan["new_name"]) and plan["new_name"] != plan["old_name"]
+            box.setChecked(can_rename)
+            box.setEnabled(can_rename)
+            self.checkboxes.append(box)
+            row_layout.addWidget(box)
+
+            if can_rename:
+                label_text = (
+                    f"{plan['old_name']}\n"
+                    f"    -> {plan['new_name']}\n"
+                    f"    ({plan['reason']})"
+                )
+            else:
+                label_text = (
+                    f"{plan['old_name']}\n"
+                    f"    -> (skipped: {plan['reason']})"
+                )
+            label = QLabel(label_text)
+            if not can_rename:
+                label.setStyleSheet("color: #9baea6;")
+            row_layout.addWidget(label, 1)
+
+            container_layout.addWidget(row)
+
+        container_layout.addStretch(1)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Apply")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_plans(self) -> list[dict]:
+        chosen: list[dict] = []
+        for box, plan in zip(self.checkboxes, self.plans):
+            if box.isChecked() and plan["new_name"]:
+                chosen.append(plan)
+        return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -420,12 +999,6 @@ class AddressBatchDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class SourceMatchPickerDialog(QDialog):
-    """Radio-list picker for choosing which source email to pull the PDF from.
-
-    If the user clicks Cancel, `self.chosen` stays None and the caller
-    should skip the PDF for that record.
-    """
-
     def __init__(self, parent, identifier: str, matches: list[ExactMatch]) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"Choose source email for {identifier}")
@@ -624,8 +1197,11 @@ def write_packing_list_template(record: PackingListRecord, destination: Path) ->
     template = Path(__file__).resolve().parent / "Excel Bases" / "packing list example.xls"
     if not template.exists():
         raise FileNotFoundError(f"Packing-list template not found: {template}")
-    if len(record["items"]) > 23:
-        raise ValueError("The packing-list template has 23 item rows; split this RITM into another letter.")
+    if len(record["items"]) > MAX_ITEMS_PER_LOAD:
+        raise ValueError(
+            "The packing-list template has 23 item rows; split this RITM "
+            "into another letter."
+        )
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(template, destination)
@@ -636,19 +1212,23 @@ def write_packing_list_template(record: PackingListRecord, destination: Path) ->
     try:
         workbook = excel.Workbooks.Open(str(destination), UpdateLinks=0, ReadOnly=False)
         sheet = workbook.Worksheets("Packing List")
-        sheet.Range("H8").Value = datetime.combine(parse_date(record["date"]), datetime.min.time())
+
+        _safe_write(
+            sheet, "H8",
+            datetime.combine(parse_date(record["date"]), datetime.min.time()),
+        )
         sheet.Range("H8").NumberFormat = "mm/dd/yyyy"
-        sheet.Range("H9").Value = record["location"].strip() or "No Location"
-        sheet.Range("H10").Value = f"{record['packing_list']}-{record['letter']}"
+        _safe_write(sheet, "H9", record["location"].strip() or "No Location")
+        _safe_write(sheet, "H10", _packing_list_identifier(record))
 
         for row, item in enumerate(record["items"], start=13):
             description = item["description"]
             if item["type"]:
                 description = f"{description} ({item['type']})"
-            sheet.Cells(row, 2).Value = description
-            sheet.Cells(row, 8).Value = item["gross"]
-            sheet.Cells(row, 9).Value = item["tare"]
-            sheet.Cells(row, 10).Value = item["net"]
+            _safe_write(sheet, f"B{row}", description)
+            _safe_write(sheet, f"H{row}", item["gross"])
+            _safe_write(sheet, f"I{row}", item["tare"])
+            _safe_write(sheet, f"J{row}", item["net"])
 
         workbook.Save()
     finally:
@@ -674,7 +1254,7 @@ def write_scrap_pickup_template(record: PackingListRecord, destination: Path) ->
         sheet = workbook.Worksheets("SCRAPREM")
         request_date = datetime.combine(parse_date(record["date"]), datetime.min.time())
         for address in ("D15", "D33"):
-            sheet.Range(address).Value = request_date
+            _safe_write(sheet, address, request_date)
             sheet.Range(address).NumberFormat = "mm/dd/yyyy"
 
         location_parts = [
@@ -688,11 +1268,12 @@ def write_scrap_pickup_template(record: PackingListRecord, destination: Path) ->
         else:
             street = "No Location"
             city = ""
-        sheet.Range("F16").Value = record["ritm"] or "No Request Item"
-        sheet.Range("D19").Value = street
-        sheet.Range("D20").Value = city
-        sheet.Range("D34").Value = f"{record['packing_list']}-{record['letter']}"
-        sheet.Range("D35").Value = record["driver_plate"]
+
+        _safe_write(sheet, "F16", record["ritm"] or "No Request Item")
+        _safe_write(sheet, "D19", street)
+        _safe_write(sheet, "D20", city)
+        _safe_write(sheet, "D34", _packing_list_identifier(record))
+        _safe_write(sheet, "D35", record["driver_plate"].replace(" / ", "# "))
         workbook.Save()
     finally:
         if workbook is not None:
@@ -706,8 +1287,9 @@ def write_scrap_pickup_template(record: PackingListRecord, destination: Path) ->
 # ---------------------------------------------------------------------------
 
 def _packing_list_identifier(record: PackingListRecord) -> str:
-    if record["letter"]:
-        return f"{record['packing_list']}-{record['letter']}"
+    letter = (record.get("letter") or "").strip()
+    if letter:
+        return f"{record['packing_list']}-{letter}"
     return record["packing_list"]
 
 
@@ -727,13 +1309,20 @@ def _split_reel_id(description: str) -> tuple[str, str]:
 
 
 def _reel_summary_sort_key(record: PackingListRecord) -> tuple[int, int, str, str]:
-    receiving_date = parse_date(record["date"]).toordinal()
+    frn_date, _reason = _date_from_frn(record["packing_list"])
+    if frn_date is None:
+        try:
+            frn_date = parse_date(record["date"])
+        except Exception:
+            frn_date = date(2000, 1, 1)
+    receiving_date = frn_date.toordinal()
     reel_number = re.search(r"-(\d+)R(?:-|$)", record["packing_list"], re.IGNORECASE)
     reel_order = int(reel_number.group(1)) if reel_number else 1_000_000
+    letter = (record.get("letter") or "").strip().casefold()
     return (
         receiving_date,
         reel_order,
-        record["letter"].casefold(),
+        letter,
         _packing_list_identifier(record).casefold(),
     )
 
@@ -773,8 +1362,8 @@ def _read_reel_summary_record(sheet) -> PackingListRecord | None:
             "net": gross - tare,
         })
 
-    trucker = str(sheet.Range("F8").Value or "").strip()
-    trailer = str(sheet.Range("F9").Value or "").strip()
+    trucker = str(sheet.Range("G8").Value or "").strip()
+    trailer = str(sheet.Range("G9").Value or "").strip()
     return {
         "group": "",
         "ritm": str(sheet.Range("M5").Value or "").strip(),
@@ -831,10 +1420,13 @@ def _copy_template_reel_tabs(
         after_sheet = new_sheet
         created.append(new_sheet)
         for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
-            new_sheet.Range(address).Value = ""
-        new_sheet.Range("D12:H42").ClearContents()
+            _safe_write(new_sheet, address, "")
+        _clear_item_range(new_sheet, 12, 42, 4, 8)
 
     return created
+
+
+
 
 
 def write_reel_summary_report(
@@ -890,10 +1482,14 @@ def write_reel_summary_report(
 
             ordered_records = sorted(report_records.values(), key=_reel_summary_sort_key)
 
-            if any(len(record["items"]) > 31 for record in ordered_records):
-                record = next(record for record in ordered_records if len(record["items"]) > 31)
+            if any(len(record["items"]) > MAX_ITEMS_PER_SUMMARY_TAB for record in ordered_records):
+                record = next(
+                    record for record in ordered_records
+                    if len(record["items"]) > MAX_ITEMS_PER_SUMMARY_TAB
+                )
                 raise ValueError(
-                    f"{_packing_list_identifier(record)} has more reels than a report tab supports."
+                    f"{_packing_list_identifier(record)} has more reels than a "
+                    "report tab supports."
                 )
 
             if len(ordered_records) > len(reel_sheets):
@@ -927,31 +1523,32 @@ def write_reel_summary_report(
 
             for sheet in reel_sheets:
                 for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
-                    sheet.Range(address).Value = ""
-                sheet.Range("D12:H42").ClearContents()
+                    _safe_write(sheet, address, "")
+                _clear_item_range(sheet, 12, 42, 4, 8)
 
             for sheet, record in zip(reel_sheets, ordered_records):
                 driver, plate = _split_driver_and_plate(record["driver_plate"])
-                sheet.Range("M2").Value = _packing_list_identifier(record)
-                sheet.Range("M4").Value = datetime.combine(
-                    parse_date(record["date"]), datetime.min.time()
+                _safe_write(sheet, "M2", _packing_list_identifier(record))
+                _safe_write(
+                    sheet, "M4",
+                    datetime.combine(parse_date(record["date"]), datetime.min.time()),
                 )
                 sheet.Range("M4").NumberFormat = "mm/dd/yyyy"
-                sheet.Range("M5").Value = record["ritm"]
-                sheet.Range("C7").Value = record["location"].strip() or "No Location"
-                sheet.Range("I7").Value = sum(item["net"] for item in record["items"])
-                sheet.Range("C8").Value = "N/A"
-                sheet.Range("F8").Value = driver
-                sheet.Range("C9").Value = "N/A"
-                sheet.Range("F9").Value = plate
+                _safe_write(sheet, "M5", record["ritm"])
+                _safe_write(sheet, "C7", record["location"].strip() or "No Location")
+                _safe_write(sheet, "I7", sum(item["net"] for item in record["items"]))
+                _safe_write(sheet, "C8", "N/A")
+                _safe_write(sheet, "F8", driver)
+                _safe_write(sheet, "C9", "N/A")
+                _safe_write(sheet, "F9", plate)
 
                 for row, item in enumerate(record["items"], start=12):
                     reel_id, reel_size = _split_reel_id(item["description"])
-                    sheet.Cells(row, 4).Value = reel_id
-                    sheet.Cells(row, 5).Value = reel_size
-                    sheet.Cells(row, 6).Value = item["type"]
-                    sheet.Cells(row, 7).Value = item["gross"]
-                    sheet.Cells(row, 8).Value = item["tare"]
+                    _safe_write(sheet, f"D{row}", reel_id)
+                    _safe_write(sheet, f"E{row}", reel_size)
+                    _safe_write(sheet, f"F{row}", item["type"])
+                    _safe_write(sheet, f"G{row}", item["gross"])
+                    _safe_write(sheet, f"H{row}", item["tare"])
 
             for index, sheet in enumerate(reel_sheets, start=1):
                 if index <= len(ordered_records):
@@ -965,7 +1562,6 @@ def write_reel_summary_report(
                         n += 1
                         candidate = f"{n}R"
                     sheet.Name = candidate
-
             excel.CalculateFull()
             workbook.Save()
         finally:
@@ -1060,7 +1656,24 @@ class ScannerWorker(QThread):
                     existing_match = near_entries.get(key)
                     if existing_match is None or near_match.similarity > existing_match.similarity:
                         near_entries[key] = near_match
-                self.scan_complete.emit(ScanResults(exact_matches, list(near_entries.values())))
+
+                exact_matches.sort(key=lambda m: (
+                    m.received,
+                    m.folder.casefold(),
+                    m.subject.casefold(),
+                    m.filename.casefold(),
+                    m.term.casefold(),
+                ))
+                near_list = list(near_entries.values())
+                near_list.sort(key=lambda m: (
+                    m.received,
+                    m.folder.casefold(),
+                    m.subject.casefold(),
+                    m.filename.casefold(),
+                    m.term.casefold(),
+                    -m.similarity,
+                ))
+                self.scan_complete.emit(ScanResults(exact_matches, near_list))
         except Exception as error:
             self.scan_failed.emit(str(error))
 
@@ -1075,6 +1688,9 @@ class PackingListApp(QMainWindow):
         self.setWindowTitle("Scanner Packing Lists")
         self.resize(1180, 900)
         self.setMinimumSize(920, 720)
+
+        self.app_config = load_app_config()
+        self.summaries_folder = self._resolve_summaries_folder()
 
         self.records: list[PackingListRecord] = []
         self.exported_record_ids_by_directory: dict[str, set[str]] = {}
@@ -1104,6 +1720,19 @@ class PackingListApp(QMainWindow):
         self._build_interface()
 
     # ------------------------------------------------------------------
+    # Summaries folder
+    # ------------------------------------------------------------------
+
+    def _resolve_summaries_folder(self) -> Path:
+        configured = self.app_config.get("summaries_folder")
+        if configured:
+            p = Path(configured)
+            if p.is_dir():
+                return p
+        DEFAULT_SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+        return DEFAULT_SUMMARIES_DIR
+
+    # ------------------------------------------------------------------
     # Interface
     # ------------------------------------------------------------------
 
@@ -1123,6 +1752,16 @@ class PackingListApp(QMainWindow):
         hint.setStyleSheet("color: #53645e; margin-bottom: 8px;")
         root.addWidget(hint)
 
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Summaries folder:"))
+        self.summaries_label = QLabel(
+            f"{self.summaries_folder}  (auto-set from the Export Folder)"
+        )
+        self.summaries_label.setStyleSheet("color: #53645e;")
+        self.summaries_label.setWordWrap(True)
+        folder_row.addWidget(self.summaries_label, 1)
+        root.addLayout(folder_row)
+
         input_row = QHBoxLayout()
         self.open_sheet_button = QPushButton("Open Input Sheet")
         self.open_sheet_button.setStyleSheet(
@@ -1137,6 +1776,13 @@ class PackingListApp(QMainWindow):
         )
         self.import_sheet_button.clicked.connect(self._import_input_sheet)
         input_row.addWidget(self.import_sheet_button)
+
+        self.rename_files_button = QPushButton("Rename Files")
+        self.rename_files_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        self.rename_files_button.clicked.connect(self._rename_files)
+        input_row.addWidget(self.rename_files_button)
 
         self.next_load_button = QPushButton("Next Load")
         self.next_load_button.clicked.connect(self._next_load)
@@ -1337,10 +1983,14 @@ class PackingListApp(QMainWindow):
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("color: #53645e;")
         footer.addWidget(self.status_label, 1)
-        self.save_button = QPushButton("Export Workbook")
-        self.save_button.setStyleSheet("font-weight: bold;")
-        self.save_button.clicked.connect(self._save_records)
-        footer.addWidget(self.save_button)
+
+        self.export_folder_button = QToolButton()
+        self.export_folder_button.setText("📁 Export Folder…")
+        self.export_folder_button.setToolTip(
+            "Choose where the packing list workbooks and per-load folders go"
+        )
+        self.export_folder_button.clicked.connect(self._save_records)
+        footer.addWidget(self.export_folder_button)
         root.addLayout(footer)
 
     @staticmethod
@@ -1446,6 +2096,74 @@ class PackingListApp(QMainWindow):
             f"Imported {record['packing_list']}. Click Scan Item List to "
             "match it against Outlook."
         )
+
+    def _rename_files(self) -> None:
+        default_dir = working_dir()
+        if not default_dir.exists():
+            default_dir = Path(__file__).resolve().parent
+
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Choose the folder whose files should be renamed",
+            str(default_dir),
+        )
+        if not chosen:
+            return
+        folder = Path(chosen)
+
+        self.status_label.setText(f"Scanning {folder} for FRN numbers...")
+        QApplication.processEvents()
+
+        try:
+            plans = plan_file_renames(folder)
+        except Exception as error:
+            QMessageBox.critical(self, "Could not scan folder", str(error))
+            self.status_label.setText("Rename cancelled.")
+            return
+
+        if not plans:
+            QMessageBox.information(
+                self, "Nothing to do",
+                "That folder has no files to rename.",
+            )
+            self.status_label.setText("Rename cancelled.")
+            return
+
+        dialog = RenamePreviewDialog(self, plans)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Rename cancelled.")
+            return
+
+        selected = dialog.selected_plans()
+        if not selected:
+            self.status_label.setText("No files selected for renaming.")
+            return
+
+        renamed = 0
+        failures: list[str] = []
+        for plan in selected:
+            src: Path = plan["path"]
+            dst = src.with_name(plan["new_name"])
+            if dst.exists() and dst != src:
+                failures.append(
+                    f"{src.name}: '{plan['new_name']}' already exists"
+                )
+                continue
+            try:
+                src.rename(dst)
+                renamed += 1
+            except OSError as error:
+                failures.append(f"{src.name}: {error}")
+
+        message_lines = [f"Renamed {renamed} file(s)."]
+        if failures:
+            message_lines.append("")
+            message_lines.append("Warnings:")
+            message_lines.extend(f"  - {line}" for line in failures)
+        QMessageBox.information(
+            self, "Rename complete", "\n".join(message_lines)
+        )
+        self.status_label.setText(f"Renamed {renamed} file(s) in {folder}")
 
     def _next_load(self) -> None:
         if self.imported_record is not None:
@@ -1648,7 +2366,7 @@ class PackingListApp(QMainWindow):
         tare_total = sum(item["tare"] for item in record["items"])
         net_total = sum(item["net"] for item in record["items"])
         values = (
-            f"{record['packing_list']}-{record['letter']}",
+            _packing_list_identifier(record),
             record["ritm"],
             record["date"],
             record["packing_list"],
@@ -1660,63 +2378,6 @@ class PackingListApp(QMainWindow):
         )
         for column, value in enumerate(values):
             self.table.setItem(row, column, QTableWidgetItem(value))
-
-    def _append_unmatched_record(
-        self,
-        record: PackingListRecord,
-        items: list[ItemRecord],
-        addresses: dict[int, str] | None = None,
-    ) -> list[PackingListRecord]:
-        if not items:
-            return []
-        addresses = addresses or {}
-
-        grouped: dict[str, list[ItemRecord]] = {}
-        no_address_items: list[ItemRecord] = []
-        for idx, item in enumerate(items):
-            key = addresses.get(idx, "").strip()
-            if not key:
-                no_address_items.append(item)
-                continue
-            grouped.setdefault(key, []).append(item)
-        if no_address_items:
-            grouped[""] = no_address_items
-
-        ordered_groups = sorted(
-            grouped.items(),
-            key=lambda kv: (kv[0] == "", -len(kv[1])),
-        )
-
-        appended: list[PackingListRecord] = []
-        for address, group_items in ordered_groups:
-            if address:
-                parts = [p.strip() for p in address.split(",")]
-                if len(parts) >= 2:
-                    city_state = ", ".join(parts[1:])
-                    city_state = re.sub(
-                        r"\s+\d{5}(?:-\d{4})?\s*$", "", city_state
-                    ).strip()
-                    location = city_state.replace(",", "")
-                else:
-                    location = ""
-                location_address = address
-            else:
-                location = ""
-                location_address = ""
-            unmatched_record: PackingListRecord = {
-                **record,
-                "group": "no request item",
-                "ritm": "No Request Item",
-                "letter": self._next_packing_list_letter(
-                    record["packing_list"].casefold()
-                ),
-                "location": location,
-                "location_address": location_address,
-                "items": group_items,
-            }
-            self._append_record(unmatched_record)
-            appended.append(unmatched_record)
-        return appended
 
     def _next_packing_list_letter(self, packing_list_key: str) -> str:
         taken: set[str] = set()
@@ -1736,6 +2397,162 @@ class PackingListApp(QMainWindow):
                 return candidate
             number += 1
 
+    def _location_from_address(self, address: str) -> str:
+        parts = [p.strip() for p in address.split(",")]
+        if len(parts) < 2:
+            return ""
+        city_state = ", ".join(parts[1:])
+        city_state = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", city_state).strip()
+        return city_state.replace(",", "")
+
+    def _build_unmatched_records(
+        self,
+        record: PackingListRecord,
+        items: list[ItemRecord],
+        address_assignments: dict[int, str],
+        ritm_assignments: dict[int, str],
+        staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]],
+    ) -> list[PackingListRecord]:
+        packing_list_key = record["packing_list"].casefold()
+
+        buckets: dict[tuple[str, str], list[ItemRecord]] = {}
+        for idx, item in enumerate(items):
+            addr = address_assignments.get(idx, "").strip()
+            r = ritm_assignments.get(idx, "").strip()
+            buckets.setdefault((addr, r), []).append(item)
+
+        def existing_ritm_records() -> dict[str, PackingListRecord]:
+            return {
+                rec["ritm"].casefold(): rec
+                for rec in self.records
+                if rec["packing_list"].casefold() == packing_list_key
+                and rec["ritm"]
+                and rec["ritm"].casefold() != "no request item"
+            }
+
+        new_records: list[PackingListRecord] = []
+
+        for (address, ritm), group_items in buckets.items():
+            if ritm:
+                chosen_ritm = self._resolve_ritm_typo(ritm, packing_list_key)
+                target = existing_ritm_records().get(chosen_ritm.casefold())
+                if target is not None:
+                    self._merge_items_into_record(
+                        target, group_items, packing_list_key
+                    )
+                    continue
+                new_record: PackingListRecord = {
+                    **record,
+                    "group": chosen_ritm.casefold(),
+                    "ritm": chosen_ritm,
+                    "letter": "",
+                    "location": self._location_from_address(address) if address else "",
+                    "location_address": address,
+                    "items": group_items,
+                }
+                self._append_record(new_record)
+                new_records.append(new_record)
+            else:
+                new_record: PackingListRecord = {
+                    **record,
+                    "group": "no request item",
+                    "ritm": "No Request Item",
+                    "letter": "",
+                    "location": self._location_from_address(address) if address else "",
+                    "location_address": address,
+                    "items": group_items,
+                }
+                self._append_record(new_record)
+                new_records.append(new_record)
+
+        return new_records
+
+    def _merge_items_into_record(
+        self,
+        target: PackingListRecord,
+        items: list[ItemRecord],
+        packing_list_key: str,
+    ) -> None:
+        remaining = list(items)
+        current = target
+        while remaining:
+            space = MAX_ITEMS_PER_LOAD - len(current["items"])
+            if space <= 0:
+                sibling: PackingListRecord = {
+                    **current,
+                    "letter": "",
+                    "items": [],
+                }
+                self._append_record(sibling)
+                current = sibling
+                space = MAX_ITEMS_PER_LOAD
+            take = min(space, len(remaining))
+            current["items"].extend(remaining[:take])
+            remaining = remaining[take:]
+
+        self._refresh_queue_table()
+
+    def _resolve_ritm_typo(self, typed_ritm: str, packing_list_key: str) -> str:
+        typed_norm = normalize_ritm(typed_ritm)
+        known = {
+            rec["ritm"]: rec["ritm"]
+            for rec in self.records
+            if rec["packing_list"].casefold() == packing_list_key
+            and rec["ritm"]
+            and rec["ritm"].casefold() != "no request item"
+        }
+        if not known:
+            return typed_ritm
+        for existing in known:
+            if normalize_ritm(existing) == typed_norm:
+                return existing
+
+        candidates: list[tuple[str, float]] = []
+        for existing in known:
+            existing_norm = normalize_ritm(existing)
+            ratio = SequenceMatcher(None, typed_norm, existing_norm).ratio()
+            if ratio >= 0.90:
+                candidates.append((existing, ratio))
+        if not candidates:
+            return typed_ritm
+        candidates.sort(key=lambda x: -x[1])
+        best, ratio = candidates[0]
+        answer = QMessageBox.question(
+            self,
+            "Possible RITM typo",
+            f"You typed: {typed_ritm}\n\n"
+            f"A Request Item on this load is very close:\n"
+            f"    {best}   (similarity {ratio:.0%})\n\n"
+            f"Did you mean {best}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            return best
+        return typed_ritm
+
+    def _refresh_queue_table(self) -> None:
+        self.table.setRowCount(0)
+        for record in self.records:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            gross_total = sum(item["gross"] for item in record["items"])
+            tare_total = sum(item["tare"] for item in record["items"])
+            net_total = sum(item["net"] for item in record["items"])
+            values = (
+                _packing_list_identifier(record),
+                record["ritm"],
+                record["date"],
+                record["packing_list"],
+                record["driver_plate"],
+                str(len(record["items"])),
+                f"{gross_total:,}",
+                f"{tare_total:,}",
+                f"{net_total:,}",
+            )
+            for column, value in enumerate(values):
+                self.table.setItem(row, column, QTableWidgetItem(value))
+
     def _clear_current_list(self) -> None:
         self.packing_list_input.clear()
         self.driver_plate_input.clear()
@@ -1750,6 +2567,7 @@ class PackingListApp(QMainWindow):
         for widget in (
             self.open_sheet_button,
             self.import_sheet_button,
+            self.rename_files_button,
             self.next_load_button,
             self.manual_toggle_button,
             self.date_input,
@@ -1763,7 +2581,7 @@ class PackingListApp(QMainWindow):
             self.delete_item_button,
             self.items_table,
             self.scan_button,
-            self.save_button,
+            self.export_folder_button,
         ):
             widget.setEnabled(enabled)
 
@@ -1810,7 +2628,12 @@ class PackingListApp(QMainWindow):
 
         self.visible_email_matches = sorted(
             self.matched_emails_by_key.values(),
-            key=lambda email: (email.ritm.casefold(), email.received),
+            key=lambda email: (
+                email.ritm.casefold(),
+                email.received,
+                email.subject.casefold(),
+                email.folder.casefold(),
+            ),
             reverse=True,
         )
         self.email_table.setRowCount(0)
@@ -1992,6 +2815,111 @@ class PackingListApp(QMainWindow):
         self.scan_worker.scan_failed.connect(self._scan_failed)
         self.scan_worker.start()
 
+    def _confirm_near_matches(
+        self,
+        near_matches: list[NearMatch],
+    ) -> set[tuple[str, str, str]]:
+        accepted: set[tuple[str, str, str]] = set()
+
+        seen: set[tuple[str, str, str]] = set()
+        candidates: list[NearMatch] = []
+        for candidate in near_matches:
+            key = (
+                candidate.term.casefold(),
+                candidate.folder.casefold(),
+                candidate.filename.casefold(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+
+        if not candidates:
+            return accepted
+
+        total = len(candidates)
+        for index, candidate in enumerate(candidates, start=1):
+            dialog = NearMatchConfirmDialog(self, candidate, index, total)
+            dialog.exec()
+            if dialog.accepted:
+                accepted.add((
+                    candidate.term.casefold(),
+                    candidate.folder.casefold(),
+                    candidate.filename.casefold(),
+                ))
+        return accepted
+
+    @staticmethod
+    def _parse_received(text: str) -> datetime:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return datetime.min
+
+    @staticmethod
+    def _email_key(match: ExactMatch) -> str:
+        return match.entry_id or f"{match.folder}|{match.subject}|{match.received}|{match.filename}"
+
+    def _resolve_resent_emails(
+        self,
+        subject_matches: list[ExactMatch],
+    ) -> tuple[list[ExactMatch], set[str]]:
+        groups: dict[tuple[str, str], list[ExactMatch]] = {}
+        for match in subject_matches:
+            for ritm in match.subject_ritms:
+                key = (match.subject.casefold(), ritm.casefold())
+                groups.setdefault(key, []).append(match)
+
+        skipped_ritms: set[str] = set()
+        keep_ids: set[str] = set()
+
+        for (subject_key, ritm_key), group in groups.items():
+            unique_sources: dict[str, list[ExactMatch]] = {}
+            for match in group:
+                unique_sources.setdefault(self._email_key(match), []).append(match)
+            if len(unique_sources) < 2:
+                continue
+
+            sorted_sources = sorted(
+                unique_sources.values(),
+                key=lambda ms: self._parse_received(ms[0].received),
+                reverse=True,
+            )
+            newer_email = sorted_sources[0][0]
+            older_email = sorted_sources[1][0]
+
+            dialog = ResendPickerDialog(
+                self, ritm_key.upper(), older_email, newer_email
+            )
+            dialog.exec()
+            if dialog.chosen is None:
+                skipped_ritms.add(ritm_key)
+            else:
+                keep_ids.add(self._email_key(dialog.chosen))
+
+        filtered: list[ExactMatch] = []
+        for match in subject_matches:
+            match_ritm_keys = [r.casefold() for r in match.subject_ritms]
+            if any(r in skipped_ritms for r in match_ritm_keys):
+                continue
+
+            kept = False
+            for ritm_key in match_ritm_keys:
+                group = groups.get((match.subject.casefold(), ritm_key), [])
+                unique_srcs = {self._email_key(m) for m in group}
+                if len(unique_srcs) < 2:
+                    kept = True
+                    break
+                if self._email_key(match) in keep_ids:
+                    kept = True
+                    break
+            if kept:
+                filtered.append(match)
+
+        return filtered, skipped_ritms
+
     def _scan_finished(self, results: ScanResults) -> None:
         record = self.pending_record
         if record is None:
@@ -2002,19 +2930,26 @@ class PackingListApp(QMainWindow):
         if not subject_matches:
             dialog = AddressBatchDialog(self, record["items"])
             dialog.exec()
-            appended = self._append_unmatched_record(
-                record, record["items"], dialog.assignments
+            new_records = self._build_unmatched_records(
+                record,
+                record["items"],
+                dialog.address_assignments,
+                dialog.ritm_assignments,
+                [],
             )
             self.pending_record = None
             self.imported_record = None
             self.imported_source_path = None
-            if not appended:
+            if not new_records:
                 self._set_processing_state(True)
                 self.scan_results_label.setText("There are no items to queue as unmatched.")
                 self.status_label.setText("No items found to queue.")
                 return
+            # Single-load: no letter.
+            self._assign_letters_by_priority(record["packing_list"].casefold())
+            self._refresh_queue_table()
             queued_ids = ", ".join(
-                _packing_list_identifier(r) for r in appended
+                _packing_list_identifier(r) for r in new_records
             )
             self._clear_current_list()
             self.imported_info_label.setText("No input sheet imported yet.")
@@ -2026,16 +2961,29 @@ class PackingListApp(QMainWindow):
             self.status_label.setText("Queued all items as unmatched.")
             return
 
+        accepted_near_keys = self._confirm_near_matches(results.near_matches)
+
+        subject_matches, skipped_ritms = self._resolve_resent_emails(subject_matches)
+        if not subject_matches:
+            self.pending_record = None
+            self.imported_record = None
+            self.imported_source_path = None
+            self._set_processing_state(True)
+            self.scan_results_label.setText(
+                "All matched RITMs were skipped. Nothing queued."
+            )
+            self.status_label.setText("Scan finished with no items queued.")
+            return
+
+        found_ritms = sorted({
+            ritm for match in subject_matches for ritm in match.subject_ritms
+            if ritm.casefold() not in skipped_ritms
+        })
         exact_summary = sorted({
             f"{match.term}: {match.folder} / {match.filename}"
             for match in subject_matches
         })
-        found_ritms = sorted({
-            ritm for match in subject_matches for ritm in match.subject_ritms
-        })
-        assigned_ritms = found_ritms
 
-        queued_packing_lists = []
         assigned_item_indexes: set[int] = set()
         ritm_letters: dict[str, str] = {}
         matched_email_count = len({
@@ -2045,55 +2993,36 @@ class PackingListApp(QMainWindow):
         total_accepted_files = 0
         staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]] = []
 
-        for ritm in assigned_ritms:
+        for ritm in found_ritms:
             ritm_key = ritm.casefold()
-            if found_ritms:
-                ritm_matches = [
-                    match for match in subject_matches if ritm in match.subject_ritms
-                ]
-            else:
-                ritm_matches = []
+            ritm_matches = [
+                match for match in subject_matches
+                if ritm in match.subject_ritms
+            ]
             if not ritm_matches:
                 continue
 
             current_matched_terms = {match.term.casefold() for match in ritm_matches}
-            matched_terms = set(current_matched_terms)
             exact_files = {f"{match.folder} / {match.filename}" for match in ritm_matches}
             accepted_files: set[str] = set()
             accepted_terms = set()
-            seen_candidates: set[tuple[str, str, str]] = set()
+
             for candidate in results.near_matches:
-                if (
-                    candidate.term.casefold() not in matched_terms
-                    or ritm not in candidate.subject_ritms
-                ):
-                    continue
                 candidate_key = (
                     candidate.term.casefold(),
                     candidate.folder.casefold(),
                     candidate.filename.casefold(),
                 )
-                if candidate_key in seen_candidates:
+                if candidate_key not in accepted_near_keys:
                     continue
-                seen_candidates.add(candidate_key)
-                answer = QMessageBox.question(
-                    self,
-                    "Possible item match",
-                    f"This attachment contains '{candidate.guess}', similar to item "
-                    f"'{candidate.term}' ({candidate.similarity:.0%}).\n\n"
-                    f"File: {candidate.folder} / {candidate.filename}\n"
-                    f"Email: {candidate.subject}\n"
-                    f"Include this possible item in RITM {ritm.upper()}?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
+                if ritm not in candidate.subject_ritms:
+                    continue
+                accepted_files.add(
+                    f"{candidate.folder} / {candidate.filename} "
+                    f"(accepted near match: {candidate.guess} for {candidate.term})"
                 )
-                if answer == QMessageBox.StandardButton.Yes:
-                    accepted_files.add(
-                        f"{candidate.folder} / {candidate.filename} "
-                        f"(accepted near match: {candidate.guess} for {candidate.term})"
-                    )
-                    accepted_terms.add(candidate.term.casefold())
-                    total_accepted_files += len(accepted_files)
+                accepted_terms.add(candidate.term.casefold())
+                total_accepted_files += 1
 
             existing_group = self.groups.get(ritm_key)
             if existing_group is not None:
@@ -2133,45 +3062,60 @@ class PackingListApp(QMainWindow):
                 "group": ritm_key,
                 "location": next(
                     (match.location for match in ritm_matches if match.location), ""
-                ),
+                ) or record.get("location", ""),
                 "location_address": next(
                     (match.location_address for match in ritm_matches if match.location_address),
                     "",
-                ),
+                ) or record.get("location_address", ""),
                 "items": matched_items,
             }
             staged_ritm_records.append((ritm_record, ritm_matches))
 
-        def _ritm_sort_key(entry: tuple[PackingListRecord, list[ExactMatch]]):
-            rec, _ = entry
-            has_location = bool(rec["location"].strip())
-            tier = 0 if has_location else 1
-            return (tier, -len(rec["items"]), rec["ritm"].casefold())
-
-        staged_ritm_records.sort(key=_ritm_sort_key)
-
-        for ritm_record, ritm_matches in staged_ritm_records:
-            letter = self._next_packing_list_letter(record["packing_list"].casefold())
-            ritm_record["letter"] = letter
-            ritm_letters[ritm_record["group"]] = letter
+        # Append records now, but defer record_source_matches keying until
+        # after letters are assigned (below), since the identifier includes
+        # the letter (or is the bare FRN for a single-load family).
+        for ritm_record, _ in staged_ritm_records:
             self._append_record(ritm_record)
-            self.record_source_matches[_packing_list_identifier(ritm_record)] = list(ritm_matches)
-            queued_packing_lists.append(f"{record['packing_list']}-{letter}")
 
         unmatched_items = [
             item for index, item in enumerate(record["items"])
             if index not in assigned_item_indexes
         ]
+        dialog_new_records: list[PackingListRecord] = []
         if unmatched_items:
             dialog = AddressBatchDialog(self, unmatched_items)
             dialog.exec()
-            appended = self._append_unmatched_record(
-                record, unmatched_items, dialog.assignments
+            dialog_new_records = self._build_unmatched_records(
+                record,
+                unmatched_items,
+                dialog.address_assignments,
+                dialog.ritm_assignments,
+                staged_ritm_records,
             )
-            for unmatched_record in appended:
-                queued_packing_lists.append(
-                    f"{_packing_list_identifier(unmatched_record)} (unmatched)"
+
+        all_records_for_letters: list[PackingListRecord] = (
+            [r for r, _ in staged_ritm_records] + dialog_new_records
+        )
+        for r in all_records_for_letters:
+            if not r["letter"]:
+                r["letter"] = self._next_packing_list_letter(
+                    record["packing_list"].casefold()
                 )
+        self._assign_letters_by_priority(record["packing_list"].casefold())
+        self._refresh_queue_table()
+
+        # NOW the letters are final; key record_source_matches by identifier
+        # so _save_records can find them and write the Request Item PDFs.
+        for ritm_record, ritm_matches in staged_ritm_records:
+            self.record_source_matches[_packing_list_identifier(ritm_record)] = list(ritm_matches)
+
+
+
+        ritm_letters = {}
+        for r in self.records:
+            if r["packing_list"].casefold() == record["packing_list"].casefold():
+                if r["ritm"] and r["ritm"].casefold() != "no request item":
+                    ritm_letters[r["ritm"].casefold()] = r["letter"]
 
         self._merge_matched_emails(
             subject_matches,
@@ -2180,13 +3124,12 @@ class PackingListApp(QMainWindow):
             record["packing_list"],
         )
 
-        if not queued_packing_lists:
-            self.pending_record = None
-            self.imported_record = None
-            self.imported_source_path = None
-            self._set_processing_state(True)
-            self.status_label.setText("No matched items could be assigned to an RITM group.")
-            return
+        queued_packing_lists = [
+            _packing_list_identifier(r)
+            for r in self.records
+            if r["packing_list"].casefold() == record["packing_list"].casefold()
+        ]
+
         self.pending_record = None
         self.imported_record = None
         self.imported_source_path = None
@@ -2203,6 +3146,40 @@ class PackingListApp(QMainWindow):
         self.status_label.setText(
             f"Processed packing list IDs {', '.join(queued_packing_lists)}."
         )
+
+    def _assign_letters_by_priority(self, packing_list_key: str) -> None:
+        this_list = [
+            r for r in self.records
+            if r["packing_list"].casefold() == packing_list_key
+        ]
+
+        # Single-load family: no letter at all — identifier stays bare FRN.
+        if len(this_list) == 1:
+            this_list[0]["letter"] = ""
+            return
+
+        def key(r: PackingListRecord):
+            has_ritm = bool(r["ritm"]) and r["ritm"].casefold() != "no request item"
+            has_loc = bool(r["location"].strip() or r["location_address"].strip())
+            if has_ritm and has_loc:
+                tier = 0
+            elif has_ritm:
+                tier = 1
+            elif has_loc:
+                tier = 2
+            else:
+                tier = 3
+            return (tier, -len(r["items"]), r["ritm"].casefold(), r["group"])
+
+        this_list.sort(key=key)
+
+        for i, r in enumerate(this_list):
+            number = i + 1
+            letters = ""
+            while number:
+                number, rem = divmod(number - 1, 26)
+                letters = chr(ord("A") + rem) + letters
+            r["letter"] = letters
 
     def _scan_failed(self, error: str) -> None:
         self.pending_record = None
@@ -2261,17 +3238,27 @@ class PackingListApp(QMainWindow):
             )
             return
 
-        default_directory = Path(__file__).resolve().parent / "packing_list_exports"
         selected_directory = QFileDialog.getExistingDirectory(
             self,
-            "Choose where to save packing lists and the Reel Summary Report",
-            str(default_directory),
+            "Choose where to save packing lists, per-load folders, and the "
+            "Reel Summary Report",
+            str(self.summaries_folder.parent if self.summaries_folder.parent.is_dir() else DEFAULT_SUMMARIES_DIR.parent),
         )
         if not selected_directory:
             return
         destination_directory = Path(selected_directory)
         directory_key = str(destination_directory.resolve()).casefold()
         exported_record_ids = self.exported_record_ids_by_directory.get(directory_key, set())
+
+        # Summaries live in a 'Summaries' subfolder of the export folder.
+        self.summaries_folder = destination_directory / "Summaries"
+        self.summaries_folder.mkdir(parents=True, exist_ok=True)
+        self.summaries_label.setText(
+            f"{self.summaries_folder}  (auto-set from the Export Folder)"
+        )
+        self.app_config["summaries_folder"] = str(self.summaries_folder)
+        save_app_config(self.app_config)
+
         records_to_export = [
             record for record in self.records
             if _packing_list_identifier(record).casefold() not in exported_record_ids
@@ -2285,8 +3272,14 @@ class PackingListApp(QMainWindow):
             safe = re.sub(
                 r"[^A-Za-z0-9._-]+", "_", record["packing_list"]
             ).strip("._-") or "PackingList"
+            # Single-load family: file name is the bare FRN (no trailing dash,
+            # no letter).
+            if record["letter"]:
+                file_suffix = f"{safe}-{record['letter']}"
+            else:
+                file_suffix = safe
             packing_list_paths.append(
-                destination_directory / f"Packing List {safe}-{record['letter']}.xls"
+                destination_directory / f"Packing List {file_suffix}.xls"
             )
             load_folder = destination_directory / identifier
             per_load_folders.append(load_folder)
@@ -2320,9 +3313,26 @@ class PackingListApp(QMainWindow):
                 return
 
         records_by_week: dict[tuple[date, date], list[PackingListRecord]] = {}
+        frn_date_warnings: list[str] = []
         for record in self.records:
+            frn_date, reason = _date_from_frn(record["packing_list"])
+            if frn_date is None:
+                frn_date_warnings.append(
+                    f"{_packing_list_identifier(record)}: "
+                    f"could not read a valid date from the FRN ({reason}); "
+                    f"using the typed date {record['date']} instead."
+                )
+                try:
+                    frn_date = parse_date(record["date"])
+                except Exception as error:
+                    QMessageBox.critical(
+                        self,
+                        "Could not read a record's date",
+                        f"{_packing_list_identifier(record)}: {error}",
+                    )
+                    return
             try:
-                monday, friday = week_range(record["date"])
+                monday, friday = week_range(frn_date.isoformat())
             except Exception as error:
                 QMessageBox.critical(
                     self,
@@ -2337,7 +3347,7 @@ class PackingListApp(QMainWindow):
         try:
             for (monday, friday), week_records in records_by_week.items():
                 filename = summary_filename(monday, friday)
-                weekly_path = destination_directory / filename
+                weekly_path = self.summaries_folder / filename
                 write_reel_summary_report(week_records, weekly_path)
 
             for record, pl_path, load_folder, sp_path in zip(
@@ -2402,8 +3412,13 @@ class PackingListApp(QMainWindow):
         info_lines = [
             f"Saved {count} packing-list workbook(s) (top-level)",
             f"Created {count} per-load folder(s) with Scrap Pickup + Request Item PDF",
-            f"Updated {week_count} weekly Reel Summary Report(s)",
+            f"Wrote {week_count} weekly Reel Summary Report(s) to "
+            f"{self.summaries_folder}",
         ]
+        if frn_date_warnings:
+            info_lines.append("")
+            info_lines.append("FRN date warnings:")
+            info_lines.extend(f"  - {msg}" for msg in frn_date_warnings)
         if pdf_failures:
             info_lines.append("")
             info_lines.append("PDF warnings:")
