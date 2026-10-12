@@ -760,15 +760,23 @@ class SolverWorker(QThread):
 
     def _do_solve(self):
         remaining = dict(self.totals)
+        print("=== SOLVER INPUT ===")
+        print("totals:", self.totals)
+        print("bundles:")
+        for load, items, total in self.raw_bundles:
+            print(f"  {load}: items={items}  total={total}")
+        print("====================")
         bundles = []
         locked = []
         for load, items, total in self.raw_bundles:
+            # Only keep items that actually have a positive budget. A load's
+            # Class cell may mention a material that the user left at 0
+            # (empty-reel stuff) — those are simply not part of the split.
+            items = [it for it in items if it in remaining]
             if not items:
-                raise ValueError(f"Load {load} has no materials.")
+                raise ValueError(f"Load {load} has no materials with weight.")
             if len(items) == 1:
                 item = items[0]
-                if item not in remaining:
-                    raise ValueError(f"Unknown material '{item}' in load {load}.")
                 remaining[item] -= total
                 locked.append({"load": load, "items": items, "weights": {item: total}})
             else:
@@ -1237,32 +1245,54 @@ class SplitMaterialWindow(QMainWindow):
             updated_loads.append(ld)
         self.loads = updated_loads
 
+        # --- Materials tab -> totals + known_materials ---
+        # Blank or 0 weight = "known but zero" (empty-reel / other). The name
+        # is remembered so loads that mention it still validate, but it is not
+        # added to `totals`, so the solver never deals with a 0-valued item.
         totals: dict[str, int] = {}
+        known_materials: set[str] = set()
+        rows_to_keep: list[tuple[str, str]] = []
         for r in range(self.mats_table.rowCount()):
             name_item = self.mats_table.item(r, 0)
             weight_item = self.mats_table.item(r, 1)
-            if not name_item or not weight_item:
+            if not name_item:
                 continue
             name = normalize_material(name_item.text())
-            weight_text = weight_item.text().strip()
-            if not name or not weight_text:
+            if not name:
                 continue
+            weight_text = (weight_item.text().strip() if weight_item else "")
+
+            if not weight_text:
+                known_materials.add(norm(name))
+                continue   # drop from tab (blank = known-but-zero)
             try:
                 w_val = int(weight_text)
             except ValueError:
                 QMessageBox.critical(self, "Bad material weight",
                                      f"Material row {r+1}: '{weight_text}' is not an integer.")
                 return
-            if w_val <= 0:
+            if w_val < 0:
                 QMessageBox.critical(self, "Bad material weight",
-                                     f"Material row {r+1}: weight must be positive.")
+                                     f"Material row {r+1}: weight cannot be negative.")
                 return
-            totals[norm(name)] = w_val
 
-        if not totals:
+            key = norm(name)
+            known_materials.add(key)
+            if w_val > 0:
+                totals[key] = w_val
+                rows_to_keep.append((name, weight_text))
+            # w_val == 0 -> known-but-zero, drop from tab
+
+        # Rewrite the tab without the known-but-zero rows.
+        self.mats_table.setRowCount(0)
+        for name, weight_text in rows_to_keep:
+            self._add_material_row(name, weight_text)
+
+        if not known_materials:
             QMessageBox.warning(self, "No materials", "Add at least one material.")
             return
 
+        # --- Build bundles, dropping any known-zero materials ---
         raw_bundles: list[tuple[str, list[str], int]] = []
         for ld in self.loads:
             if ld.bundle_total <= 0:
@@ -1274,17 +1304,26 @@ class SplitMaterialWindow(QMainWindow):
                     if m and m not in mats:
                         mats.append(m)
             for it in mats:
-                if it not in totals:
+                if it not in known_materials:
                     QMessageBox.critical(
                         self, "Unknown material",
                         f"Load {ld.identifier} uses material '{it}' "
                         f"but no total weight was entered for it."
                     )
                     return
-            raw_bundles.append((ld.identifier, mats, ld.bundle_total))
+            # Only pass along materials that actually have a positive total;
+            # everything else is "known but ignored".
+            billable = [it for it in mats if it in totals]
+            if not billable:
+                # A load with no billable materials is fine — nothing to split.
+                continue
+            raw_bundles.append((ld.identifier, billable, ld.bundle_total))
 
         if not raw_bundles:
-            QMessageBox.warning(self, "No bundle totals", "No load has a total to solve.")
+            QMessageBox.warning(
+                self, "Nothing to split",
+                "No load has any material with a positive total weight."
+            )
             return
 
         self.run_button.setEnabled(False)
