@@ -176,8 +176,11 @@ def find_location_address_in_text(text):
 
         address = match.group(1).strip()
         for following_line in lines[index + 1:index + 4]:
+            # Stop as soon as we have a street and a city. Two non-empty
+            # comma-separated parts is a complete-enough address; anything
+            # more would pull in the sentence that follows.
             address_parts = [part.strip() for part in address.split(",")]
-            if len(address_parts) >= 3 and address_parts[2]:
+            if len(address_parts) >= 2 and address_parts[0] and address_parts[1]:
                 break
             following_line = following_line.strip()
             if not following_line:
@@ -187,7 +190,7 @@ def find_location_address_in_text(text):
             address = f"{address} {following_line}".strip()
 
         parts = [part.strip() for part in address.split(",")]
-        if len(parts) < 3 or not parts[1] or not parts[2]:
+        if len(parts) < 2 or not parts[0] or not parts[1]:
             continue
         return ", ".join(parts)
     return ""
@@ -195,13 +198,15 @@ def find_location_address_in_text(text):
 
 def find_location_in_text(text):
     parts = [part.strip() for part in find_location_address_in_text(text).split(",")]
-    if len(parts) < 3 or not parts[1] or not parts[2]:
+    if len(parts) < 2 or not parts[0] or not parts[1]:
         return ""
-    state_match = re.match(r"([A-Za-z]{2})\b", parts[2])
-    state = state_match.group(1).upper() if state_match else parts[2].split()[0]
-    return f"{parts[1]} {state}"
-
-
+    # The city is now parts[1]. If there's a state after it, include it.
+    city = parts[1]
+    if len(parts) >= 3 and parts[2]:
+        state_match = re.match(r"([A-Za-z]{2})\b", parts[2])
+        if state_match:
+            return f"{city} {state_match.group(1).upper()}"
+    return city
 # ---------------------------------------------------------------------------
 # Fuzzy matching (length-bucketed, SequenceMatcher reused)
 # ---------------------------------------------------------------------------
