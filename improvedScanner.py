@@ -20,7 +20,7 @@ JSON_RESULTS_FILE = os.environ.get("SCAN_RESULTS_JSON")
 
 # Fuzzy matching settings
 FUZZY_ENABLED = True       # set to False to disable near-miss detection
-FUZZY_THRESHOLD = 0.85    # 0.0 = anything, 1.0 = exact. 0.85 ~ "one char off"
+FUZZY_THRESHOLD = 0.85     # 0.0 = anything, 1.0 = exact. 0.85 ~ "one char off"
 FUZZY_MIN_LEN = 6          # skip fuzzy matching for terms shorter than this
 
 # --- Load search terms ---
@@ -42,6 +42,9 @@ if not SEARCH_TERMS:
     print(f"{LIST_FILE} is empty.")
     input("Press Enter to exit...")
     exit(1)
+
+# Precompute lowercase view of search terms once.
+SEARCH_TERMS_LOWER = [(t, t.lower()) for t in SEARCH_TERMS]
 
 # --- Ask for time range ---
 print("\nChoose a time range to scan:")
@@ -90,6 +93,11 @@ skipped_count = 0
 gui_exact_matches = []
 gui_near_matches = []
 
+
+# ---------------------------------------------------------------------------
+# Attachment reading / text extraction
+# ---------------------------------------------------------------------------
+
 def read_attachment_bytes(attachment):
     try:
         suffix = os.path.splitext(attachment.FileName)[1]
@@ -103,6 +111,7 @@ def read_attachment_bytes(attachment):
     except Exception as e:
         print(f"  [!] Could not read {attachment.FileName}: {e}")
         return None
+
 
 def extract_text_from_bytes(data, filename):
     ext = os.path.splitext(filename)[1].lower()
@@ -131,19 +140,32 @@ def extract_text_from_bytes(data, filename):
         print(f"  [!] Could not parse {filename}: {e}")
         return ""
 
+
+# ---------------------------------------------------------------------------
+# Term / RITM / location extraction
+# ---------------------------------------------------------------------------
+
 def find_terms_in_text(text):
     if not text:
         return set()
     lowered = text.lower()
-    return {term for term in SEARCH_TERMS if term.lower() in lowered}
+    # Fast path: bail out as soon as all terms are found (rare but cheap).
+    hits = set()
+    for term, term_lower in SEARCH_TERMS_LOWER:
+        if term_lower in lowered:
+            hits.add(term)
+    return hits
+
 
 RITM_RE = re.compile(r"\bRITM[\s:#-]*\d+\b", re.IGNORECASE)
+
 
 def find_ritms_in_text(text):
     return sorted({
         re.sub(r"[^A-Za-z0-9]", "", match).upper()
         for match in RITM_RE.findall(text or "")
     })
+
 
 def find_location_address_in_text(text):
     lines = (text or "").splitlines()
@@ -170,6 +192,7 @@ def find_location_address_in_text(text):
         return ", ".join(parts)
     return ""
 
+
 def find_location_in_text(text):
     parts = [part.strip() for part in find_location_address_in_text(text).split(",")]
     if len(parts) < 3 or not parts[1] or not parts[2]:
@@ -178,34 +201,52 @@ def find_location_in_text(text):
     state = state_match.group(1).upper() if state_match else parts[2].split()[0]
     return f"{parts[1]} {state}"
 
+
+# ---------------------------------------------------------------------------
+# Fuzzy matching (length-bucketed, SequenceMatcher reused)
+# ---------------------------------------------------------------------------
+
 WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
-def find_near_misses(text, unmatched_terms):
+
+def _build_words_by_len(text):
+    """Return {length: [(orig, lower), ...]} for words in text."""
+    words = set(WORD_RE.findall(text))
+    words_by_len = defaultdict(list)
+    for w in words:
+        w_low = w.lower()
+        words_by_len[len(w_low)].append((w, w_low))
+    return words_by_len
+
+
+def find_near_misses_from_words_by_len(words_by_len, unmatched_terms):
     """
-    For each unmatched term (long enough to be fuzzy-matched), look for
-    a word in `text` that is close enough to be considered a likely typo.
-    Returns {term: [(guessed_word, ratio), ...]}.
+    Like find_near_misses, but accepts a pre-bucketed word index so the same
+    attachment can be reused for both the JSON output and the text report
+    without re-extracting words.
     """
     result = {}
-    if not text or not unmatched_terms:
+    if not words_by_len or not unmatched_terms:
         return result
 
-    words = set(WORD_RE.findall(text))
-    if not words:
-        return result
-    words_lower = {w.lower(): w for w in words}
-
+    matcher = difflib.SequenceMatcher()
     for term in unmatched_terms:
         if len(term) < FUZZY_MIN_LEN:
             continue
         term_lower = term.lower()
-        candidates = [
-            (w_orig, w_low) for w_low, w_orig in words_lower.items()
-            if abs(len(w_low) - len(term_lower)) <= 2
-        ]
+        term_len = len(term_lower)
+
+        candidates = []
+        for delta in (-2, -1, 0, 1, 2):
+            candidates.extend(words_by_len.get(term_len + delta, ()))
+        if not candidates:
+            continue
+
+        matcher.set_seq2(term_lower)
         hits = []
         for w_orig, w_low in candidates:
-            ratio = difflib.SequenceMatcher(None, term_lower, w_low).ratio()
+            matcher.set_seq1(w_low)
+            ratio = matcher.ratio()
             if ratio >= FUZZY_THRESHOLD:
                 hits.append((w_orig, ratio))
         if hits:
@@ -213,11 +254,17 @@ def find_near_misses(text, unmatched_terms):
             result[term] = hits[:3]
     return result
 
+
+# ---------------------------------------------------------------------------
+# Folder walker
+# ---------------------------------------------------------------------------
+
 def get_folders(folder):
     """Yield folder and all subfolders, recursively."""
     yield folder
     for sub in folder.Folders:
         yield from get_folders(sub)
+
 
 folders_to_scan = list(get_folders(inbox))
 print(f"Scanning Inbox + all subfolders ({len(folders_to_scan)} folder(s))...\n")
@@ -247,8 +294,10 @@ for folder in folders_to_scan:
                     skipped_count += 1
                     folder_skipped += 1
                     continue
-                received_dt = datetime(received.year, received.month, received.day,
-                                       received.hour, received.minute, received.second)
+                received_dt = datetime(
+                    received.year, received.month, received.day,
+                    received.hour, received.minute, received.second,
+                )
                 if received_dt < cutoff:
                     hit_cutoff = True
                     break
@@ -268,11 +317,11 @@ for folder in folders_to_scan:
 
         email_terms = set()
         email_files = set()
-        # filename -> content text, so we don't re-read attachments for fuzzy pass
-        file_contents = {}
-        # filename -> set of terms found exactly in that specific file
-        file_found_terms = defaultdict(set)
-        if JSON_RESULTS_FILE:
+
+        # Cache per-email metadata that we might need for the JSON output.
+        need_json = bool(JSON_RESULTS_FILE)
+
+        if need_json:
             try:
                 email_subject = str(message.Subject or "")
             except Exception:
@@ -301,6 +350,10 @@ for folder in folders_to_scan:
             subject_ritms = find_ritms_in_text(email_subject)
             email_ritms = find_ritms_in_text(f"{email_subject}\n{email_body}")
 
+        # Per-attachment bookkeeping. We accumulate everything we need here
+        # so the fuzzy pass can run once at the end of the email.
+        attachment_records = []  # list of dicts
+
         for attachment in message.Attachments:
             filename = attachment.FileName
             data = read_attachment_bytes(attachment)
@@ -308,75 +361,96 @@ for folder in folders_to_scan:
                 continue
 
             content = extract_text_from_bytes(data, filename)
-            file_contents[filename] = content
             hits = find_terms_in_text(content)
 
-            if JSON_RESULTS_FILE:
-                if hits:
-                    attachment_ritms = find_ritms_in_text(content)
-                    for term in hits:
-                        gui_exact_matches.append({
-                            "term": term,
-                            "filename": filename,
-                            "subject": email_subject,
-                            "sender": sender_name,
-                            "sender_email": sender_email,
-                            "entry_id": entry_id,
-                            "store_id": store_id,
-                            "folder": folder.Name,
-                            "received": received_text,
-                            "ritms": sorted(set(attachment_ritms) | set(email_ritms)),
-                            "subject_ritms": subject_ritms,
-                            "location": find_location_in_text(content),
-                            "location_address": find_location_address_in_text(content),
-                        })
-                if FUZZY_ENABLED and content:
-                    exact_terms = {term.casefold() for term in hits}
-                    unmatched_terms = [
-                        term for term in SEARCH_TERMS
-                        if term.casefold() not in exact_terms
-                    ]
-                    near_matches = find_near_misses(content, unmatched_terms)
-                    for term, guesses in near_matches.items():
-                        for guess, ratio in guesses:
+            attachment_records.append({
+                "filename": filename,
+                "content": content,
+                "hits": hits,
+                "content_len": len(content),
+            })
+
+            if hits:
+                email_terms |= hits
+                email_files.add(filename)
+                print(f"  🔎 {filename} → {', '.join(sorted(hits))}")
+
+        # --- Single combined fuzzy pass over this email's attachments ---
+        # Run once per file, and share the results with both the JSON output
+        # and the text-report suggestions. Skip entirely when fuzzy is off.
+        if FUZZY_ENABLED and attachment_records:
+            try:
+                entry_key = message.EntryID
+            except Exception:
+                entry_key = f"{message.Subject}|{message.ReceivedTime}"
+
+            for rec in attachment_records:
+                content = rec["content"]
+                if not content:
+                    continue
+
+                # Terms that were NOT found exactly in this specific file.
+                exact_here = {t.casefold() for t in rec["hits"]}
+                unmatched_for_file = [
+                    t for t in SEARCH_TERMS if t.casefold() not in exact_here
+                ]
+                if not unmatched_for_file:
+                    continue
+
+                words_by_len = _build_words_by_len(content)
+                near = find_near_misses_from_words_by_len(
+                    words_by_len, unmatched_for_file
+                )
+                if not near:
+                    continue
+
+                # Feed the text-report accumulator.
+                for term, guess_hits in near.items():
+                    for guess_word, ratio in guess_hits:
+                        fuzzy_by_email[entry_key][rec["filename"]].add(
+                            (term, guess_word, round(ratio, 3))
+                        )
+
+                # Feed the JSON output, using the same data.
+                if need_json:
+                    for term, guess_hits in near.items():
+                        for guess_word, ratio in guess_hits:
                             gui_near_matches.append({
                                 "term": term,
-                                "guess": guess,
+                                "guess": guess_word,
                                 "similarity": round(ratio, 3),
-                                "filename": filename,
+                                "filename": rec["filename"],
                                 "subject": email_subject,
                                 "folder": folder.Name,
                                 "received": received_text,
                                 "subject_ritms": subject_ritms,
                             })
 
-            if hits:
-                email_terms |= hits
-                email_files.add(filename)
-                file_found_terms[filename] |= hits
-                print(f"  🔎 {filename} → {', '.join(sorted(hits))}")
-
-        # --- Fuzzy pass: only for terms NOT already found in that specific file ---
-        if FUZZY_ENABLED and email_files:
-            try:
-                entry_key = message.EntryID
-            except Exception:
-                entry_key = f"{message.Subject}|{message.ReceivedTime}"
-
-            for filename in email_files:
-                content = file_contents.get(filename, "")
-                # Only fuzzy-match terms NOT already found in THIS file
-                unmatched_for_file = [
-                    t for t in SEARCH_TERMS
-                    if t not in file_found_terms.get(filename, set())
-                ]
-                near = find_near_misses(content, unmatched_for_file)
-                if near:
-                    for term, hits in near.items():
-                        for guess_word, ratio in hits:
-                            fuzzy_by_email[entry_key][filename].add(
-                                (term, guess_word, round(ratio, 3))
-                            )
+        # --- Emit exact JSON matches (only for attachments that hit) ---
+        if need_json:
+            for rec in attachment_records:
+                if not rec["hits"]:
+                    continue
+                content = rec["content"]
+                attachment_ritms = find_ritms_in_text(content)
+                location = find_location_in_text(content)
+                location_address = find_location_address_in_text(content)
+                for term in rec["hits"]:
+                    gui_exact_matches.append({
+                        "term": term,
+                        "filename": rec["filename"],
+                        "subject": email_subject,
+                        "sender": sender_name,
+                        "sender_email": sender_email,
+                        "entry_id": entry_id,
+                        "store_id": store_id,
+                        "folder": folder.Name,
+                        "received": received_text,
+                        "ritms": sorted(set(attachment_ritms) | set(email_ritms)),
+                        "subject_ritms": subject_ritms,
+                        "location": location,
+                        "location_address": location_address,
+                    })
 
         if email_terms:
             try:
@@ -397,8 +471,10 @@ for folder in folders_to_scan:
             print(f"  ...scanned {folder_scanned} email(s) in [{folder.Name}]")
 
     if folder_scanned or folder_skipped:
-        print(f"[{folder.Name}] scanned {folder_scanned}, skipped {folder_skipped}"
-              + (" (hit cutoff, stopped early)" if hit_cutoff else ""))
+        print(
+            f"[{folder.Name}] scanned {folder_scanned}, skipped {folder_skipped}"
+            + (" (hit cutoff, stopped early)" if hit_cutoff else "")
+        )
 
 # --- Bucket results ---
 multi_term_emails = [e for e in matches_by_email.values() if len(e["terms"]) >= 2]
@@ -414,9 +490,12 @@ missing_terms = [t for t in SEARCH_TERMS if t not in found_terms]
 
 # --- Write report ---
 lines = []
+
+
 def w(s=""):
     lines.append(s)
     print(s)
+
 
 w()
 w("=" * 60)
@@ -490,18 +569,22 @@ for entry_id, e in matches_by_email.items():
     key = frozenset(e["terms"])
     groups[key].append((entry_id, e))
 
+
 def group_sort_key(item):
     terms, emails = item
     newest = max(e["received"] for _, e in emails)
     return (-len(terms), newest)
 
+
 ordered_groups = sorted(groups.items(), key=group_sort_key)
+
 
 def files_for_group(emails):
     files = set()
     for _, e in emails:
         files |= e["files"]
     return sorted(files)
+
 
 letter = ord("A")
 for terms, emails in ordered_groups:
@@ -511,10 +594,8 @@ for terms, emails in ordered_groups:
     for t in sorted(terms):
         w(f"   {t}")
 
-    # Lowercase set of exact terms in this group, for quick lookup
     terms_lower = {t.lower() for t in terms}
 
-    # Near-miss suggestions scoped to this group's files only
     suggestion_map = defaultdict(set)
     for entry_id, _ in emails:
         fmap = fuzzy_by_email.get(entry_id)
@@ -523,10 +604,8 @@ for terms, emails in ordered_groups:
         for filename, hint_set in fmap.items():
             if filename in files:
                 for term, guess, ratio in hint_set:
-                    # Skip if this search term is already an exact match in this group
                     if term.lower() in terms_lower:
                         continue
-                    # Skip if the guessed word is itself an exact match in this group
                     if guess.lower() in terms_lower:
                         continue
                     suggestion_map[filename].add((term, guess, ratio))
@@ -541,8 +620,10 @@ for terms, emails in ordered_groups:
     letter += 1
 
 # Final bucket: terms never found exactly AND never got a near-miss hint
-truly_missing = [t for t in SEARCH_TERMS
-                 if t not in found_terms and t not in fuzzy_terms_anywhere]
+truly_missing = [
+    t for t in SEARCH_TERMS
+    if t not in found_terms and t not in fuzzy_terms_anywhere
+]
 
 if truly_missing:
     w(f"{chr(letter)}) N/A")
@@ -555,9 +636,52 @@ with open(LOG_FILE, "w", encoding="utf-8") as f:
     f.write("\n".join(lines))
 
 if JSON_RESULTS_FILE:
+    # --- Anchor near-matches to RITMs that had a real exact hit -----------
+    # Without this, gui_near_matches grows with the size of the mailbox and
+    # the GUI ends up prompting for every fuzzy hit in every scanned email.
+    exact_ritms = set()
+    for entry in gui_exact_matches:
+        for ritm in entry.get("subject_ritms") or []:
+            exact_ritms.add(ritm.casefold())
+        for ritm in entry.get("ritms") or []:
+            exact_ritms.add(ritm.casefold())
+
+    if exact_ritms:
+        anchored = [
+            entry for entry in gui_near_matches
+            if {r.casefold() for r in (entry.get("subject_ritms") or [])} & exact_ritms
+        ]
+    else:
+        anchored = []
+
+    deduped = {}
+    for entry in anchored:
+        key = (
+            entry["term"].casefold(),
+            entry["folder"].casefold(),
+            entry["filename"].casefold(),
+        )
+        existing = deduped.get(key)
+        if existing is None or entry["similarity"] > existing["similarity"]:
+            deduped[key] = entry
+
+    near_matches_out = sorted(
+        deduped.values(),
+        key=lambda e: (
+            e["received"],
+            e["folder"].casefold(),
+            e["filename"].casefold(),
+            e["term"].casefold(),
+            -e["similarity"],
+        ),
+    )
+
     with open(JSON_RESULTS_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"exact_matches": gui_exact_matches, "near_matches": gui_near_matches},
+            {
+                "exact_matches": gui_exact_matches,
+                "near_matches": near_matches_out,
+            },
             f,
             ensure_ascii=False,
             indent=2,
