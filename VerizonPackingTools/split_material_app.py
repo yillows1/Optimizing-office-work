@@ -450,16 +450,33 @@ class _LoadRow:
     bundle_total: int = 0    # Total Net, summed from column I
     total_tare: int = 0      # Total Tare, summed from column H
     ritm: str = ""           # RITM # (R tab M5)
-    driver: str = ""         # Trucker value (R tab F8)
-    plate: str = ""          # Trailer value (R tab F9)
+    driver: str = ""         # Trucker value (R tab F8, fallback G8)
+    plate: str = ""          # Trailer value (R tab F9, fallback G9)
 
 
-# Driver and plate live in F8 / F9 on the R tab. The scanner writes them
-# there. Do NOT fall back to G8/G9 — the scanner's own _read_reel_summary
-# reads the wrong columns, but the writer is correct and F8/F9 are the
-# canonical locations.
+# Driver and plate live in F8 / F9 on the R tab (what the current scanner
+# writes). Older scanners wrote G8 / G9 — we fall back to those so the
+# split app finds the values either way.
 _DRIVER_CELL = "F8"
 _PLATE_CELL = "F9"
+_DRIVER_FALLBACK_CELL = "G8"
+_PLATE_FALLBACK_CELL = "G9"
+
+
+def _read_driver_plate(sheet) -> tuple[str, str]:
+    """Read driver and plate from the R tab.
+
+    Primary: F8 / F9 (current scanner layout).
+    Fallback: G8 / G9 (older scanner layout).
+    Returns ("", "") if neither has anything.
+    """
+    driver = _cell_text(sheet, _DRIVER_CELL)
+    if not driver:
+        driver = _cell_text(sheet, _DRIVER_FALLBACK_CELL)
+    plate = _cell_text(sheet, _PLATE_CELL)
+    if not plate:
+        plate = _cell_text(sheet, _PLATE_FALLBACK_CELL)
+    return driver, plate
 
 
 def _find_sequence_frn(path: Path, base_frn: str) -> str | None:
@@ -559,8 +576,7 @@ def read_family_r_loads(path: Path, frn: str) -> list[_LoadRow]:
             total_tare = sum_tare
 
             ritm = str(sheet.Range("M5").Value or "").strip()
-            driver = _cell_text(sheet, _DRIVER_CELL)
-            plate = _cell_text(sheet, _PLATE_CELL)
+            driver, plate = _read_driver_plate(sheet)
 
             # Identifier is derived from the tab name. For family tabs,
             # it's <frn>-<letter>. For single-load tabs, the tab name is
@@ -1363,12 +1379,20 @@ class SplitMaterialWindow(QMainWindow):
         self._rebuild_materials_from_loads()
         self._log(f"Loaded {len(loads)} load(s) from {path.name}.")
         for ld in loads:
-            self._log(
-                f"  {ld.identifier}: {len(ld.items)} item(s)  "
-                f"net={ld.bundle_total}  tare={ld.total_tare}  "
-                f"ritm={ld.ritm or '(none)'}  "
-                f"driver={ld.driver or '(none)'}  plate={ld.plate or '(none)'}"
-            )
+            if not ld.driver and not ld.plate:
+                self._log(
+                    f"  {ld.identifier}: {len(ld.items)} item(s)  "
+                    f"net={ld.bundle_total}  tare={ld.total_tare}  "
+                    f"ritm={ld.ritm or '(none)'}  "
+                    f"**driver/plate MISSING (F8/F9 and G8/G9 all blank)**"
+                )
+            else:
+                self._log(
+                    f"  {ld.identifier}: {len(ld.items)} item(s)  "
+                    f"net={ld.bundle_total}  tare={ld.total_tare}  "
+                    f"ritm={ld.ritm or '(none)'}  "
+                    f"driver={ld.driver or '(none)'}  plate={ld.plate or '(none)'}"
+                )
 
     def _rebuild_tabs(self) -> None:
         while self.tabs.count() > 1:

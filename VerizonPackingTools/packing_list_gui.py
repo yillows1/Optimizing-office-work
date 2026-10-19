@@ -1,17 +1,23 @@
 import re
 import os
 import io
+import gc
 import json
 import html
 import subprocess
 import sys
 import tempfile
 import shutil
+import time as _time
+import functools as _functools
+import logging as _logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, TypedDict
+
+import pythoncom
 
 from PySide6.QtCore import QEvent, QThread, Qt, Signal
 from PySide6.QtGui import QKeyEvent
@@ -71,6 +77,36 @@ def get_user_dir() -> _Path:
     return _Path(__file__).resolve().parent
 
 
+# ---------------------------------------------------------------------------
+# Timing instrumentation (logs to packing_timing.log next to the app)
+# ---------------------------------------------------------------------------
+
+_TIMING_LOG = get_user_dir() / "packing_timing.log"
+
+_logging.basicConfig(
+    filename=str(_TIMING_LOG),
+    level=_logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+def _timed(fn):
+    """Decorator: log how long fn() took. Passes return value through."""
+    @_functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = _time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            elapsed = _time.perf_counter() - start
+            _logging.info(f"{fn.__name__}: {elapsed:.2f}s")
+    return wrapper
+
+
+def _log_marker(text: str) -> None:
+    _logging.info(f"--- {text} ---")
+
+
 CONFIG_PATH = get_user_dir() / "scanner_config.json"
 DEFAULT_SUMMARIES_DIR = get_user_dir() / "Summaries"
 
@@ -96,6 +132,10 @@ MAX_ITEMS_PER_SUMMARY_TAB = 31
 
 RENAME_EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm"}
 RENAME_PDF_SUFFIXES = {".pdf"}
+
+# xlCalculationManual / xlCalculationAutomatic
+XL_CALC_MANUAL = -4135
+XL_CALC_AUTOMATIC = -4105
 
 
 def load_app_config() -> dict:
@@ -167,7 +207,6 @@ def summary_filename(monday: date, friday: date) -> str:
     )
 
 
-# FRN date parsing (e.g. 'FRN260929-1R' -> date(2026, 9, 29)).
 _FRN_DATE_RE = re.compile(r"FRN(\d{2})(\d{2})(\d{2})", re.IGNORECASE)
 
 
@@ -185,12 +224,67 @@ def _date_from_frn(packing_list_number: str) -> tuple[date | None, str]:
 
 
 # ---------------------------------------------------------------------------
+# Excel COM lifetime helpers
+# ---------------------------------------------------------------------------
+
+@_timed
+def _release_excel(excel, workbook=None) -> None:
+    if workbook is not None:
+        try:
+            workbook.Close(SaveChanges=False)
+        except Exception:
+            pass
+    if excel is not None:
+        try:
+            excel.Calculation = XL_CALC_AUTOMATIC
+        except Exception:
+            pass
+        try:
+            excel.ScreenUpdating = True
+        except Exception:
+            pass
+        try:
+            excel.Quit()
+        except Exception:
+            pass
+    del excel
+    del workbook
+    try:
+        pythoncom.CoFreeUnusedLibraries()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def _tune_excel_for_batch(excel) -> None:
+    """Turn off the slow stuff while we batch operations."""
+    try:
+        excel.ScreenUpdating = False
+    except Exception:
+        pass
+    try:
+        excel.DisplayAlerts = False
+    except Exception:
+        pass
+    try:
+        excel.EnableEvents = False
+    except Exception:
+        pass
+    try:
+        excel.Calculation = XL_CALC_MANUAL
+    except Exception:
+        pass
+    try:
+        excel.AskToUpdateLinks = False
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Excel helpers (merge-safe)
 # ---------------------------------------------------------------------------
 
 def _safe_write(sheet, address: str, value) -> None:
-    """Write to a cell, targeting the merge anchor if the cell is merged.
-    Prevents Excel's 'we can't do that to a merged cell' error."""
     rng = sheet.Range(address)
     try:
         if rng.MergeCells:
@@ -211,8 +305,23 @@ def _safe_clear(sheet, address: str) -> None:
 
 
 def _clear_item_range(sheet, first_row: int, last_row: int, first_col: int, last_col: int) -> None:
-    """Clear a block of cells, skipping any cell that's part of a merge
-    to avoid Excel complaining."""
+    """Clear a rectangular block of cells.
+
+    Batched: one Range.ClearContents() call instead of one per cell.
+    Falls back to per-cell only if the block contains merged cells
+    (which raise on bulk operations).
+    """
+    try:
+        rng = sheet.Range(
+            sheet.Cells(first_row, first_col),
+            sheet.Cells(last_row, last_col),
+        )
+        if rng.MergeCells:
+            raise RuntimeError("merged block")
+        rng.ClearContents()
+        return
+    except Exception:
+        pass
     for r in range(first_row, last_row + 1):
         for c in range(first_col, last_col + 1):
             cell = sheet.Cells(r, c)
@@ -224,10 +333,35 @@ def _clear_item_range(sheet, first_row: int, last_row: int, first_col: int, last
             cell.ClearContents()
 
 
+def _read_block(sheet, first_row: int, first_col: int, last_row: int, last_col: int):
+    """Read a rectangular block in one COM call."""
+    return sheet.Range(
+        sheet.Cells(first_row, first_col),
+        sheet.Cells(last_row, last_col),
+    ).Value
+
+
+def _as_grid(value, rows: int, cols: int) -> list[list]:
+    """Normalize Excel's block-read return to a list of lists of the
+    requested shape."""
+    if value is None:
+        return [[None] * cols for _ in range(rows)]
+    if not isinstance(value, tuple):
+        return [[value] + [None] * (cols - 1)]
+    if rows == 1 and cols == 1:
+        return [[value[0]]] if isinstance(value, tuple) else [[value]]
+    if rows == 1:
+        return [list(value)]
+    if cols == 1:
+        return [[v] for v in value]
+    return [list(row) for row in value]
+
+
 # ---------------------------------------------------------------------------
 # PDF helpers
 # ---------------------------------------------------------------------------
 
+@_timed
 def slice_first_pages(source_bytes: bytes, max_pages: int = 2) -> bytes | None:
     try:
         reader = PdfReader(io.BytesIO(source_bytes))
@@ -243,6 +377,7 @@ def slice_first_pages(source_bytes: bytes, max_pages: int = 2) -> bytes | None:
         return None
 
 
+@_timed
 def annotate_pdf(source_bytes: bytes, note: str) -> bytes | None:
     try:
         reader = PdfReader(io.BytesIO(source_bytes))
@@ -274,6 +409,7 @@ def annotate_pdf(source_bytes: bytes, note: str) -> bytes | None:
         return None
 
 
+@_timed
 def fetch_attachment_bytes(
     entry_id: str,
     store_id: str,
@@ -340,20 +476,15 @@ def _extract_frn_from_text(text: str) -> tuple[str, str]:
 
 
 def _extract_frn_from_excel(path: Path, excel=None) -> tuple[str, str]:
-    """
-    Try to pull an FRN from a workbook. If `excel` is provided, reuse that
-    Excel.Application (much faster when scanning a folder); otherwise
-    spin up a temporary one.
-    """
     owns_excel = excel is None
     workbook = None
+    excel_local = excel
     try:
         if owns_excel:
-            excel = win32com.client.DispatchEx("Excel.Application")
-            excel.Visible = False
-            excel.DisplayAlerts = False
+            excel_local = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel_local)
 
-        workbook = excel.Workbooks.Open(
+        workbook = excel_local.Workbooks.Open(
             str(path), UpdateLinks=0, ReadOnly=True
         )
 
@@ -375,16 +506,14 @@ def _extract_frn_from_excel(path: Path, excel=None) -> tuple[str, str]:
     except Exception:
         return "", ""
     finally:
-        if workbook is not None:
-            try:
-                workbook.Close(SaveChanges=False)
-            except Exception:
-                pass
-        if owns_excel and excel is not None:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
+        if owns_excel:
+            _release_excel(excel_local, workbook)
+        else:
+            if workbook is not None:
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
 
 
 def _extract_frn_from_pdf(path: Path) -> tuple[str, str]:
@@ -400,10 +529,6 @@ def _extract_frn_from_pdf(path: Path) -> tuple[str, str]:
 
 
 def plan_file_renames(folder: Path, progress=None) -> list[dict]:
-    """
-    `progress` is an optional callable(current, total, filename) used to
-    report progress to a UI.
-    """
     entries = [
         e for e in sorted(folder.iterdir())
         if e.is_file()
@@ -415,11 +540,9 @@ def plan_file_renames(folder: Path, progress=None) -> list[dict]:
     plans: list[dict] = []
     excel = None
     try:
-        # Only spin up Excel if there's at least one spreadsheet to look at.
         if any(e.suffix.casefold() in RENAME_EXCEL_SUFFIXES for e in entries):
             excel = win32com.client.DispatchEx("Excel.Application")
-            excel.Visible = False
-            excel.DisplayAlerts = False
+            _tune_excel_for_batch(excel)
 
         for index, entry in enumerate(entries, start=1):
             if progress is not None:
@@ -470,11 +593,7 @@ def plan_file_renames(folder: Path, progress=None) -> list[dict]:
                 "reason": reason,
             })
     finally:
-        if excel is not None:
-            try:
-                excel.Quit()
-            except Exception:
-                pass
+        _release_excel(excel, None)
     return plans
 
 
@@ -1131,22 +1250,27 @@ def _normalize_excel_date(value: object) -> str:
     )
 
 
+@_timed
 def parse_incoming_packing_list(path: str | Path) -> PackingListRecord:
+    _log_marker(f"parse_incoming_packing_list START {path}")
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Input sheet not found: {path}")
 
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
+    excel = None
     workbook = None
     try:
+        _log_marker("parse: DispatchEx")
+        excel = win32com.client.DispatchEx("Excel.Application")
+        _tune_excel_for_batch(excel)
+        _log_marker("parse: Workbooks.Open")
         workbook = excel.Workbooks.Open(str(path), UpdateLinks=0, ReadOnly=True)
         try:
             sheet = workbook.Worksheets(INPUT_SHEET_NAME)
         except Exception:
             sheet = workbook.Worksheets(1)
 
+        _log_marker("parse: reading header cells")
         date_iso = _normalize_excel_date(sheet.Range(IN_DATE).Value)
         packing_list = _cell_str(sheet, IN_PACKING_LIST)
         if not packing_list:
@@ -1157,18 +1281,20 @@ def parse_incoming_packing_list(path: str | Path) -> PackingListRecord:
         plate = _cell_str(sheet, IN_PLATE)
         cont = _cell_str(sheet, IN_CONT)
 
+        _log_marker("parse: reading item block in one call")
+        rows_count = IN_LAST_ITEM_ROW - IN_FIRST_ITEM_ROW + 1
+        cols_count = 5  # B..F
+        raw = _read_block(sheet, IN_FIRST_ITEM_ROW, 2, IN_LAST_ITEM_ROW, 6)
+        grid = _as_grid(raw, rows_count, cols_count)
+
         items: list[ItemRecord] = []
-        for row in range(IN_FIRST_ITEM_ROW, IN_LAST_ITEM_ROW + 1):
-            description = str(
-                sheet.Range(f"{IN_DESC_COL}{row}").Value or ""
-            ).strip()
+        for row_values in grid:
+            description = str(row_values[0] or "").strip()
             if not description:
                 continue
-            material = str(
-                sheet.Range(f"{IN_MATERIAL_COL}{row}").Value or ""
-            ).strip()
-            gross = _to_int(sheet.Range(f"{IN_GROSS_COL}{row}").Value)
-            tare = _to_int(sheet.Range(f"{IN_TARE_COL}{row}").Value)
+            material = str(row_values[2] or "").strip()
+            gross = _to_int(row_values[3])
+            tare = _to_int(row_values[4])
             items.append({
                 "description": description,
                 "type": normalize_item_type(material),
@@ -1176,6 +1302,7 @@ def parse_incoming_packing_list(path: str | Path) -> PackingListRecord:
                 "tare": tare,
                 "net": gross - tare,
             })
+        _log_marker(f"parse: items done ({len(items)})")
 
         if not items:
             raise ValueError(
@@ -1201,16 +1328,21 @@ def parse_incoming_packing_list(path: str | Path) -> PackingListRecord:
             "items": items,
         }
     finally:
-        if workbook is not None:
-            workbook.Close(SaveChanges=False)
-        excel.Quit()
+        _log_marker("parse: releasing Excel")
+        _release_excel(excel, workbook)
 
 
 # ---------------------------------------------------------------------------
 # Output template writers
 # ---------------------------------------------------------------------------
 
-def write_packing_list_template(record: PackingListRecord, destination: Path) -> Path:
+@_timed
+def write_packing_list_template(
+    record: PackingListRecord,
+    destination: Path,
+    excel=None,
+) -> Path:
+    _log_marker(f"write_packing_list START {destination.name}")
     template = get_resource_path("Excel Bases/packing list example.xls")
     if not template.exists():
         raise FileNotFoundError(f"Packing-list template not found: {template}")
@@ -1222,14 +1354,23 @@ def write_packing_list_template(record: PackingListRecord, destination: Path) ->
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(template, destination)
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
+
+    owns_excel = excel is None
+    excel_local = excel
     workbook = None
     try:
-        workbook = excel.Workbooks.Open(str(destination), UpdateLinks=0, ReadOnly=False)
+        if owns_excel:
+            _log_marker("write_packing_list: DispatchEx (owns)")
+            excel_local = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel_local)
+
+        _log_marker("write_packing_list: Workbooks.Open")
+        workbook = excel_local.Workbooks.Open(
+            str(destination), UpdateLinks=0, ReadOnly=False
+        )
         sheet = workbook.Worksheets("Packing List")
 
+        _log_marker("write_packing_list: writing header")
         _safe_write(
             sheet, "H8",
             datetime.combine(parse_date(record["date"]), datetime.min.time()),
@@ -1238,37 +1379,83 @@ def write_packing_list_template(record: PackingListRecord, destination: Path) ->
         _safe_write(sheet, "H9", record["location"].strip() or "No Location")
         _safe_write(sheet, "H10", _packing_list_identifier(record))
 
-        for row, item in enumerate(record["items"], start=13):
+        _log_marker("write_packing_list: writing item block in one call")
+        num_rows = MAX_ITEMS_PER_LOAD  # 23
+        grid = [["" for _ in range(9)] for _ in range(num_rows)]
+        for i, item in enumerate(record["items"]):
+            if i >= num_rows:
+                break
             description = item["description"]
             if item["type"]:
                 description = f"{description} ({item['type']})"
-            _safe_write(sheet, f"B{row}", description)
-            _safe_write(sheet, f"H{row}", item["gross"])
-            _safe_write(sheet, f"I{row}", item["tare"])
-            _safe_write(sheet, f"J{row}", item["net"])
+            grid[i][0] = description   # B
+            grid[i][6] = item["gross"] # H
+            grid[i][7] = item["tare"]  # I
+            grid[i][8] = item["net"]   # J
 
+        block = sheet.Range(
+            sheet.Cells(13, 2),     # B13
+            sheet.Cells(13 + num_rows - 1, 10),  # J35
+        )
+        try:
+            if block.MergeCells:
+                raise RuntimeError("merged block")
+            block.Value = grid
+        except Exception:
+            for i, item in enumerate(record["items"]):
+                row = 13 + i
+                description = item["description"]
+                if item["type"]:
+                    description = f"{description} ({item['type']})"
+                _safe_write(sheet, f"B{row}", description)
+                _safe_write(sheet, f"H{row}", item["gross"])
+                _safe_write(sheet, f"I{row}", item["tare"])
+                _safe_write(sheet, f"J{row}", item["net"])
+
+        _log_marker("write_packing_list: Save")
         workbook.Save()
     finally:
-        if workbook is not None:
-            workbook.Close(SaveChanges=False)
-        excel.Quit()
+        if owns_excel:
+            _log_marker("write_packing_list: releasing own Excel")
+            _release_excel(excel_local, workbook)
+        else:
+            if workbook is not None:
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
     return destination
 
 
-def write_scrap_pickup_template(record: PackingListRecord, destination: Path) -> Path:
+@_timed
+def write_scrap_pickup_template(
+    record: PackingListRecord,
+    destination: Path,
+    excel=None,
+) -> Path:
+    _log_marker(f"write_scrap START {destination.name}")
     template = get_resource_path("Excel Bases/Scrap Pick Up Request for Load.xls")
     if not template.exists():
         raise FileNotFoundError(f"Scrap pickup template not found: {template}")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(template, destination)
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
+
+    owns_excel = excel is None
+    excel_local = excel
     workbook = None
     try:
-        workbook = excel.Workbooks.Open(str(destination), UpdateLinks=0, ReadOnly=False)
+        if owns_excel:
+            _log_marker("write_scrap: DispatchEx (owns)")
+            excel_local = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel_local)
+
+        _log_marker("write_scrap: Workbooks.Open")
+        workbook = excel_local.Workbooks.Open(
+            str(destination), UpdateLinks=0, ReadOnly=False
+        )
         sheet = workbook.Worksheets("SCRAPREM")
+        _log_marker("write_scrap: writing cells")
         request_date = datetime.combine(parse_date(record["date"]), datetime.min.time())
         for address in ("D15", "D33"):
             _safe_write(sheet, address, request_date)
@@ -1291,11 +1478,18 @@ def write_scrap_pickup_template(record: PackingListRecord, destination: Path) ->
         _safe_write(sheet, "D20", city)
         _safe_write(sheet, "D34", _packing_list_identifier(record))
         _safe_write(sheet, "D35", record["driver_plate"].replace(" / ", "# "))
+        _log_marker("write_scrap: Save")
         workbook.Save()
     finally:
-        if workbook is not None:
-            workbook.Close(SaveChanges=False)
-        excel.Quit()
+        if owns_excel:
+            _log_marker("write_scrap: releasing own Excel")
+            _release_excel(excel_local, workbook)
+        else:
+            if workbook is not None:
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
     return destination
 
 
@@ -1363,24 +1557,33 @@ def _read_reel_summary_record(sheet) -> PackingListRecord | None:
     else:
         normalized_date = parse_date(str(received)).isoformat()
 
+    rows_count = 31
+    cols_count = 5
+    raw = _read_block(sheet, 12, 4, 42, 8)
+    grid = _as_grid(raw, rows_count, cols_count)
+
     items: list[ItemRecord] = []
-    for row in range(12, 43):
-        reel_id = str(sheet.Cells(row, 4).Value or "").strip()
+    for row_values in grid:
+        reel_id = str(row_values[0] or "").strip()
         if not reel_id:
             continue
-        reel_size = str(sheet.Cells(row, 5).Value or "").strip()
-        gross = int(float(sheet.Cells(row, 7).Value or 0))
-        tare = int(float(sheet.Cells(row, 8).Value or 0))
+        reel_size = str(row_values[1] or "").strip()
+        gross = int(float(row_values[3] or 0))
+        tare = int(float(row_values[4] or 0))
         items.append({
             "description": f"{reel_id}{reel_size}",
-            "type": str(sheet.Cells(row, 6).Value or "").strip(),
+            "type": str(row_values[2] or "").strip(),
             "gross": gross,
             "tare": tare,
             "net": gross - tare,
         })
 
-    trucker = str(sheet.Range("G8").Value or "").strip()
-    trailer = str(sheet.Range("G9").Value or "").strip()
+    # Driver/plate live in F8/F9 (that's where the writer below puts them).
+    # An earlier version of this function read G8/G9, which are blank — so
+    # re-opening an existing report saw empty driver/plate and rewrote them
+    # as empty, wiping them over time.
+    trucker = str(sheet.Range("F8").Value or "").strip()
+    trailer = str(sheet.Range("F9").Value or "").strip()
     return {
         "group": "",
         "ritm": str(sheet.Range("M5").Value or "").strip(),
@@ -1443,13 +1646,13 @@ def _copy_template_reel_tabs(
     return created
 
 
-
-
-
+@_timed
 def write_reel_summary_report(
     records: list[PackingListRecord],
     destination: Path,
+    excel=None,
 ) -> Path:
+    _log_marker(f"write_reel_summary START {destination.name} ({len(records)} records)")
     template = get_resource_path("Excel Bases/Reel Summary Report.XLS")
     if not template.exists():
         raise FileNotFoundError(f"Reel Summary template not found: {template}")
@@ -1461,17 +1664,27 @@ def write_reel_summary_report(
     )
     os.close(descriptor)
     staged_path = Path(staged_name)
+
+    owns_excel = excel is None
+    excel_local = excel
+    workbook = None
+    template_workbook = None
+
     try:
         shutil.copy2(source_path, staged_path)
-        excel = win32com.client.DispatchEx("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
-        excel.EnableEvents = False
-        workbook = None
-        template_workbook = None
-        try:
-            workbook = excel.Workbooks.Open(str(staged_path), UpdateLinks=0, ReadOnly=False)
 
+        if owns_excel:
+            _log_marker("write_reel_summary: DispatchEx (owns)")
+            excel_local = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel_local)
+
+        try:
+            _log_marker("write_reel_summary: Open staged workbook")
+            workbook = excel_local.Workbooks.Open(
+                str(staged_path), UpdateLinks=0, ReadOnly=False
+            )
+
+            _log_marker("write_reel_summary: scanning reel sheets")
             report_records: dict[str, PackingListRecord] = {}
             reel_sheets: list[Any] = []
             for sheet in workbook.Worksheets:
@@ -1485,6 +1698,7 @@ def write_reel_summary_report(
                 if previous_record is not None:
                     key = _packing_list_identifier(previous_record).casefold()
                     report_records[key] = previous_record
+            _log_marker(f"write_reel_summary: found {len(reel_sheets)} reel sheets")
 
             if not reel_sheets:
                 raise ValueError("The selected workbook does not contain any numbered R tabs.")
@@ -1509,7 +1723,10 @@ def write_reel_summary_report(
 
             if len(ordered_records) > len(reel_sheets):
                 needed = len(ordered_records) - len(reel_sheets)
-                template_workbook = excel.Workbooks.Open(str(template), UpdateLinks=0, ReadOnly=True)
+                _log_marker(f"write_reel_summary: copying {needed} new template tabs")
+                template_workbook = excel_local.Workbooks.Open(
+                    str(template), UpdateLinks=0, ReadOnly=True
+                )
                 new_sheets = _copy_template_reel_tabs(workbook, template_workbook, needed)
                 reel_sheets.extend(new_sheets)
 
@@ -1528,6 +1745,7 @@ def write_reel_summary_report(
             if any(name.casefold() in non_reel_sheet_names for name in populated_tab_names):
                 raise ValueError("A packing-list tab name conflicts with another workbook tab.")
 
+            _log_marker("write_reel_summary: renaming to temporary names")
             existing_names = {sheet.Name.casefold() for sheet in workbook.Worksheets}
             for index, sheet in enumerate(reel_sheets, start=1):
                 temporary_name = f"__R_TEMP_{index}"
@@ -1536,11 +1754,14 @@ def write_reel_summary_report(
                 sheet.Name = temporary_name
                 existing_names.add(temporary_name.casefold())
 
+            _log_marker("write_reel_summary: clearing old content (batched)")
             for sheet in reel_sheets:
                 for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
                     _safe_write(sheet, address, "")
                 _clear_item_range(sheet, 12, 42, 4, 8)
+            _log_marker("write_reel_summary: clear done")
 
+            _log_marker("write_reel_summary: writing records")
             for sheet, record in zip(reel_sheets, ordered_records):
                 driver, plate = _split_driver_and_plate(record["driver_plate"])
                 _safe_write(sheet, "M2", _packing_list_identifier(record))
@@ -1551,20 +1772,45 @@ def write_reel_summary_report(
                 sheet.Range("M4").NumberFormat = "mm/dd/yyyy"
                 _safe_write(sheet, "M5", record["ritm"])
                 _safe_write(sheet, "C7", record["location"].strip() or "No Location")
-                _safe_write(sheet, "I7", sum(item["net"] for item in record["items"]))
+                # I7 = Total Gross (per user request — was total net).
+                _safe_write(sheet, "I7", sum(item["gross"] for item in record["items"]))
                 _safe_write(sheet, "C8", "N/A")
                 _safe_write(sheet, "F8", driver)
                 _safe_write(sheet, "C9", "N/A")
                 _safe_write(sheet, "F9", plate)
 
-                for row, item in enumerate(record["items"], start=12):
+                block_rows = 31
+                block_cols = 5
+                grid = [["" for _ in range(block_cols)] for _ in range(block_rows)]
+                for i, item in enumerate(record["items"]):
+                    if i >= block_rows:
+                        break
                     reel_id, reel_size = _split_reel_id(item["description"])
-                    _safe_write(sheet, f"D{row}", reel_id)
-                    _safe_write(sheet, f"E{row}", reel_size)
-                    _safe_write(sheet, f"F{row}", item["type"])
-                    _safe_write(sheet, f"G{row}", item["gross"])
-                    _safe_write(sheet, f"H{row}", item["tare"])
+                    grid[i][0] = reel_id            # D
+                    grid[i][1] = reel_size          # E
+                    grid[i][2] = item["type"]       # F
+                    grid[i][3] = item["gross"]      # G
+                    grid[i][4] = item["tare"]       # H
 
+                block = sheet.Range(
+                    sheet.Cells(12, 4),  # D12
+                    sheet.Cells(12 + block_rows - 1, 8),  # H42
+                )
+                try:
+                    if block.MergeCells:
+                        raise RuntimeError("merged block")
+                    block.Value = grid
+                except Exception:
+                    for i, item in enumerate(record["items"]):
+                        row = 12 + i
+                        reel_id, reel_size = _split_reel_id(item["description"])
+                        _safe_write(sheet, f"D{row}", reel_id)
+                        _safe_write(sheet, f"E{row}", reel_size)
+                        _safe_write(sheet, f"F{row}", item["type"])
+                        _safe_write(sheet, f"G{row}", item["gross"])
+                        _safe_write(sheet, f"H{row}", item["tare"])
+
+            _log_marker("write_reel_summary: final tab names")
             for index, sheet in enumerate(reel_sheets, start=1):
                 if index <= len(ordered_records):
                     sheet.Name = populated_tab_names[index - 1]
@@ -1577,19 +1823,32 @@ def write_reel_summary_report(
                         n += 1
                         candidate = f"{n}R"
                     sheet.Name = candidate
-            excel.CalculateFull()
+            _log_marker("write_reel_summary: CalculateFull")
+            excel_local.CalculateFull()
+            _log_marker("write_reel_summary: Save")
             workbook.Save()
         finally:
             if template_workbook is not None:
-                template_workbook.Close(SaveChanges=False)
+                try:
+                    template_workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
             if workbook is not None:
-                workbook.Close(SaveChanges=False)
-            excel.Quit()
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            if owns_excel:
+                _log_marker("write_reel_summary: releasing own Excel")
+                _release_excel(excel_local, None)
 
         os.replace(staged_path, destination)
     finally:
         if staged_path.exists():
-            staged_path.unlink()
+            try:
+                staged_path.unlink()
+            except Exception:
+                pass
     return destination
 
 
@@ -2053,11 +2312,13 @@ class PackingListApp(QMainWindow):
             return
         chosen_path = Path(chosen)
 
+        _log_marker("GUI: Import clicked, about to parse")
         try:
             record = parse_incoming_packing_list(chosen_path)
         except Exception as error:
             QMessageBox.critical(self, "Could not read input sheet", str(error))
             return
+        _log_marker("GUI: Import parse returned")
 
         if self.imported_record is not None:
             answer = QMessageBox.question(
@@ -2943,7 +3204,6 @@ class PackingListApp(QMainWindow):
                 self.scan_results_label.setText("There are no items to queue as unmatched.")
                 self.status_label.setText("No items found to queue.")
                 return
-            # Single-load: no letter.
             self._assign_letters_by_priority(record["packing_list"].casefold())
             self._refresh_queue_table()
             queued_ids = ", ".join(
@@ -3069,9 +3329,6 @@ class PackingListApp(QMainWindow):
             }
             staged_ritm_records.append((ritm_record, ritm_matches))
 
-        # Append records now, but defer record_source_matches keying until
-        # after letters are assigned (below), since the identifier includes
-        # the letter (or is the bare FRN for a single-load family).
         for ritm_record, _ in staged_ritm_records:
             self._append_record(ritm_record)
 
@@ -3102,12 +3359,8 @@ class PackingListApp(QMainWindow):
         self._assign_letters_by_priority(record["packing_list"].casefold())
         self._refresh_queue_table()
 
-        # NOW the letters are final; key record_source_matches by identifier
-        # so _save_records can find them and write the Request Item PDFs.
         for ritm_record, ritm_matches in staged_ritm_records:
             self.record_source_matches[_packing_list_identifier(ritm_record)] = list(ritm_matches)
-
-
 
         ritm_letters = {}
         for r in self.records:
@@ -3151,7 +3404,6 @@ class PackingListApp(QMainWindow):
             if r["packing_list"].casefold() == packing_list_key
         ]
 
-        # Single-load family: no letter at all — identifier stays bare FRN.
         if len(this_list) == 1:
             this_list[0]["letter"] = ""
             return
@@ -3214,6 +3466,7 @@ class PackingListApp(QMainWindow):
         return None
 
     def _save_records(self) -> None:
+        _log_marker("=== EXPORT START ===")
         if not self.records:
             QMessageBox.information(
                 self, "Nothing to save",
@@ -3236,6 +3489,7 @@ class PackingListApp(QMainWindow):
             )
             return
 
+        _log_marker("EXPORT: before directory dialog")
         selected_directory = QFileDialog.getExistingDirectory(
             self,
             "Choose where to save packing lists, per-load folders, and the "
@@ -3243,12 +3497,14 @@ class PackingListApp(QMainWindow):
             str(self.summaries_folder.parent if self.summaries_folder.parent.is_dir() else DEFAULT_SUMMARIES_DIR.parent),
         )
         if not selected_directory:
+            _log_marker("EXPORT: user cancelled directory dialog")
             return
+        _log_marker(f"EXPORT: directory chosen {selected_directory}")
+
         destination_directory = Path(selected_directory)
         directory_key = str(destination_directory.resolve()).casefold()
         exported_record_ids = self.exported_record_ids_by_directory.get(directory_key, set())
 
-        # Summaries live in a 'Summaries' subfolder of the export folder.
         self.summaries_folder = destination_directory / "Summaries"
         self.summaries_folder.mkdir(parents=True, exist_ok=True)
         self.summaries_label.setText(
@@ -3261,6 +3517,7 @@ class PackingListApp(QMainWindow):
             record for record in self.records
             if _packing_list_identifier(record).casefold() not in exported_record_ids
         ]
+        _log_marker(f"EXPORT: {len(records_to_export)} record(s) to export")
 
         packing_list_paths: list[Path] = []
         per_load_folders: list[Path] = []
@@ -3270,8 +3527,6 @@ class PackingListApp(QMainWindow):
             safe = re.sub(
                 r"[^A-Za-z0-9._-]+", "_", record["packing_list"]
             ).strip("._-") or "PackingList"
-            # Single-load family: file name is the bare FRN (no trailing dash,
-            # no letter).
             if record["letter"]:
                 file_suffix = f"{safe}-{record['letter']}"
             else:
@@ -3308,8 +3563,10 @@ class PackingListApp(QMainWindow):
                 QMessageBox.StandardButton.No,
             )
             if answer != QMessageBox.StandardButton.Yes:
+                _log_marker("EXPORT: user declined overwrite")
                 return
 
+        _log_marker("EXPORT: building records_by_week")
         records_by_week: dict[tuple[date, date], list[PackingListRecord]] = {}
         frn_date_warnings: list[str] = []
         for record in self.records:
@@ -3339,30 +3596,45 @@ class PackingListApp(QMainWindow):
                 )
                 return
             records_by_week.setdefault((monday, friday), []).append(record)
+        _log_marker(f"EXPORT: {len(records_by_week)} week bucket(s)")
 
         pdf_failures: list[str] = []
 
+        shared_excel = None
         try:
+            _log_marker("EXPORT: DispatchEx shared Excel")
+            shared_excel = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(shared_excel)
+            _log_marker("EXPORT: shared Excel ready")
+
+            _log_marker("EXPORT: reel summary loop START")
+            _t_reel = _time.perf_counter()
             for (monday, friday), week_records in records_by_week.items():
                 filename = summary_filename(monday, friday)
                 weekly_path = self.summaries_folder / filename
-                write_reel_summary_report(week_records, weekly_path)
+                write_reel_summary_report(week_records, weekly_path, excel=shared_excel)
+            _log_marker(f"EXPORT: reel summary loop DONE {_time.perf_counter()-_t_reel:.2f}s")
 
+            _log_marker("EXPORT: per-record loop START")
+            _t_per = _time.perf_counter()
             for record, pl_path, load_folder, sp_path in zip(
                 records_to_export, packing_list_paths, per_load_folders, scrap_paths
             ):
                 identifier = _packing_list_identifier(record)
+                _log_marker(f"EXPORT: record {identifier}")
 
-                write_packing_list_template(record, pl_path)
+                write_packing_list_template(record, pl_path, excel=shared_excel)
 
                 load_folder.mkdir(parents=True, exist_ok=True)
-                write_scrap_pickup_template(record, sp_path)
+                write_scrap_pickup_template(record, sp_path, excel=shared_excel)
 
                 matches = self.record_source_matches.get(identifier, [])
                 chosen = self._pick_source_match(identifier, matches)
                 if chosen is None:
+                    _log_marker(f"EXPORT: {identifier} no source match, skipping PDF")
                     continue
 
+                _log_marker(f"EXPORT: {identifier} fetching PDF from Outlook")
                 pdf_bytes = fetch_attachment_bytes(
                     chosen.entry_id, chosen.store_id, chosen.filename
                 )
@@ -3388,10 +3660,16 @@ class PackingListApp(QMainWindow):
 
                 req_pdf_path = load_folder / f"Request Item for Load {identifier}.pdf"
                 req_pdf_path.write_bytes(annotated)
+            _log_marker(f"EXPORT: per-record loop DONE {_time.perf_counter()-_t_per:.2f}s")
 
         except Exception as error:
+            _log_marker(f"EXPORT: EXCEPTION {error}")
             QMessageBox.critical(self, "Could not save files", str(error))
             return
+        finally:
+            _log_marker("EXPORT: releasing shared Excel")
+            _release_excel(shared_excel, None)
+            _log_marker("EXPORT: shared Excel released")
 
         exported_record_ids.update(
             _packing_list_identifier(record).casefold() for record in records_to_export
@@ -3421,6 +3699,7 @@ class PackingListApp(QMainWindow):
             info_lines.append("")
             info_lines.append("PDF warnings:")
             info_lines.extend(f"  - {msg}" for msg in pdf_failures)
+        _log_marker("=== EXPORT DONE ===")
         QMessageBox.information(
             self,
             "Workbooks saved",
