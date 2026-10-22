@@ -1,5 +1,3 @@
-i think i need to make the app first before this since all the instructions should be made after the app is created
-
 things to remember to make:
 
 how the flow of the work works now with these tools
@@ -8,13 +6,18 @@ question.  how does this work or does it even work with one that doesnt need spl
 Answer: It should now work with the ones the don't need splits so 4RR/4RP and etc still will function as intended
 
 
+DISCLAIMER: 
+Still haven't implemented anything that stores to the website database
+
+
 
 Basic use:
 1) Boot up PackingList.exe
 2) Pick folder where the application will read the file from
 3) Hit open input sheet to fill out a page, or you can just drag and drop the file in but that's probably not implemented yet so just hit open for now
 4) fill out the sheet and save
-5) Hit rename files for helping yourself keep track (the app will rename it based on the FRN or Packing List Number)
+5) Hit rename files for helping yourself keep track (the app will rename it based on the FRN or Packing List Number) - if you messed up, the program looks for the Incoming FRN at the beginning I think so if you want it to
+rename the excel sheet, change the name to something completely wrong and it will pick up on it correctly.  Otherwise if it starts with FRN it assumes its correct since checking every excel sheet would be slow
 
 (FYI the steps down here may be a bit slower as they read and scan or write on the excel sheets so wait till it says imported or if something pops up)
 6) Hit Import Input Sheet and select the one that you want to Import 
@@ -43,4 +46,33 @@ Those files will be needed for the SplitMaterial.exe
 
 
 When the total Weights for each material comes in, you can use SplitMaterial.exe
+
+
+Things to remember:
+After doing split materials, the summary file's tabs aren't always in order since sometimes they will be in the order you made them since I kept breaking the program when I tried to get them to be in the correct order (FIXED for R, inconsistent for P)
+Although for reference it should order it correctly on the summary tab but just the actual physical P tabs can end up out of order
+but this only happens if you input data out of order.  This does not happen to the R ones though I figured out a fix idk why it doesnt work as consistently in P tabs but that may be because
+the split_material_app grabs the first tabs and then changes the first tabs if you change the weights in any way and then writes the other tabs and what not so it probably gets messed up because of that
+
+the little checkbox for sorting RP families should work for the loads that literally just have 1 load so like FRN261009-3R.  No a,b,or c at the end and things like that.  This should still work
+even if you don't click the checkmark just it was added a while back and i never removed it
+so usually the recommended is to leave this box UNCHECKED
+
+
+ALSO
+when using split apps, it capitalizes FRN and whatever based on how you type it in for the summary tab
+
+
+
+
+
+Not super sure on some things since I tested everything a bunch of times but still mightve missed things so if you find any issues lmk
+
+
+random things:
+
+if there isnt a good solution it tries to basically create its own solution by doing all the loads except 1 so say you have loads A, B, and C.  A and B are given values that make sense and work but C is then
+just given the remainder which will look wrong if you do the math but this ONLY happens if the numbers dont match up in general like theres too much fo99 for it to work or something like that
+
+split material tries to do it correctly, but if thee is no correct answers and the numbers of each load actually add up, then it just kinda does the first loads and the last load gets the rest of the Weights
 

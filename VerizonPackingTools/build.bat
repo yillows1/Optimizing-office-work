@@ -21,6 +21,8 @@ python -m PyInstaller ^
   --hidden-import win32com ^
   --hidden-import win32com.client ^
   --hidden-import win32timezone ^
+  --hidden-import pythoncom ^
+  --hidden-import pywintypes ^
   --hidden-import ortools ^
   --hidden-import ortools.sat.python.cp_model ^
   --collect-all ortools ^
@@ -38,7 +40,12 @@ python -m PyInstaller ^
   --hidden-import win32com ^
   --hidden-import win32com.client ^
   --hidden-import win32timezone ^
+  --hidden-import pythoncom ^
+  --hidden-import pywintypes ^
   --hidden-import improvedScanner ^
+  --hidden-import pypdf ^
+  --hidden-import docx ^
+  --hidden-import openpyxl ^
   --collect-data win32com ^
   --add-data "Excel Bases;Excel Bases" ^
   --paths . ^

@@ -698,25 +698,77 @@ class BlankZeroSpinBox(QSpinBox):
 
 
 # ---------------------------------------------------------------------------
-# Address / RITM batch dialog
+# Assignment dialog with live staging
 # ---------------------------------------------------------------------------
 
 class AddressBatchDialog(QDialog):
-    def __init__(self, parent, items: list[ItemRecord]) -> None:
+    """Assignment dialog with live RITM staging.
+
+    Input (read-only at construction; the dialog makes its own copies):
+      unmatched_items:  items from the scan that didn't match an email RITM
+      staged_ritms:     RITM records the scan already assembled; items are
+                        movable out of these into the unmatched pool
+      record_template:  the scan's record, used as template for any RITM
+                        the user creates via the Request Item tab
+
+    Behavior:
+      - Location / Request Item / Both tabs operate on the current
+        unmatched pool.
+      - Request Item and Both tabs, when a RITM is applied to item(s),
+        either merge the item(s) into an existing staged RITM with that
+        RITM (matching letter preserved), or create a new staged RITM
+        (this handles the "RITM wasn't on any email" case).
+      - Remove / Drop tab shows every staged RITM with one checkbox per
+        item. Checking and clicking "Apply removals" pulls items from
+        the staged RITM back into the unmatched pool. A RITM that loses
+        all items disappears from the Remove / Drop view.
+      - The Remove / Drop tab is EMPTY (shows a placeholder message) when
+        there are no staged RITMs. As soon as one is created via
+        assignment, it appears.
+
+    On Finished (accept), the caller reads:
+      dialog.staged_ritms     final list of staged RITM records
+      dialog.unmatched_items  final list of still-unassigned items
+    """
+
+    def __init__(
+        self,
+        parent,
+        unmatched_items: list[ItemRecord],
+        staged_ritms: list[PackingListRecord],
+        record_template: PackingListRecord,
+    ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Enter location / Request Item (optional)")
-        self.setMinimumWidth(600)
+        self.setWindowTitle("Assign location / Request Item, remove from RITMs")
+        self.setMinimumWidth(760)
+        self.setMinimumHeight(620)
 
-        self._items: list[ItemRecord] = list(items)
+        self._template: PackingListRecord = dict(record_template)
 
+        # Master pool: items currently not assigned to any RITM. Order
+        # matters — assignment indexes point into this list, and when
+        # items are moved back from a RITM they get appended to the end.
+        self.unmatched_items: list[ItemRecord] = list(unmatched_items)
+
+        # Staged RITMs. Each entry is a PackingListRecord with a
+        # non-empty items list. Anything that loses all its items during
+        # editing is removed from this list.
+        self.staged_ritms: list[PackingListRecord] = [
+            dict(r) for r in staged_ritms if r.get("items")
+        ]
+        # Ensure the items lists are fresh copies so we can mutate freely.
+        for r in self.staged_ritms:
+            r["items"] = list(r["items"])
+
+        # Assignment dicts keyed by index into self.unmatched_items.
         self.address_assignments: dict[int, str] = {}
         self.ritm_assignments: dict[int, str] = {}
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "These items were queued without a matching RITM or location.\n"
-            "Check the IDs you want to assign, fill in the field(s), then click "
-            "Apply. Checked items are removed from all three tabs once applied."
+            "Assign location/RITM to unmatched items, or pull items out of "
+            "the staged RITMs. Any RITM you assign via the Request Item or "
+            "Both tab will be created if it doesn't already exist."
         ))
 
         self.tabs = QTabWidget()
@@ -725,6 +777,7 @@ class AddressBatchDialog(QDialog):
         self._build_tab("Location", self._build_location_tab)
         self._build_tab("Request Item", self._build_ritm_tab)
         self._build_tab("Both", self._build_both_tab)
+        self._build_remove_tab()
 
         layout.addWidget(self.tabs)
 
@@ -732,24 +785,39 @@ class AddressBatchDialog(QDialog):
         self.status_label.setStyleSheet("color: #53645e;")
         layout.addWidget(self.status_label)
 
+        # If there are no unmatched items to work with, focus Remove / Drop.
+        if not self.unmatched_items:
+            self.tabs.setCurrentWidget(self._remove_tab_widget)
+
+    # ------------------------------------------------------------------
+    # Basic tab builders (Location / Request Item / Both)
+    # ------------------------------------------------------------------
+
     def _build_tab(self, title: str, builder) -> None:
         tab = QWidget()
         tab_layout = QVBoxLayout(tab)
 
         list_widget = QListWidget()
         list_widget.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-        for index, item in enumerate(self._items):
+        self._populate_list(list_widget)
+        self.lists.append(list_widget)
+        tab_layout.addWidget(list_widget)
+
+        builder(tab_layout, list_widget)
+        self.tabs.addTab(tab, title)
+
+    def _populate_list(self, list_widget: QListWidget) -> None:
+        list_widget.clear()
+        for index, item in enumerate(self.unmatched_items):
             entry = QListWidgetItem(item["description"])
             entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             entry.setCheckState(Qt.CheckState.Unchecked)
             entry.setData(Qt.ItemDataRole.UserRole, index)
             list_widget.addItem(entry)
-        self.lists.append(list_widget)
-        tab_layout.addWidget(list_widget)
 
-        builder(tab_layout, list_widget)
-
-        self.tabs.addTab(tab, title)
+    def _refresh_all_assignment_lists(self) -> None:
+        for list_widget in self.lists:
+            self._populate_list(list_widget)
 
     def _build_location_tab(self, tab_layout, list_widget) -> None:
         row = QHBoxLayout()
@@ -760,7 +828,7 @@ class AddressBatchDialog(QDialog):
         )
         row.addWidget(self.location_input, 1)
         tab_layout.addLayout(row)
-        self._add_apply_button(tab_layout, "apply_location")
+        self._add_apply_buttons(tab_layout, "apply_location")
 
     def _build_ritm_tab(self, tab_layout, list_widget) -> None:
         row = QHBoxLayout()
@@ -769,7 +837,7 @@ class AddressBatchDialog(QDialog):
         self.ritm_input.setPlaceholderText("e.g. RITM0011836256")
         row.addWidget(self.ritm_input, 1)
         tab_layout.addLayout(row)
-        self._add_apply_button(tab_layout, "apply_ritm")
+        self._add_apply_buttons(tab_layout, "apply_ritm")
 
     def _build_both_tab(self, tab_layout, list_widget) -> None:
         row1 = QHBoxLayout()
@@ -787,10 +855,9 @@ class AddressBatchDialog(QDialog):
         self.both_ritm_input.setPlaceholderText("e.g. RITM0011836256")
         row2.addWidget(self.both_ritm_input, 1)
         tab_layout.addLayout(row2)
+        self._add_apply_buttons(tab_layout, "apply_both")
 
-        self._add_apply_button(tab_layout, "apply_both")
-
-    def _add_apply_button(self, tab_layout, mode: str) -> None:
+    def _add_apply_buttons(self, tab_layout, mode: str) -> None:
         button_row = QHBoxLayout()
         apply_button = QPushButton("Apply to selected")
         apply_button.setStyleSheet(
@@ -811,6 +878,103 @@ class AddressBatchDialog(QDialog):
         button_row.addStretch(1)
         tab_layout.addLayout(button_row)
 
+    # ------------------------------------------------------------------
+    # Remove / Drop tab
+    # ------------------------------------------------------------------
+
+    def _build_remove_tab(self) -> None:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        tab_layout.addWidget(QLabel(
+            "Check items to pull out of a staged RITM. They return to the "
+            "unmatched pool so you can re-assign them. If a RITM loses all "
+            "its items, it is dropped entirely."
+        ))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(6, 6, 6, 6)
+        scroll.setWidget(container)
+
+        tab_layout.addWidget(scroll, 1)
+
+        button_row = QHBoxLayout()
+        self.apply_removals_button = QPushButton("Apply removals")
+        self.apply_removals_button.setStyleSheet(
+            "font-weight: bold; background: #8b2f2f; color: white;"
+        )
+        self.apply_removals_button.clicked.connect(self._apply_removals)
+        button_row.addWidget(self.apply_removals_button)
+
+        finished_button = QPushButton("Finished")
+        finished_button.setStyleSheet("font-weight: bold;")
+        finished_button.clicked.connect(self.accept)
+        button_row.addWidget(finished_button)
+
+        button_row.addStretch(1)
+        tab_layout.addLayout(button_row)
+
+        self._remove_container_layout = container_layout
+        self._remove_scroll = scroll
+        self._remove_tab_widget = tab
+
+        self.tabs.addTab(tab, "Remove / Drop")
+        self._rebuild_remove_tab()
+
+    def _rebuild_remove_tab(self) -> None:
+        layout = self._remove_container_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        # Prune empty staged RITMs.
+        self.staged_ritms = [r for r in self.staged_ritms if r["items"]]
+
+        if not self.staged_ritms:
+            layout.addWidget(QLabel(
+                "(No RITMs staged yet. Assign a RITM in the Request Item "
+                "or Both tab to create one.)"
+            ))
+            layout.addStretch(1)
+            self.apply_removals_button.setEnabled(False)
+            self._remove_checkboxes = {}
+            return
+
+        self.apply_removals_button.setEnabled(True)
+
+        self._remove_checkboxes: list[tuple[PackingListRecord, list[QCheckBox]]] = []
+
+        for record in self.staged_ritms:
+            identifier = _packing_list_identifier(record)
+            ritm_label = record["ritm"] or "(no request item)"
+            group = QGroupBox(
+                f"{identifier} — RITM {ritm_label} — "
+                f"{len(record['items'])} item(s)"
+            )
+            group_layout = QVBoxLayout(group)
+            boxes: list[QCheckBox] = []
+            for item in record["items"]:
+                box = QCheckBox(
+                    f"{item['description']}  ({item['type']}, "
+                    f"net {item['net']:,})"
+                )
+                box.setChecked(False)
+                group_layout.addWidget(box)
+                boxes.append(box)
+            self._remove_checkboxes.append((record, boxes))
+            layout.addWidget(group)
+
+        layout.addStretch(1)
+
+    # ------------------------------------------------------------------
+    # Apply assignment
+    # ------------------------------------------------------------------
+
     def _checked_indices(self, list_widget: QListWidget) -> list[int]:
         indices: list[int] = []
         for row in range(list_widget.count()):
@@ -819,47 +983,32 @@ class AddressBatchDialog(QDialog):
                 indices.append(int(entry.data(Qt.ItemDataRole.UserRole)))
         return indices
 
-    def _remove_from_all_lists(self, indices: set[int]) -> None:
-        for list_widget in self.lists:
-            row = 0
-            while row < list_widget.count():
-                entry = list_widget.item(row)
-                if int(entry.data(Qt.ItemDataRole.UserRole)) in indices:
-                    list_widget.takeItem(row)
-                else:
-                    row += 1
-
-    def _remaining_count(self) -> int:
-        return self.lists[0].count() if self.lists else 0
-
     def _apply(self, mode: str) -> None:
         current_tab = self.tabs.currentIndex()
+        if current_tab >= len(self.lists):
+            return  # not an assignment tab
         list_widget = self.lists[current_tab]
         indices = self._checked_indices(list_widget)
 
         if not indices:
             QMessageBox.information(
                 self, "Nothing selected",
-                "Check at least one item ID before applying.",
+                "Check at least one item before applying.",
             )
             return
 
+        location = ""
+        ritm = ""
         if mode == "apply_location":
-            value = self.location_input.text().strip()
-            for idx in indices:
-                self.address_assignments[idx] = value
-            self.location_input.clear()
+            location = self.location_input.text().strip()
         elif mode == "apply_ritm":
-            value = self.ritm_input.text().strip()
-            if not value:
+            ritm = self.ritm_input.text().strip()
+            if not ritm:
                 QMessageBox.information(
                     self, "No RITM entered",
                     "Type a Request Item number before applying.",
                 )
                 return
-            for idx in indices:
-                self.ritm_assignments[idx] = value
-            self.ritm_input.clear()
         elif mode == "apply_both":
             location = self.both_location_input.text().strip()
             ritm = self.both_ritm_input.text().strip()
@@ -869,24 +1018,133 @@ class AddressBatchDialog(QDialog):
                     "Enter a location and/or a Request Item before applying.",
                 )
                 return
-            for idx in indices:
-                if location:
-                    self.address_assignments[idx] = location
-                if ritm:
-                    self.ritm_assignments[idx] = ritm
-            self.both_location_input.clear()
-            self.both_ritm_input.clear()
 
-        self._remove_from_all_lists(set(indices))
-        remaining = self._remaining_count()
-        if remaining == 0:
+        # Record assignments on the pool items.
+        for idx in indices:
+            if location:
+                self.address_assignments[idx] = location
+            if ritm:
+                self.ritm_assignments[idx] = ritm
+
+        # If a RITM was applied, move those items into a staged RITM
+        # (creating one if needed).
+        if ritm:
+            self._move_items_to_ritm(indices, ritm, location)
+
+        # Remove assigned items from the visible lists. Note: for the
+        # Location-only mode, the item stays in the pool, but we still
+        # remove it from the visible list so the user doesn't re-select it.
+        # The pool self.unmatched_items is the authoritative list; only
+        # items moved into a staged RITM are actually removed from it.
+        self._remove_indices_from_visible_lists(indices)
+
+        self.location_input.clear()
+        self.ritm_input.clear()
+        self.both_location_input.clear()
+        self.both_ritm_input.clear()
+
+        remaining_visible = self.lists[0].count() if self.lists else 0
+        if remaining_visible == 0 and not self.unmatched_items:
             self.status_label.setText(
-                "All items processed. Click Finished to close."
+                "All items assigned. Click Finished to close."
             )
         else:
             self.status_label.setText(
-                f"Applied to {len(indices)} item(s). {remaining} remaining."
+                f"Applied to {len(indices)} item(s). "
+                f"{len(self.unmatched_items)} unmatched item(s) remain."
             )
+
+    def _move_items_to_ritm(
+        self,
+        indices: list[int],
+        ritm: str,
+        location: str,
+    ) -> None:
+        """Move the checked pool items into the staged RITM `ritm`.
+
+        If a staged RITM with that RITM already exists, items merge into
+        it (preserving the existing letter). If not, a new staged RITM is
+        created using self._template as the base, with `ritm`, `location`,
+        and `location_address` set.
+
+        After moving, the indices are removed from self.unmatched_items and
+        the item indexes in self.address_assignments / self.ritm_assignments
+        are shifted appropriately (via a rebuild rather than in-place
+        manipulation).
+        """
+        # Partition pool into items-to-move and items-to-keep.
+        moved_items = [self.unmatched_items[i] for i in indices]
+        moved_set = set(indices)
+
+        kept_items: list[ItemRecord] = []
+        new_address: dict[int, str] = {}
+        new_ritm_map: dict[int, str] = {}
+        for old_idx, item in enumerate(self.unmatched_items):
+            if old_idx in moved_set:
+                continue
+            new_idx = len(kept_items)
+            kept_items.append(item)
+            if old_idx in self.address_assignments:
+                new_address[new_idx] = self.address_assignments[old_idx]
+            if old_idx in self.ritm_assignments:
+                new_ritm_map[new_idx] = self.ritm_assignments[old_idx]
+
+        self.unmatched_items = kept_items
+        self.address_assignments = new_address
+        self.ritm_assignments = new_ritm_map
+
+        # Find or create the staged RITM.
+        ritm_key = ritm.casefold()
+        target = None
+        for r in self.staged_ritms:
+            if (r["ritm"] or "").casefold() == ritm_key:
+                target = r
+                break
+
+        if target is None:
+            # Create a new staged RITM from the template.
+            new_ritm: PackingListRecord = {
+                "group": ritm_key,
+                "ritm": ritm,
+                "letter": "",
+                "date": self._template["date"],
+                "packing_list": self._template["packing_list"],
+                "location": self._location_from_address(location) if location else "",
+                "location_address": location,
+                "driver_plate": self._template["driver_plate"],
+                "items": [],
+            }
+            # If the item count exceeds per-load max we may split later;
+            # for now, one record holds them.
+            self.staged_ritms.append(new_ritm)
+            target = new_ritm
+
+        target["items"].extend(moved_items)
+        if location and not target["location_address"]:
+            target["location_address"] = location
+            target["location"] = self._location_from_address(location)
+
+        # Refresh the Remove / Drop tab so the RITM shows up (or updates
+        # its item count).
+        self._rebuild_remove_tab()
+
+    def _remove_indices_from_visible_lists(self, indices: list[int]) -> None:
+        """Remove rows whose UserRole index is in `indices` from every list.
+
+        Note: `indices` are indexes into the *previous* self.unmatched_items.
+        For lists built before a _move_items_to_ritm call, this works. After
+        a move, all visible lists get rebuilt via _refresh_all_assignment_lists,
+        which we call at the end of _apply anyway.
+        """
+        index_set = set(indices)
+        for list_widget in self.lists:
+            row = 0
+            while row < list_widget.count():
+                entry = list_widget.item(row)
+                if int(entry.data(Qt.ItemDataRole.UserRole)) in index_set:
+                    list_widget.takeItem(row)
+                else:
+                    row += 1
 
     def _another_batch(self) -> None:
         self.location_input.clear()
@@ -896,6 +1154,66 @@ class AddressBatchDialog(QDialog):
         self.status_label.setText(
             "New batch started. Check items and enter the next values."
         )
+
+    # ------------------------------------------------------------------
+    # Apply removals (from staged RITMs back to pool)
+    # ------------------------------------------------------------------
+
+    def _apply_removals(self) -> None:
+        if not getattr(self, "_remove_checkboxes", None):
+            return
+
+        any_checked = False
+        newly_freed: list[ItemRecord] = []
+
+        for record, boxes in self._remove_checkboxes:
+            drop_indexes = [i for i, box in enumerate(boxes) if box.isChecked()]
+            if not drop_indexes:
+                continue
+            any_checked = True
+            drop_set = set(drop_indexes)
+            kept = [item for i, item in enumerate(record["items"]) if i not in drop_set]
+            freed = [item for i, item in enumerate(record["items"]) if i in drop_set]
+            record["items"] = kept
+            newly_freed.extend(freed)
+
+        if not any_checked:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "Check at least one item to remove.",
+            )
+            return
+
+        # Append freed items back to the pool.
+        for item in newly_freed:
+            self.unmatched_items.append(item)
+
+        # Rebuild all visible lists from the current pool.
+        self._refresh_all_assignment_lists()
+
+        # Rebuild Remove / Drop (prunes emptied RITMs).
+        self._rebuild_remove_tab()
+
+        self.status_label.setText(
+            f"Pulled {len(newly_freed)} item(s) back into the unmatched pool. "
+            f"{len(self.unmatched_items)} unmatched item(s) available."
+        )
+
+        # Switch to Location tab for re-assignment.
+        self.tabs.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _location_from_address(address: str) -> str:
+        parts = [p.strip() for p in address.split(",")]
+        if len(parts) < 2:
+            return ""
+        city_state = ", ".join(parts[1:])
+        city_state = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", city_state).strip()
+        return city_state.replace(",", "")
 
 
 # ---------------------------------------------------------------------------
@@ -1191,14 +1509,26 @@ def working_dir() -> Path:
     return get_user_dir() / WORKING_DIR_RELATIVE_PATH
 
 
-def copy_template_to_working() -> Path:
+def copy_template_to_working(preferred_dir: Path | None = None) -> Path:
+    """Copy the blank input template to a working location.
+
+    `preferred_dir` (usually the last-imported folder) is used if it exists;
+    otherwise we fall back to the app's Working dir, then the app dir.
+    """
     src = template_path()
     if not src.exists():
         raise FileNotFoundError(
             f"Input template not found: {src}\n"
             f"Put 'Incoming Packing List.xls' in the 'Excel Bases' folder."
         )
-    dst_dir = working_dir()
+
+    if preferred_dir is not None and Path(preferred_dir).is_dir():
+        dst_dir = Path(preferred_dir)
+    elif working_dir().is_dir():
+        dst_dir = working_dir()
+    else:
+        dst_dir = Path(__file__).resolve().parent
+
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
@@ -1579,9 +1909,6 @@ def _read_reel_summary_record(sheet) -> PackingListRecord | None:
         })
 
     # Driver/plate live in F8/F9 (that's where the writer below puts them).
-    # An earlier version of this function read G8/G9, which are blank — so
-    # re-opening an existing report saw empty driver/plate and rewrote them
-    # as empty, wiping them over time.
     trucker = str(sheet.Range("F8").Value or "").strip()
     trailer = str(sheet.Range("F9").Value or "").strip()
     return {
@@ -1772,7 +2099,6 @@ def write_reel_summary_report(
                 sheet.Range("M4").NumberFormat = "mm/dd/yyyy"
                 _safe_write(sheet, "M5", record["ritm"])
                 _safe_write(sheet, "C7", record["location"].strip() or "No Location")
-                # I7 = Total Gross (per user request — was total net).
                 _safe_write(sheet, "I7", sum(item["gross"] for item in record["items"]))
                 _safe_write(sheet, "C8", "N/A")
                 _safe_write(sheet, "F8", driver)
@@ -2275,11 +2601,18 @@ class PackingListApp(QMainWindow):
     # ------------------------------------------------------------------
 
     def _open_input_sheet(self) -> None:
+        last_import_folder = self.app_config.get("last_import_folder")
+        preferred_dir = Path(last_import_folder) if last_import_folder else None
+
         try:
-            working = copy_template_to_working()
+            working = copy_template_to_working(preferred_dir=preferred_dir)
         except Exception as error:
             QMessageBox.critical(self, "Could not open input sheet", str(error))
             return
+
+        self.app_config["last_import_folder"] = str(working.parent)
+        save_app_config(self.app_config)
+
         try:
             os.startfile(str(working))
         except AttributeError:
@@ -2298,19 +2631,29 @@ class PackingListApp(QMainWindow):
         )
 
     def _import_input_sheet(self) -> None:
-        default_dir = working_dir()
-        if not default_dir.exists():
-            default_dir = Path(__file__).resolve().parent
+        last_import_folder = (
+            self.app_config.get("last_import_folder")
+            or str(working_dir())
+        )
+        if not Path(last_import_folder).is_dir():
+            last_import_folder = (
+                str(working_dir())
+                if working_dir().is_dir()
+                else str(Path.home())
+            )
 
         chosen, _ = QFileDialog.getOpenFileName(
             self,
             "Select the filled-in Incoming Packing List",
-            str(default_dir),
+            last_import_folder,
             "Excel 97-2003 (*.xls);;All files (*)",
         )
         if not chosen:
             return
         chosen_path = Path(chosen)
+
+        self.app_config["last_import_folder"] = str(chosen_path.parent)
+        save_app_config(self.app_config)
 
         _log_marker("GUI: Import clicked, about to parse")
         try:
@@ -2357,18 +2700,28 @@ class PackingListApp(QMainWindow):
         )
 
     def _rename_files(self) -> None:
-        default_dir = working_dir()
-        if not default_dir.exists():
-            default_dir = Path(__file__).resolve().parent
+        last_rename_folder = (
+            self.app_config.get("last_rename_folder")
+            or str(working_dir())
+        )
+        if not Path(last_rename_folder).is_dir():
+            last_rename_folder = (
+                str(working_dir())
+                if working_dir().is_dir()
+                else str(Path.home())
+            )
 
         chosen = QFileDialog.getExistingDirectory(
             self,
             "Choose the folder whose files should be renamed",
-            str(default_dir),
+            last_rename_folder,
         )
         if not chosen:
             return
         folder = Path(chosen)
+
+        self.app_config["last_rename_folder"] = str(folder)
+        save_app_config(self.app_config)
 
         self.status_label.setText(f"Scanning {folder} for FRN numbers...")
         QApplication.processEvents()
@@ -3187,36 +3540,19 @@ class PackingListApp(QMainWindow):
 
         subject_matches = [match for match in results.exact_matches if match.subject_ritms]
         if not subject_matches:
-            dialog = AddressBatchDialog(self, record["items"])
-            dialog.exec()
-            new_records = self._build_unmatched_records(
-                record,
-                record["items"],
-                dialog.address_assignments,
-                dialog.ritm_assignments,
-                [],
-            )
+            dialog = AddressBatchDialog(self, record["items"], [], record)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.pending_record = None
+                self.imported_record = None
+                self.imported_source_path = None
+                self._set_processing_state(True)
+                self.status_label.setText("Scan finished. Nothing queued.")
+                return
+            self._commit_dialog_state(record, dialog, [], None)
             self.pending_record = None
             self.imported_record = None
             self.imported_source_path = None
-            if not new_records:
-                self._set_processing_state(True)
-                self.scan_results_label.setText("There are no items to queue as unmatched.")
-                self.status_label.setText("No items found to queue.")
-                return
-            self._assign_letters_by_priority(record["packing_list"].casefold())
-            self._refresh_queue_table()
-            queued_ids = ", ".join(
-                _packing_list_identifier(r) for r in new_records
-            )
-            self._clear_current_list()
-            self.imported_info_label.setText("No input sheet imported yet.")
             self._set_processing_state(True)
-            self.scan_results_label.setText(
-                "No exact item descriptions were found in the scanned attachments. "
-                f"All items were queued as {queued_ids}."
-            )
-            self.status_label.setText("Queued all items as unmatched.")
             return
 
         accepted_near_keys = self._confirm_near_matches(results.near_matches)
@@ -3243,13 +3579,13 @@ class PackingListApp(QMainWindow):
         })
 
         assigned_item_indexes: set[int] = set()
-        ritm_letters: dict[str, str] = {}
         matched_email_count = len({
             match.entry_id or (match.folder, match.subject, match.received)
             for match in subject_matches
         })
         total_accepted_files = 0
         staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]] = []
+        staged: list[PackingListRecord] = []
 
         for ritm in found_ritms:
             ritm_key = ritm.casefold()
@@ -3281,11 +3617,6 @@ class PackingListApp(QMainWindow):
                 )
                 accepted_terms.add(candidate.term.casefold())
                 total_accepted_files += 1
-
-            existing_group = self.groups.get(ritm_key)
-            if existing_group is not None:
-                exact_files.update(existing_group.exact_files)
-                accepted_files.update(set(existing_group.files) - set(existing_group.exact_files))
 
             group_terms = sorted({match.term for match in ritm_matches} | {
                 candidate.term for candidate in results.near_matches
@@ -3328,51 +3659,24 @@ class PackingListApp(QMainWindow):
                 "items": matched_items,
             }
             staged_ritm_records.append((ritm_record, ritm_matches))
-
-        for ritm_record, _ in staged_ritm_records:
-            self._append_record(ritm_record)
+            staged.append(ritm_record)
 
         unmatched_items = [
             item for index, item in enumerate(record["items"])
             if index not in assigned_item_indexes
         ]
-        dialog_new_records: list[PackingListRecord] = []
-        if unmatched_items:
-            dialog = AddressBatchDialog(self, unmatched_items)
-            dialog.exec()
-            dialog_new_records = self._build_unmatched_records(
-                record,
-                unmatched_items,
-                dialog.address_assignments,
-                dialog.ritm_assignments,
-                staged_ritm_records,
-            )
 
-        all_records_for_letters: list[PackingListRecord] = (
-            [r for r, _ in staged_ritm_records] + dialog_new_records
-        )
-        for r in all_records_for_letters:
-            if not r["letter"]:
-                r["letter"] = self._next_packing_list_letter(
-                    record["packing_list"].casefold()
-                )
-        self._assign_letters_by_priority(record["packing_list"].casefold())
-        self._refresh_queue_table()
+        dialog = AddressBatchDialog(self, unmatched_items, staged, record)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.pending_record = None
+            self.imported_record = None
+            self.imported_source_path = None
+            self._set_processing_state(True)
+            self.status_label.setText("Scan cancelled.")
+            return
 
-        for ritm_record, ritm_matches in staged_ritm_records:
-            self.record_source_matches[_packing_list_identifier(ritm_record)] = list(ritm_matches)
-
-        ritm_letters = {}
-        for r in self.records:
-            if r["packing_list"].casefold() == record["packing_list"].casefold():
-                if r["ritm"] and r["ritm"].casefold() != "no request item":
-                    ritm_letters[r["ritm"].casefold()] = r["letter"]
-
-        self._merge_matched_emails(
-            subject_matches,
-            [],
-            ritm_letters,
-            record["packing_list"],
+        self._commit_dialog_state(
+            record, dialog, staged_ritm_records, subject_matches
         )
 
         queued_packing_lists = [
@@ -3387,6 +3691,49 @@ class PackingListApp(QMainWindow):
         self._clear_current_list()
         self.imported_info_label.setText("No input sheet imported yet.")
         self._set_processing_state(True)
+
+
+        # Attach source-match info for RITMs that survived the dialog.
+        # Key by (packing_list, RITM) rather than by identifier, because
+        # _assign_letters_by_priority may have re-lettered records during
+        # the commit. Looking up by post-dialog identifier would fail
+        # whenever the letter changed.
+        matches_by_ritm: dict[tuple[str, str], list[ExactMatch]] = {}
+        for rec, matches in staged_ritm_records:
+            if not matches:
+                continue
+            key = (
+                rec["packing_list"].casefold(),
+                (rec["ritm"] or "").casefold(),
+            )
+            matches_by_ritm.setdefault(key, []).extend(matches)
+
+        for final_rec in self.records:
+            identifier = _packing_list_identifier(final_rec)
+            if (final_rec["packing_list"].casefold()
+                    != record["packing_list"].casefold()):
+                continue
+            key = (
+                final_rec["packing_list"].casefold(),
+                (final_rec["ritm"] or "").casefold(),
+            )
+            matches = matches_by_ritm.get(key)
+            if matches:
+                self.record_source_matches[identifier] = list(matches)
+
+        ritm_letters: dict[str, str] = {}
+        for r in self.records:
+            if r["packing_list"].casefold() == record["packing_list"].casefold():
+                if r["ritm"] and r["ritm"].casefold() != "no request item":
+                    ritm_letters[r["ritm"].casefold()] = r["letter"]
+
+        self._merge_matched_emails(
+            subject_matches,
+            [],
+            ritm_letters,
+            record["packing_list"],
+        )
+
         self.scan_results_label.setText(
             f"Packing list IDs: {', '.join(queued_packing_lists)}\n"
             f"Exact item matches across {matched_email_count} email(s):\n"
@@ -3398,11 +3745,105 @@ class PackingListApp(QMainWindow):
             f"Processed packing list IDs {', '.join(queued_packing_lists)}."
         )
 
+    def _commit_dialog_state(
+        self,
+        template_record: PackingListRecord,
+        dialog: AddressBatchDialog,
+        staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]],
+        subject_matches: list[ExactMatch] | None,
+    ) -> None:
+        """Move the dialog's final staged state into self.records.
+
+        - RITMs the scan found that the dialog still contains are appended
+          or merged into self.records.
+        - RITMs the scan found that the dialog dropped (because the user
+          pulled all their items out) are REMOVED from self.records, along
+          with their record_source_matches entry, so they can't be
+          exported.
+        - Any leftover unmatched items get built into records (No Request
+          Item or with the assignments the user made).
+        - Letters are recalculated for the whole packing-list family.
+        - The queue table is refreshed.
+        """
+        # Identifiers the scan originally staged. Used to detect drops.
+        input_identifiers = {
+            _packing_list_identifier(rec) for rec, _ in staged_ritm_records
+        }
+        # Identifiers the dialog still has after user edits.
+        output_identifiers = {
+            _packing_list_identifier(r) for r in dialog.staged_ritms
+        }
+        dropped_identifiers = input_identifiers - output_identifiers
+
+        # 1. Remove records that the dialog dropped entirely.
+        #    This covers both:
+        #      - A record just added by an earlier call in this same session
+        #      - A record left over from a prior session/export with the
+        #        same identifier
+        #    Either way, if the user pulled every item out of that RITM in
+        #    the dialog, it should not appear in the queue or the export.
+        if dropped_identifiers:
+            for record in list(self.records):
+                identifier = _packing_list_identifier(record)
+                if identifier not in dropped_identifiers:
+                    continue
+                # Only drop records belonging to the current packing list,
+                # not the entire queue.
+                if (record["packing_list"].casefold()
+                        != template_record["packing_list"].casefold()):
+                    continue
+                try:
+                    self.records.remove(record)
+                except ValueError:
+                    pass
+                self.record_source_matches.pop(identifier, None)
+                for dir_key in self.exported_record_ids_by_directory:
+                    self.exported_record_ids_by_directory[dir_key].discard(
+                        identifier.casefold()
+                    )
+
+        # 2. Commit staged RITMs (append or merge).
+        for ritm_record in dialog.staged_ritms:
+            items = ritm_record["items"]
+            if not items:
+                continue
+            packing_list_key = ritm_record["packing_list"].casefold()
+            ritm_key = (ritm_record["ritm"] or "").casefold()
+            existing = next(
+                (
+                    r for r in self.records
+                    if r["packing_list"].casefold() == packing_list_key
+                    and (r["ritm"] or "").casefold() == ritm_key
+                ),
+                None,
+            )
+            if existing is not None:
+                existing["items"].extend(items)
+            else:
+                self._append_record(ritm_record)
+
+        # 3. Build records for any leftover unmatched items.
+        if dialog.unmatched_items:
+            self._build_unmatched_records(
+                template_record,
+                dialog.unmatched_items,
+                dialog.address_assignments,
+                dialog.ritm_assignments,
+                staged_ritm_records,
+            )
+
+        # 4. Re-letter and refresh.
+        self._assign_letters_by_priority(template_record["packing_list"].casefold())
+        self._refresh_queue_table()
+
     def _assign_letters_by_priority(self, packing_list_key: str) -> None:
         this_list = [
             r for r in self.records
             if r["packing_list"].casefold() == packing_list_key
         ]
+
+        if not this_list:
+            return
 
         if len(this_list) == 1:
             this_list[0]["letter"] = ""
@@ -3465,6 +3906,7 @@ class PackingListApp(QMainWindow):
             return dialog.chosen
         return None
 
+    
     def _save_records(self) -> None:
         _log_marker("=== EXPORT START ===")
         if not self.records:
@@ -3489,17 +3931,29 @@ class PackingListApp(QMainWindow):
             )
             return
 
+        last_export_folder = (
+            self.app_config.get("last_export_folder")
+            or str(self.summaries_folder.parent
+                   if self.summaries_folder.parent.is_dir()
+                   else DEFAULT_SUMMARIES_DIR.parent)
+        )
+        if not Path(last_export_folder).is_dir():
+            last_export_folder = str(DEFAULT_SUMMARIES_DIR.parent)
+
         _log_marker("EXPORT: before directory dialog")
         selected_directory = QFileDialog.getExistingDirectory(
             self,
             "Choose where to save packing lists, per-load folders, and the "
             "Reel Summary Report",
-            str(self.summaries_folder.parent if self.summaries_folder.parent.is_dir() else DEFAULT_SUMMARIES_DIR.parent),
+            last_export_folder,
         )
         if not selected_directory:
             _log_marker("EXPORT: user cancelled directory dialog")
             return
         _log_marker(f"EXPORT: directory chosen {selected_directory}")
+
+        self.app_config["last_export_folder"] = selected_directory
+        save_app_config(self.app_config)
 
         destination_directory = Path(selected_directory)
         directory_key = str(destination_directory.resolve()).casefold()
@@ -3629,6 +4083,9 @@ class PackingListApp(QMainWindow):
                 write_scrap_pickup_template(record, sp_path, excel=shared_excel)
 
                 matches = self.record_source_matches.get(identifier, [])
+                _log_marker(
+                    f"EXPORT: {identifier} source_matches={len(matches)}"
+                )
                 chosen = self._pick_source_match(identifier, matches)
                 if chosen is None:
                     _log_marker(f"EXPORT: {identifier} no source match, skipping PDF")

@@ -4,7 +4,7 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = [('Excel Bases', 'Excel Bases')]
 binaries = []
-hiddenimports = ['win32com', 'win32com.client', 'win32timezone', 'ortools', 'ortools.sat.python.cp_model']
+hiddenimports = ['win32com', 'win32com.client', 'win32timezone', 'pythoncom', 'pywintypes', 'ortools', 'ortools.sat.python.cp_model']
 datas += collect_data_files('win32com')
 tmp_ret = collect_all('ortools')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

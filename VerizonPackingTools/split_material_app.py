@@ -215,7 +215,18 @@ except ImportError:
     HAS_ORTOOLS = False
 
 
-def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
+def solve_cp(bundles, remaining, step, totals, time_limit=15.0,
+             relaxed=False, sacrificial=()):
+    """CP-SAT solver.
+
+    strict (relaxed=False): every bundle's weights must sum to its
+    bundle_total, AND every material's total must match its budget.
+
+    relaxed=True: only the bundles listed in `sacrificial` are allowed
+    to have weights that don't sum to their bundle_total; all other
+    bundles stay exact, and material totals stay exact.
+    """
+    sacrificial = set(sacrificial)
     model = cp_model.CpModel()
     min_units = -(-MIN_WEIGHT // step)
     x = {}
@@ -225,8 +236,23 @@ def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
             if max_units < min_units:
                 return None
             x[(bi, it)] = model.new_int_var(min_units, max_units, f"x_{bi}_{it}")
-    for bi, b in enumerate(bundles):
-        model.add(sum(x[(bi, it)] * step for it in b["items"]) == b["total"])
+
+    if relaxed:
+        # Sacrificial bundles float; everyone else stays exact.
+        for bi, b in enumerate(bundles):
+            total = sum(x[(bi, it)] * step for it in b["items"])
+            if b["load"] in sacrificial:
+                # Loose bound: at most the full bundle_total, at least the
+                # min-weight floor so it isn't trivially zero.
+                model.add(total >= min_units * step)
+                model.add(total <= b["total"])
+            else:
+                model.add(total == b["total"])
+    else:
+        for bi, b in enumerate(bundles):
+            model.add(sum(x[(bi, it)] * step for it in b["items"]) == b["total"])
+
+    # Material totals must be exact in both modes.
     for item, need in remaining.items():
         contributors = [
             x[(bi, it)] * step
@@ -239,6 +265,7 @@ def solve_cp(bundles, remaining, step, totals, time_limit=15.0):
         else:
             if need != 0:
                 return None
+
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit
     status = solver.Solve(model)
@@ -282,14 +309,24 @@ def partitions_capped_cached(total, caps, step, min_weight=MIN_WEIGHT):
     return result
 
 
-def solve_recursive(bundles, remaining, step, totals):
+def solve_recursive(bundles, remaining, step, totals, relaxed=False,
+                    sacrificial=()):
+    """Backtracking solver. See solve_cp for the relaxed/sacrificial
+    semantics — behavior is intentionally identical here."""
     global _iter_count
+    sacrificial = set(sacrificial)
     assignment = []
     remaining = dict(remaining)
 
     def recurse(idx):
         global _iter_count
         if idx == len(bundles):
+            if relaxed:
+                # Any leftover is fine — sacrificial loads already absorbed
+                # what they could. Material exactness is enforced by the
+                # caller's per-load caps and the fact that we only generate
+                # combos within remaining caps.
+                return True
             return all(v == 0 for v in remaining.values())
         _iter_count += 1
         if _iter_count > ITER_LIMIT:
@@ -299,10 +336,22 @@ def solve_recursive(bundles, remaining, step, totals):
         caps = tuple(remaining[it] for it in items)
         remaining_sum = sum(remaining.values())
         needed = sum(b2["total"] for b2 in bundles[idx:])
-        if remaining_sum < needed:
+        if not relaxed and remaining_sum < needed:
             return False
         full_caps = tuple(totals[it] for it in items)
-        for combo in partitions_capped_cached(b["total"], full_caps, step):
+
+        is_sacrificial = b["load"] in sacrificial
+        if is_sacrificial:
+            # Allowed to be less than bundle_total; use whatever fits.
+            target = min(b["total"], sum(caps))
+            if target <= 0:
+                combos = [()]
+            else:
+                combos = partitions_capped_cached(target, full_caps, step)
+        else:
+            combos = partitions_capped_cached(b["total"], full_caps, step)
+
+        for combo in combos:
             if any(w > c for w, c in zip(combo, caps)):
                 continue
             for it, w in zip(items, combo):
@@ -373,64 +422,6 @@ def _safe_calculate(excel) -> None:
             return
         except Exception:
             continue
-
-
-def _sort_family_tabs_safe(workbook) -> None:
-    """Reorder family R/P tabs so R and P groups are each sorted by FRN.
-
-    This is OPT-IN. Reordering sheets via COM invalidates cross-sheet
-    references, and Excel will silently blank cells whose formulas can no
-    longer resolve. Only call this if the user has explicitly asked for
-    it, and only at the very start of a write session (before any cells
-    are modified).
-    """
-    sheets = list(workbook.Worksheets)
-    ordered_sheets = list(sheets)
-    positions_by_kind: dict[str, list[int]] = {"R": [], "P": []}
-    family_sheets_by_kind: dict[str, list[tuple[str, object]]] = {"R": [], "P": []}
-
-    for position, sheet in enumerate(sheets):
-        match = re.fullmatch(
-            r"(FRN\d{6})(?:-(\d+)R)?-([A-Za-z]+)([RP])",
-            sheet.Name.strip(),
-            re.IGNORECASE,
-        )
-        if not match:
-            continue
-        kind = match.group(4).upper()
-        positions_by_kind[kind].append(position)
-        sequence = match.group(2)
-        identifier = f"{match.group(1)}"
-        if sequence:
-            identifier += f"-{sequence}R"
-        identifier += f"-{match.group(3)}"
-        family_sheets_by_kind[kind].append((identifier, sheet))
-
-    for kind, positions in positions_by_kind.items():
-        sorted_sheets = [
-            sheet
-            for _, sheet in sorted(
-                family_sheets_by_kind[kind],
-                key=lambda entry: _frn_order_key(entry[0]),
-            )
-        ]
-        for position, sheet in zip(positions, sorted_sheets):
-            ordered_sheets[position] = sheet
-
-    anchor = None
-    for expected_sheet in ordered_sheets:
-        if anchor is None:
-            try:
-                expected_sheet.Move(Before=workbook.Worksheets(1))
-            except Exception:
-                pass
-            anchor = expected_sheet
-            continue
-        try:
-            expected_sheet.Move(After=anchor)
-        except Exception:
-            pass
-        anchor = expected_sheet
 
 
 @dataclass
@@ -865,8 +856,6 @@ def fill_summary_tab(
     summary_path: Path,
     frn: str,
     loads: list[_LoadRow],
-    *,
-    sort_tabs: bool = False,
 ) -> int:
     MAX_SLOTS = 20
     FIRST_ROW = 8
@@ -881,12 +870,6 @@ def fill_summary_tab(
     save_ok = False
     try:
         workbook = excel.Workbooks.Open(str(summary_path), UpdateLinks=0, ReadOnly=False)
-
-        if sort_tabs:
-            try:
-                _sort_family_tabs_safe(workbook)
-            except Exception as exc:
-                print(f"[fill_summary_tab] tab sort skipped: {exc}")
 
         try:
             sheet = workbook.Worksheets("Summary")
@@ -949,6 +932,7 @@ class SolverWorker(QThread):
         self.raw_bundles = raw_bundles
         self.start_step = start_step
         self.min_weight = min_weight
+        self.relaxed_loads: list[str] = []
 
     def run(self):
         global MIN_WEIGHT
@@ -990,34 +974,87 @@ class SolverWorker(QThread):
         bundles.sort(key=lambda b: (len(b["items"]), -b["total"]))
         steps = [s for s in (1, 5, 10) if s <= self.start_step]
 
-        result = None
-        used_step = None
-        if HAS_ORTOOLS:
-            for step in steps:
-                try:
-                    result = solve_cp(bundles, remaining, step, self.totals, time_limit=15.0)
-                except Exception:
-                    result = None
+        def _try(relaxed=False, sacrificial=()):
+            """Run the solver. Returns (result, used_step) or (None, None)."""
+            if HAS_ORTOOLS:
+                for step in steps:
+                    try:
+                        r = solve_cp(
+                            bundles, remaining, step, self.totals,
+                            time_limit=15.0,
+                            relaxed=relaxed,
+                            sacrificial=sacrificial,
+                        )
+                    except Exception:
+                        r = None
+                    if r is not None:
+                        return r, step
+            else:
+                for step in (5, 1):
+                    if step > self.start_step:
+                        continue
+                    _partition_cache.clear()
+                    global _iter_count
+                    _iter_count = 0
+                    try:
+                        r = solve_recursive(
+                            bundles, remaining, step, self.totals,
+                            relaxed=relaxed,
+                            sacrificial=sacrificial,
+                        )
+                    except RuntimeError:
+                        r = None
+                    if r is not None:
+                        return r, step
+            return None, None
+
+        # ---- Pass 1: strict solve — every load must match exactly. ----
+        result, used_step = _try(relaxed=False, sacrificial=())
+        relaxed_used: list[str] = []
+
+        # ---- Pass 2: relax ONE load at a time, worst-fit first. ----
+        if result is None and len(bundles) >= 2:
+            # Try the loads with the largest bundle_total first — they're
+            # the most likely to be the ones that can't be satisfied.
+            ordered = sorted(bundles, key=lambda b: b["total"], reverse=True)
+            for b in ordered:
+                victim = b["load"]
+                print(f"[solver] strict failed; trying relaxed w/ victim={victim!r}")
+                result, used_step = _try(
+                    relaxed=True, sacrificial=(victim,)
+                )
                 if result is not None:
-                    used_step = step
+                    relaxed_used = [victim]
                     break
-        else:
-            for step in (5, 1):
-                if step > self.start_step:
-                    continue
-                _partition_cache.clear()
-                global _iter_count
-                _iter_count = 0
-                try:
-                    result = solve_recursive(bundles, remaining, step, self.totals)
-                except RuntimeError:
-                    result = None
+
+        # ---- Pass 3: relax PAIRS of loads. ----
+        if result is None and len(bundles) >= 3:
+            import itertools
+            ordered = sorted(bundles, key=lambda b: b["total"], reverse=True)
+            names = [b["load"] for b in ordered]
+            for pair in itertools.combinations(names, 2):
+                print(f"[solver] strict+single failed; trying pair={pair!r}")
+                result, used_step = _try(
+                    relaxed=True, sacrificial=pair
+                )
                 if result is not None:
-                    used_step = step
+                    relaxed_used = list(pair)
                     break
 
         if result is None:
-            raise ValueError("No solution found.")
+            raise ValueError(
+                "No solution found. Even after allowing one or two loads "
+                "to be relaxed (so their per-load weight can differ from "
+                "their R-tab Net), the material totals could not be made "
+                "to add up."
+            )
+
+        if relaxed_used:
+            print(
+                f"[solver] RELAXED load(s) to keep material totals exact: "
+                f"{relaxed_used}"
+            )
+            self.relaxed_loads = list(relaxed_used)
 
         all_bundles = locked + result
         per_load: dict[str, dict[str, int]] = {}
@@ -1122,6 +1159,7 @@ class SplitMaterialWindow(QMainWindow):
         self.summary_path: Path | None = None
         self.loads: list[_LoadRow] = []
         self.load_widgets: list[LoadItemsWidget] = []
+        self.worker: SolverWorker | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -1198,7 +1236,7 @@ class SplitMaterialWindow(QMainWindow):
         opt_row.addWidget(QLabel("Min weight:"))
         self.min_weight_spin = QSpinBox()
         self.min_weight_spin.setRange(1, 1000)
-        self.min_weight_spin.setValue(3)
+        self.min_weight_spin.setValue(30)
         opt_row.addWidget(self.min_weight_spin)
         opt_row.addStretch(1)
         self.run_button = QPushButton("▶  Run Solver && Write Files")
@@ -1206,19 +1244,6 @@ class SplitMaterialWindow(QMainWindow):
         self.run_button.clicked.connect(self._run)
         opt_row.addWidget(self.run_button)
         root.addLayout(opt_row)
-
-        sort_row = QHBoxLayout()
-        self.sort_tabs_checkbox = QCheckBox(
-            "Sort family R/P tabs after writing "
-            "(only enable if your report has no cross-sheet formulas)"
-        )
-        self.sort_tabs_checkbox.setChecked(
-            bool(self.config.get("sort_tabs_after_write", False))
-        )
-        self.sort_tabs_checkbox.toggled.connect(self._toggle_sort_tabs)
-        sort_row.addWidget(self.sort_tabs_checkbox)
-        sort_row.addStretch(1)
-        root.addLayout(sort_row)
 
         self.output = QTextEdit()
         self.output.setReadOnly(True)
@@ -1278,10 +1303,6 @@ class SplitMaterialWindow(QMainWindow):
                 self.split_folder_label.setText(saved)
             else:
                 self._pick_split_folder()
-
-    def _toggle_sort_tabs(self, checked: bool) -> None:
-        self.config["sort_tabs_after_write"] = bool(checked)
-        save_config(self.config)
 
     def _pick_split_folder(self) -> None:
         start = self.config.get("split_folder") or str(DEFAULT_SPLIT_DIR)
@@ -1592,6 +1613,19 @@ class SplitMaterialWindow(QMainWindow):
             QMessageBox.critical(self, "Solver failed", error)
             return
 
+        # Tell the user which load(s) (if any) were allowed to drift from
+        # their R-tab Net so that material totals could still add up.
+        relaxed = getattr(self.worker, "relaxed_loads", []) if self.worker else []
+        if relaxed:
+            self._log(
+                "NOTE: a strict solution (all loads matching their R-tab "
+                "Net exactly) did not exist. The following load(s) were "
+                "allowed to receive a Split Material total that differs "
+                "from their R-tab Net so the material totals still add up: "
+                + ", ".join(relaxed)
+            )
+            self._log("")
+
         frn = self.frn_input.text().strip()
         if self.summary_path is not None:
             try:
@@ -1659,9 +1693,13 @@ class SplitMaterialWindow(QMainWindow):
 
         configured_split = self.config.get("split_folder")
         if configured_split and Path(configured_split).is_dir():
-            split_out_dir = Path(configured_split)
+            base_split_dir = Path(configured_split)
         else:
-            split_out_dir = summary_dir
+            base_split_dir = summary_dir
+        # All Split Material Weighted workbooks live in a dedicated
+        # "Split Materials" subfolder so they don't clutter the base folder
+        # (whether that base is the summary folder or a user-chosen one).
+        split_out_dir = base_split_dir / "Split Materials"
         split_out_dir.mkdir(parents=True, exist_ok=True)
 
         load_by_letter = {ld.letter: ld for ld in self.loads}
@@ -1702,10 +1740,7 @@ class SplitMaterialWindow(QMainWindow):
         self._log(f"Updated P tabs in {summary_path.name}")
 
         try:
-            written = fill_summary_tab(
-                summary_path, frn, self.loads,
-                sort_tabs=bool(self.config.get("sort_tabs_after_write", False)),
-            )
+            written = fill_summary_tab(summary_path, frn, self.loads)
             self._log(f"Filled {written} PL # cell(s) in Summary tab.")
         except Exception as e:
             self._log(f"Summary tab fill failed: {e}")

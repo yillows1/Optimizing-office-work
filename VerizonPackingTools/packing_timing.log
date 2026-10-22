@@ -1,0 +1,661 @@
+10:02:54 --- GUI: Import clicked, about to parse ---
+10:02:54 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\Working\Incoming FRN261008-1R.xls ---
+10:02:54 --- parse: DispatchEx ---
+10:02:55 --- parse: Workbooks.Open ---
+10:02:55 --- parse: reading header cells ---
+10:02:55 --- parse: header done, reading items ---
+10:02:55 --- parse: items done (9) ---
+10:02:55 --- parse: releasing Excel ---
+10:02:55 _release_excel: 0.05s
+10:03:55 parse_incoming_packing_list: 61.83s
+10:03:55 --- GUI: Import parse returned ---
+10:04:22 --- === EXPORT START === ---
+10:04:22 --- EXPORT: before directory dialog ---
+10:04:24 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+10:04:24 --- EXPORT: 2 record(s) to export ---
+10:04:25 --- EXPORT: building records_by_week ---
+10:04:25 --- EXPORT: 1 week bucket(s) ---
+10:04:25 --- EXPORT: DispatchEx shared Excel ---
+10:04:26 --- EXPORT: shared Excel ready ---
+10:04:26 --- EXPORT: reel summary loop START ---
+10:04:26 --- write_reel_summary START Reel Summary Report WE 10.5.26 ~ 10.9.26.xls (2 records) ---
+10:04:26 --- write_reel_summary: Open staged workbook ---
+10:04:27 --- write_reel_summary: scanning reel sheets ---
+10:04:30 --- write_reel_summary: found 20 reel sheets ---
+10:04:30 --- write_reel_summary: renaming to temporary names ---
+10:04:34 --- write_reel_summary: clearing old content ---
+10:16:39 --- GUI: Import clicked, about to parse ---
+10:16:39 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\Working\Incoming FRN261008-1R.xls ---
+10:16:39 --- parse: DispatchEx ---
+10:16:40 --- parse: Workbooks.Open ---
+10:16:41 --- parse: reading header cells ---
+10:16:41 --- parse: reading item block in one call ---
+10:16:41 --- parse: items done (9) ---
+10:16:41 --- parse: releasing Excel ---
+10:16:41 _release_excel: 0.07s
+10:16:43 parse_incoming_packing_list: 3.90s
+10:16:43 --- GUI: Import parse returned ---
+10:17:45 --- === EXPORT START === ---
+10:17:45 --- EXPORT: before directory dialog ---
+10:17:47 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+10:17:47 --- EXPORT: 2 record(s) to export ---
+10:18:24 --- EXPORT: building records_by_week ---
+10:18:24 --- EXPORT: 1 week bucket(s) ---
+10:18:24 --- EXPORT: DispatchEx shared Excel ---
+10:18:25 --- EXPORT: shared Excel ready ---
+10:18:25 --- EXPORT: reel summary loop START ---
+10:18:25 --- write_reel_summary START Reel Summary Report WE 10.5.26 ~ 10.9.26.xls (2 records) ---
+10:18:25 --- write_reel_summary: Open staged workbook ---
+10:18:26 --- write_reel_summary: scanning reel sheets ---
+10:18:27 --- write_reel_summary: found 20 reel sheets ---
+10:18:27 --- write_reel_summary: renaming to temporary names ---
+10:18:28 --- write_reel_summary: clearing old content (batched) ---
+10:18:33 --- write_reel_summary: clear done ---
+10:18:33 --- write_reel_summary: writing records ---
+10:18:35 --- write_reel_summary: final tab names ---
+10:18:37 --- write_reel_summary: CalculateFull ---
+10:18:37 --- write_reel_summary: Save ---
+10:18:38 write_reel_summary_report: 12.65s
+10:18:38 --- EXPORT: reel summary loop DONE 12.65s ---
+10:18:38 --- EXPORT: per-record loop START ---
+10:18:38 --- EXPORT: record FRN261008-1R-A ---
+10:18:38 --- write_packing_list START Packing List FRN261008-1R-A.xls ---
+10:18:38 --- write_packing_list: Workbooks.Open ---
+10:18:38 --- write_packing_list: writing header ---
+10:18:38 --- write_packing_list: writing item block in one call ---
+10:18:38 --- write_packing_list: Save ---
+10:18:38 write_packing_list_template: 0.36s
+10:18:38 --- write_scrap START Scrap Pick Up Request for Load FRN261008-1R-A.xls ---
+10:18:38 --- write_scrap: Workbooks.Open ---
+10:18:39 --- write_scrap: writing cells ---
+10:18:39 --- write_scrap: Save ---
+10:18:39 write_scrap_pickup_template: 0.41s
+10:18:39 --- EXPORT: FRN261008-1R-A fetching PDF from Outlook ---
+10:18:39 fetch_attachment_bytes: 0.06s
+10:18:39 slice_first_pages: 0.02s
+10:18:39 annotate_pdf: 0.02s
+10:18:39 --- EXPORT: record FRN261008-1R-B ---
+10:18:39 --- write_packing_list START Packing List FRN261008-1R-B.xls ---
+10:18:39 --- write_packing_list: Workbooks.Open ---
+10:18:39 --- write_packing_list: writing header ---
+10:18:39 --- write_packing_list: writing item block in one call ---
+10:18:39 --- write_packing_list: Save ---
+10:18:39 write_packing_list_template: 0.38s
+10:18:39 --- write_scrap START Scrap Pick Up Request for Load FRN261008-1R-B.xls ---
+10:18:39 --- write_scrap: Workbooks.Open ---
+10:18:39 --- write_scrap: writing cells ---
+10:18:39 --- write_scrap: Save ---
+10:18:40 write_scrap_pickup_template: 0.35s
+10:18:40 --- EXPORT: FRN261008-1R-B no source match, skipping PDF ---
+10:18:40 --- EXPORT: per-record loop DONE 1.61s ---
+10:18:40 --- EXPORT: releasing shared Excel ---
+10:18:40 _release_excel: 0.03s
+10:18:40 --- EXPORT: shared Excel released ---
+10:18:40 --- === EXPORT DONE === ---
+10:19:00 --- === EXPORT START === ---
+10:19:00 --- EXPORT: before directory dialog ---
+10:19:01 --- EXPORT: user cancelled directory dialog ---
+10:19:36 --- GUI: Import clicked, about to parse ---
+10:19:36 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\Working\Incoming FRN261008-2R.xls ---
+10:19:36 --- parse: DispatchEx ---
+10:19:37 --- parse: Workbooks.Open ---
+10:19:37 --- parse: reading header cells ---
+10:19:37 --- parse: reading item block in one call ---
+10:19:37 --- parse: items done (6) ---
+10:19:37 --- parse: releasing Excel ---
+10:19:37 _release_excel: 0.06s
+10:19:40 parse_incoming_packing_list: 3.66s
+10:19:40 --- GUI: Import parse returned ---
+10:21:35 --- === EXPORT START === ---
+10:21:35 --- EXPORT: before directory dialog ---
+10:21:40 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+10:21:40 --- EXPORT: 1 record(s) to export ---
+10:21:44 --- EXPORT: building records_by_week ---
+10:21:44 --- EXPORT: 1 week bucket(s) ---
+10:21:44 --- EXPORT: DispatchEx shared Excel ---
+10:21:45 --- EXPORT: shared Excel ready ---
+10:21:45 --- EXPORT: reel summary loop START ---
+10:21:45 --- write_reel_summary START Reel Summary Report WE 10.5.26 ~ 10.9.26.xls (3 records) ---
+10:21:45 --- write_reel_summary: Open staged workbook ---
+10:21:45 --- write_reel_summary: scanning reel sheets ---
+10:21:46 --- write_reel_summary: found 20 reel sheets ---
+10:21:47 --- write_reel_summary: renaming to temporary names ---
+10:21:47 --- write_reel_summary: clearing old content (batched) ---
+10:21:53 --- write_reel_summary: clear done ---
+10:21:53 --- write_reel_summary: writing records ---
+10:21:55 --- write_reel_summary: final tab names ---
+10:21:57 --- write_reel_summary: CalculateFull ---
+10:21:57 --- write_reel_summary: Save ---
+10:21:58 write_reel_summary_report: 12.71s
+10:21:58 --- EXPORT: reel summary loop DONE 12.71s ---
+10:21:58 --- EXPORT: per-record loop START ---
+10:21:58 --- EXPORT: record FRN261008-2R ---
+10:21:58 --- write_packing_list START Packing List FRN261008-2R.xls ---
+10:21:58 --- write_packing_list: Workbooks.Open ---
+10:21:58 --- write_packing_list: writing header ---
+10:21:58 --- write_packing_list: writing item block in one call ---
+10:21:58 --- write_packing_list: Save ---
+10:21:58 write_packing_list_template: 0.37s
+10:21:58 --- write_scrap START Scrap Pick Up Request for Load FRN261008-2R.xls ---
+10:21:58 --- write_scrap: Workbooks.Open ---
+10:21:58 --- write_scrap: writing cells ---
+10:21:58 --- write_scrap: Save ---
+10:21:58 write_scrap_pickup_template: 0.40s
+10:21:58 --- EXPORT: FRN261008-2R no source match, skipping PDF ---
+10:21:58 --- EXPORT: per-record loop DONE 0.77s ---
+10:21:58 --- EXPORT: releasing shared Excel ---
+10:21:58 _release_excel: 0.03s
+10:21:58 --- EXPORT: shared Excel released ---
+10:21:58 --- === EXPORT DONE === ---
+10:37:16 --- GUI: Import clicked, about to parse ---
+10:37:16 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\Working\Incoming FRN261008-1R.xls ---
+10:37:16 --- parse: DispatchEx ---
+10:37:18 --- parse: Workbooks.Open ---
+10:37:18 --- parse: reading header cells ---
+10:37:18 --- parse: reading item block in one call ---
+10:37:18 --- parse: items done (9) ---
+10:37:18 --- parse: releasing Excel ---
+10:37:18 _release_excel: 0.06s
+10:37:20 parse_incoming_packing_list: 3.73s
+10:37:20 --- GUI: Import parse returned ---
+10:38:23 --- === EXPORT START === ---
+10:38:23 --- EXPORT: before directory dialog ---
+10:38:26 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+10:38:26 --- EXPORT: 2 record(s) to export ---
+10:38:27 --- EXPORT: building records_by_week ---
+10:38:27 --- EXPORT: 1 week bucket(s) ---
+10:38:27 --- EXPORT: DispatchEx shared Excel ---
+10:38:28 --- EXPORT: shared Excel ready ---
+10:38:28 --- EXPORT: reel summary loop START ---
+10:38:28 --- write_reel_summary START Reel Summary Report WE 10.5.26 ~ 10.9.26.xls (2 records) ---
+10:38:28 --- write_reel_summary: Open staged workbook ---
+10:38:29 --- write_reel_summary: scanning reel sheets ---
+10:38:30 --- write_reel_summary: found 20 reel sheets ---
+10:38:30 --- write_reel_summary: renaming to temporary names ---
+10:38:30 --- write_reel_summary: clearing old content (batched) ---
+10:38:36 --- write_reel_summary: clear done ---
+10:38:36 --- write_reel_summary: writing records ---
+10:38:38 --- write_reel_summary: final tab names ---
+10:38:40 --- write_reel_summary: CalculateFull ---
+10:38:40 --- write_reel_summary: Save ---
+10:38:41 write_reel_summary_report: 12.68s
+10:38:41 --- EXPORT: reel summary loop DONE 12.68s ---
+10:38:41 --- EXPORT: per-record loop START ---
+10:38:41 --- EXPORT: record FRN261008-1R-A ---
+10:38:41 --- write_packing_list START Packing List FRN261008-1R-A.xls ---
+10:38:41 --- write_packing_list: Workbooks.Open ---
+10:38:41 --- write_packing_list: writing header ---
+10:38:41 --- write_packing_list: writing item block in one call ---
+10:38:41 --- write_packing_list: Save ---
+10:38:41 write_packing_list_template: 0.37s
+10:38:41 --- write_scrap START Scrap Pick Up Request for Load FRN261008-1R-A.xls ---
+10:38:41 --- write_scrap: Workbooks.Open ---
+10:38:41 --- write_scrap: writing cells ---
+10:38:41 --- write_scrap: Save ---
+10:38:41 write_scrap_pickup_template: 0.40s
+10:38:41 --- EXPORT: FRN261008-1R-A fetching PDF from Outlook ---
+10:38:41 fetch_attachment_bytes: 0.08s
+10:38:41 slice_first_pages: 0.01s
+10:38:42 annotate_pdf: 0.01s
+10:38:42 --- EXPORT: record FRN261008-1R-B ---
+10:38:42 --- write_packing_list START Packing List FRN261008-1R-B.xls ---
+10:38:42 --- write_packing_list: Workbooks.Open ---
+10:38:42 --- write_packing_list: writing header ---
+10:38:42 --- write_packing_list: writing item block in one call ---
+10:38:42 --- write_packing_list: Save ---
+10:38:42 write_packing_list_template: 0.30s
+10:38:42 --- write_scrap START Scrap Pick Up Request for Load FRN261008-1R-B.xls ---
+10:38:42 --- write_scrap: Workbooks.Open ---
+10:38:42 --- write_scrap: writing cells ---
+10:38:42 --- write_scrap: Save ---
+10:38:42 write_scrap_pickup_template: 0.35s
+10:38:42 --- EXPORT: FRN261008-1R-B no source match, skipping PDF ---
+10:38:42 --- EXPORT: per-record loop DONE 1.53s ---
+10:38:42 --- EXPORT: releasing shared Excel ---
+10:38:42 _release_excel: 0.04s
+10:38:42 --- EXPORT: shared Excel released ---
+10:38:42 --- === EXPORT DONE === ---
+14:25:00 --- GUI: Import clicked, about to parse ---
+14:25:00 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261016-1R.xls ---
+14:25:00 --- parse: DispatchEx ---
+14:25:02 --- parse: Workbooks.Open ---
+14:25:02 --- parse: reading header cells ---
+14:25:02 --- parse: reading item block in one call ---
+14:25:02 --- parse: items done (7) ---
+14:25:02 --- parse: releasing Excel ---
+14:25:02 _release_excel: 0.06s
+14:25:04 parse_incoming_packing_list: 3.91s
+14:25:04 --- GUI: Import parse returned ---
+14:30:25 --- GUI: Import clicked, about to parse ---
+14:30:25 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261016-1R.xls ---
+14:30:25 --- parse: DispatchEx ---
+14:30:26 --- parse: Workbooks.Open ---
+14:30:26 --- parse: reading header cells ---
+14:30:26 --- parse: reading item block in one call ---
+14:30:26 --- parse: items done (7) ---
+14:30:26 --- parse: releasing Excel ---
+14:30:26 _release_excel: 0.06s
+14:30:28 parse_incoming_packing_list: 3.80s
+14:30:28 --- GUI: Import parse returned ---
+14:33:17 --- GUI: Import clicked, about to parse ---
+14:33:17 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261016-1R.xls ---
+14:33:17 --- parse: DispatchEx ---
+14:33:18 --- parse: Workbooks.Open ---
+14:33:18 --- parse: reading header cells ---
+14:33:18 --- parse: reading item block in one call ---
+14:33:18 --- parse: items done (7) ---
+14:33:18 --- parse: releasing Excel ---
+14:33:18 _release_excel: 0.06s
+14:33:21 parse_incoming_packing_list: 3.78s
+14:33:21 --- GUI: Import parse returned ---
+14:33:32 _release_excel: 0.02s
+14:33:35 --- GUI: Import clicked, about to parse ---
+14:33:35 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261016-1R.xls ---
+14:33:35 --- parse: DispatchEx ---
+14:33:36 --- parse: Workbooks.Open ---
+14:33:36 --- parse: reading header cells ---
+14:33:36 --- parse: reading item block in one call ---
+14:33:36 --- parse: items done (7) ---
+14:33:36 --- parse: releasing Excel ---
+14:33:36 _release_excel: 0.08s
+14:33:38 parse_incoming_packing_list: 3.67s
+14:33:38 --- GUI: Import parse returned ---
+14:34:53 --- GUI: Import clicked, about to parse ---
+14:34:53 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261016-1R.xls ---
+14:34:53 --- parse: DispatchEx ---
+14:34:54 --- parse: Workbooks.Open ---
+14:34:54 --- parse: reading header cells ---
+14:34:55 --- parse: reading item block in one call ---
+14:34:55 --- parse: items done (7) ---
+14:34:55 --- parse: releasing Excel ---
+14:34:55 _release_excel: 0.07s
+14:34:57 parse_incoming_packing_list: 3.75s
+14:34:57 --- GUI: Import parse returned ---
+14:52:21 --- GUI: Import clicked, about to parse ---
+14:52:21 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261016-1R.xls ---
+14:52:21 --- parse: DispatchEx ---
+14:52:22 --- parse: Workbooks.Open ---
+14:52:22 --- parse: reading header cells ---
+14:52:22 --- parse: reading item block in one call ---
+14:52:22 --- parse: items done (7) ---
+14:52:22 --- parse: releasing Excel ---
+14:52:22 _release_excel: 0.06s
+14:52:24 parse_incoming_packing_list: 3.80s
+14:52:24 --- GUI: Import parse returned ---
+14:55:31 --- === EXPORT START === ---
+14:55:31 --- EXPORT: before directory dialog ---
+14:55:35 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+14:55:35 --- EXPORT: 1 record(s) to export ---
+14:55:36 --- EXPORT: building records_by_week ---
+14:55:36 --- EXPORT: 1 week bucket(s) ---
+14:55:36 --- EXPORT: DispatchEx shared Excel ---
+14:55:37 --- EXPORT: shared Excel ready ---
+14:55:37 --- EXPORT: reel summary loop START ---
+14:55:37 --- write_reel_summary START Reel Summary Report WE 10.12.26 ~ 10.16.26.xls (1 records) ---
+14:55:37 --- write_reel_summary: Open staged workbook ---
+14:55:38 --- write_reel_summary: scanning reel sheets ---
+14:55:39 --- write_reel_summary: found 20 reel sheets ---
+14:55:39 --- write_reel_summary: renaming to temporary names ---
+14:55:39 --- write_reel_summary: clearing old content (batched) ---
+14:55:43 --- write_reel_summary: clear done ---
+14:55:43 --- write_reel_summary: writing records ---
+14:55:46 --- write_reel_summary: final tab names ---
+14:55:47 --- write_reel_summary: CalculateFull ---
+14:55:47 --- write_reel_summary: Save ---
+14:55:47 write_reel_summary_report: 10.40s
+14:55:47 --- EXPORT: reel summary loop DONE 10.40s ---
+14:55:47 --- EXPORT: per-record loop START ---
+14:55:47 --- EXPORT: record FRN261016-1R ---
+14:55:47 --- write_packing_list START Packing List FRN261016-1R.xls ---
+14:55:47 --- write_packing_list: Workbooks.Open ---
+14:55:47 --- write_packing_list: writing header ---
+14:55:48 --- write_packing_list: writing item block in one call ---
+14:55:48 --- write_packing_list: Save ---
+14:55:48 write_packing_list_template: 0.48s
+14:55:48 --- write_scrap START Scrap Pick Up Request for Load FRN261016-1R.xls ---
+14:55:48 --- write_scrap: Workbooks.Open ---
+14:55:48 --- write_scrap: writing cells ---
+14:55:48 --- write_scrap: Save ---
+14:55:48 write_scrap_pickup_template: 0.76s
+14:55:48 --- EXPORT: FRN261016-1R fetching PDF from Outlook ---
+14:55:48 fetch_attachment_bytes: 0.07s
+14:55:49 slice_first_pages: 0.01s
+14:55:49 annotate_pdf: 0.02s
+14:55:49 --- EXPORT: per-record loop DONE 1.35s ---
+14:55:49 --- EXPORT: releasing shared Excel ---
+14:55:49 _release_excel: 0.04s
+14:55:49 --- EXPORT: shared Excel released ---
+14:55:49 --- === EXPORT DONE === ---
+15:19:26 --- GUI: Import clicked, about to parse ---
+15:19:26 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261013-1R.xls ---
+15:19:26 --- parse: DispatchEx ---
+15:19:28 --- parse: Workbooks.Open ---
+15:19:28 --- parse: reading header cells ---
+15:19:28 --- parse: reading item block in one call ---
+15:19:28 --- parse: items done (5) ---
+15:19:28 --- parse: releasing Excel ---
+15:19:28 _release_excel: 0.06s
+15:19:30 parse_incoming_packing_list: 3.85s
+15:19:30 --- GUI: Import parse returned ---
+08:16:11 --- GUI: Import clicked, about to parse ---
+08:16:11 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261016-1R.xls ---
+08:16:11 --- parse: DispatchEx ---
+08:16:12 --- parse: Workbooks.Open ---
+08:16:12 --- parse: reading header cells ---
+08:16:12 --- parse: reading item block in one call ---
+08:16:12 --- parse: items done (7) ---
+08:16:12 --- parse: releasing Excel ---
+08:16:13 _release_excel: 0.06s
+08:16:16 parse_incoming_packing_list: 4.58s
+08:16:16 --- GUI: Import parse returned ---
+08:16:29 --- GUI: Import clicked, about to parse ---
+08:16:29 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261013-1R.xls ---
+08:16:29 --- parse: DispatchEx ---
+08:16:30 --- parse: Workbooks.Open ---
+08:16:30 --- parse: reading header cells ---
+08:16:30 --- parse: reading item block in one call ---
+08:16:30 --- parse: items done (5) ---
+08:16:30 --- parse: releasing Excel ---
+08:16:30 _release_excel: 0.05s
+08:16:32 parse_incoming_packing_list: 3.72s
+08:16:32 --- GUI: Import parse returned ---
+08:17:33 --- GUI: Import clicked, about to parse ---
+08:17:33 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261013-1R.xls ---
+08:17:33 --- parse: DispatchEx ---
+08:17:34 --- parse: Workbooks.Open ---
+08:17:34 --- parse: reading header cells ---
+08:17:34 --- parse: reading item block in one call ---
+08:17:34 --- parse: items done (5) ---
+08:17:34 --- parse: releasing Excel ---
+08:17:34 _release_excel: 0.06s
+08:17:37 parse_incoming_packing_list: 3.80s
+08:17:37 --- GUI: Import parse returned ---
+08:23:09 --- === EXPORT START === ---
+08:23:09 --- EXPORT: before directory dialog ---
+08:23:11 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+08:23:11 --- EXPORT: 2 record(s) to export ---
+08:23:11 --- EXPORT: building records_by_week ---
+08:23:11 --- EXPORT: 1 week bucket(s) ---
+08:23:11 --- EXPORT: DispatchEx shared Excel ---
+08:23:12 --- EXPORT: shared Excel ready ---
+08:23:12 --- EXPORT: reel summary loop START ---
+08:23:12 --- write_reel_summary START Reel Summary Report WE 10.12.26 ~ 10.16.26.xls (2 records) ---
+08:23:12 --- write_reel_summary: Open staged workbook ---
+08:23:13 --- write_reel_summary: scanning reel sheets ---
+08:23:15 --- write_reel_summary: found 20 reel sheets ---
+08:23:15 --- write_reel_summary: renaming to temporary names ---
+08:23:15 --- write_reel_summary: clearing old content (batched) ---
+08:23:21 --- write_reel_summary: clear done ---
+08:23:21 --- write_reel_summary: writing records ---
+08:23:26 --- write_reel_summary: final tab names ---
+08:23:26 --- write_reel_summary: CalculateFull ---
+08:23:26 --- write_reel_summary: Save ---
+08:23:27 write_reel_summary_report: 14.38s
+08:23:27 --- EXPORT: reel summary loop DONE 14.38s ---
+08:23:27 --- EXPORT: per-record loop START ---
+08:23:27 --- EXPORT: record FRN261013-1R-A ---
+08:23:27 --- write_packing_list START Packing List FRN261013-1R-A.xls ---
+08:23:27 --- write_packing_list: Workbooks.Open ---
+08:23:27 --- write_packing_list: writing header ---
+08:23:27 --- write_packing_list: writing item block in one call ---
+08:23:27 --- write_packing_list: Save ---
+08:23:27 write_packing_list_template: 0.41s
+08:23:27 --- write_scrap START Scrap Pick Up Request for Load FRN261013-1R-A.xls ---
+08:23:27 --- write_scrap: Workbooks.Open ---
+08:23:27 --- write_scrap: writing cells ---
+08:23:27 --- write_scrap: Save ---
+08:23:27 write_scrap_pickup_template: 0.40s
+08:23:27 --- EXPORT: FRN261013-1R-A no source match, skipping PDF ---
+08:23:27 --- EXPORT: record FRN261013-1R-B ---
+08:23:27 --- write_packing_list START Packing List FRN261013-1R-B.xls ---
+08:23:27 --- write_packing_list: Workbooks.Open ---
+08:23:28 --- write_packing_list: writing header ---
+08:23:28 --- write_packing_list: writing item block in one call ---
+08:23:28 --- write_packing_list: Save ---
+08:23:28 write_packing_list_template: 0.35s
+08:23:28 --- write_scrap START Scrap Pick Up Request for Load FRN261013-1R-B.xls ---
+08:23:28 --- write_scrap: Workbooks.Open ---
+08:23:28 --- write_scrap: writing cells ---
+08:23:28 --- write_scrap: Save ---
+08:23:28 write_scrap_pickup_template: 0.39s
+08:23:28 --- EXPORT: FRN261013-1R-B no source match, skipping PDF ---
+08:23:28 --- EXPORT: per-record loop DONE 1.54s ---
+08:23:28 --- EXPORT: releasing shared Excel ---
+08:23:28 _release_excel: 0.03s
+08:23:28 --- EXPORT: shared Excel released ---
+08:23:28 --- === EXPORT DONE === ---
+08:27:40 --- === EXPORT START === ---
+08:27:40 --- EXPORT: before directory dialog ---
+08:27:42 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+08:27:42 --- EXPORT: 0 record(s) to export ---
+08:27:42 --- EXPORT: building records_by_week ---
+08:27:42 --- EXPORT: 1 week bucket(s) ---
+08:27:42 --- EXPORT: DispatchEx shared Excel ---
+08:27:43 --- EXPORT: shared Excel ready ---
+08:27:43 --- EXPORT: reel summary loop START ---
+08:27:43 --- write_reel_summary START Reel Summary Report WE 10.12.26 ~ 10.16.26.xls (2 records) ---
+08:27:43 --- write_reel_summary: Open staged workbook ---
+08:27:44 --- write_reel_summary: scanning reel sheets ---
+08:27:45 --- write_reel_summary: found 20 reel sheets ---
+08:27:45 --- write_reel_summary: renaming to temporary names ---
+08:27:46 --- write_reel_summary: clearing old content (batched) ---
+08:27:52 --- write_reel_summary: clear done ---
+08:27:52 --- write_reel_summary: writing records ---
+08:27:56 --- write_reel_summary: final tab names ---
+08:27:56 --- write_reel_summary: CalculateFull ---
+08:27:56 --- write_reel_summary: Save ---
+08:27:57 write_reel_summary_report: 13.69s
+08:27:57 --- EXPORT: reel summary loop DONE 13.69s ---
+08:27:57 --- EXPORT: per-record loop START ---
+08:27:57 --- EXPORT: per-record loop DONE 0.00s ---
+08:27:57 --- EXPORT: releasing shared Excel ---
+08:27:57 _release_excel: 0.03s
+08:27:57 --- EXPORT: shared Excel released ---
+08:27:57 --- === EXPORT DONE === ---
+08:31:01 --- GUI: Import clicked, about to parse ---
+08:31:01 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261013-1R.xls ---
+08:31:01 --- parse: DispatchEx ---
+08:31:03 --- parse: Workbooks.Open ---
+08:31:03 --- parse: reading header cells ---
+08:31:03 --- parse: reading item block in one call ---
+08:31:03 --- parse: items done (5) ---
+08:31:03 --- parse: releasing Excel ---
+08:31:03 _release_excel: 0.06s
+08:31:05 parse_incoming_packing_list: 3.79s
+08:31:05 --- GUI: Import parse returned ---
+08:32:53 --- === EXPORT START === ---
+08:32:53 --- EXPORT: before directory dialog ---
+08:32:55 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+08:32:55 --- EXPORT: 2 record(s) to export ---
+08:32:56 --- EXPORT: building records_by_week ---
+08:32:56 --- EXPORT: 1 week bucket(s) ---
+08:32:56 --- EXPORT: DispatchEx shared Excel ---
+08:32:57 --- EXPORT: shared Excel ready ---
+08:32:57 --- EXPORT: reel summary loop START ---
+08:32:57 --- write_reel_summary START Reel Summary Report WE 10.12.26 ~ 10.16.26.xls (2 records) ---
+08:32:57 --- write_reel_summary: Open staged workbook ---
+08:32:58 --- write_reel_summary: scanning reel sheets ---
+08:32:59 --- write_reel_summary: found 20 reel sheets ---
+08:32:59 --- write_reel_summary: renaming to temporary names ---
+08:33:00 --- write_reel_summary: clearing old content (batched) ---
+08:33:06 --- write_reel_summary: clear done ---
+08:33:06 --- write_reel_summary: writing records ---
+08:33:10 --- write_reel_summary: final tab names ---
+08:33:11 --- write_reel_summary: CalculateFull ---
+08:33:11 --- write_reel_summary: Save ---
+08:33:11 write_reel_summary_report: 14.10s
+08:33:11 --- EXPORT: reel summary loop DONE 14.11s ---
+08:33:11 --- EXPORT: per-record loop START ---
+08:33:11 --- EXPORT: record FRN261013-1R-A ---
+08:33:11 --- write_packing_list START Packing List FRN261013-1R-A.xls ---
+08:33:11 --- write_packing_list: Workbooks.Open ---
+08:33:12 --- write_packing_list: writing header ---
+08:33:12 --- write_packing_list: writing item block in one call ---
+08:33:12 --- write_packing_list: Save ---
+08:33:12 write_packing_list_template: 0.37s
+08:33:12 --- write_scrap START Scrap Pick Up Request for Load FRN261013-1R-A.xls ---
+08:33:12 --- write_scrap: Workbooks.Open ---
+08:33:12 --- write_scrap: writing cells ---
+08:33:12 --- write_scrap: Save ---
+08:33:12 write_scrap_pickup_template: 0.42s
+08:33:12 --- EXPORT: FRN261013-1R-A source_matches=0 ---
+08:33:12 --- EXPORT: FRN261013-1R-A no source match, skipping PDF ---
+08:33:12 --- EXPORT: record FRN261013-1R-B ---
+08:33:12 --- write_packing_list START Packing List FRN261013-1R-B.xls ---
+08:33:12 --- write_packing_list: Workbooks.Open ---
+08:33:12 --- write_packing_list: writing header ---
+08:33:12 --- write_packing_list: writing item block in one call ---
+08:33:12 --- write_packing_list: Save ---
+08:33:13 write_packing_list_template: 0.34s
+08:33:13 --- write_scrap START Scrap Pick Up Request for Load FRN261013-1R-B.xls ---
+08:33:13 --- write_scrap: Workbooks.Open ---
+08:33:13 --- write_scrap: writing cells ---
+08:33:13 --- write_scrap: Save ---
+08:33:13 write_scrap_pickup_template: 0.42s
+08:33:13 --- EXPORT: FRN261013-1R-B source_matches=0 ---
+08:33:13 --- EXPORT: FRN261013-1R-B no source match, skipping PDF ---
+08:33:13 --- EXPORT: per-record loop DONE 1.55s ---
+08:33:13 --- EXPORT: releasing shared Excel ---
+08:33:13 _release_excel: 0.04s
+08:33:13 --- EXPORT: shared Excel released ---
+08:33:13 --- === EXPORT DONE === ---
+08:35:30 --- GUI: Import clicked, about to parse ---
+08:35:30 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261013-1R.xls ---
+08:35:30 --- parse: DispatchEx ---
+08:35:31 --- parse: Workbooks.Open ---
+08:35:31 --- parse: reading header cells ---
+08:35:31 --- parse: reading item block in one call ---
+08:35:31 --- parse: items done (5) ---
+08:35:31 --- parse: releasing Excel ---
+08:35:31 _release_excel: 0.06s
+08:35:34 parse_incoming_packing_list: 3.80s
+08:35:34 --- GUI: Import parse returned ---
+08:37:09 --- === EXPORT START === ---
+08:37:09 --- EXPORT: before directory dialog ---
+08:37:10 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/python/packing_list_exports ---
+08:37:10 --- EXPORT: 2 record(s) to export ---
+08:37:12 --- EXPORT: building records_by_week ---
+08:37:12 --- EXPORT: 1 week bucket(s) ---
+08:37:12 --- EXPORT: DispatchEx shared Excel ---
+08:37:13 --- EXPORT: shared Excel ready ---
+08:37:13 --- EXPORT: reel summary loop START ---
+08:37:13 --- write_reel_summary START Reel Summary Report WE 10.12.26 ~ 10.16.26.xls (2 records) ---
+08:37:13 --- write_reel_summary: Open staged workbook ---
+08:37:14 --- write_reel_summary: scanning reel sheets ---
+08:37:15 --- write_reel_summary: found 20 reel sheets ---
+08:37:15 --- write_reel_summary: renaming to temporary names ---
+08:37:16 --- write_reel_summary: clearing old content (batched) ---
+08:37:22 --- write_reel_summary: clear done ---
+08:37:22 --- write_reel_summary: writing records ---
+08:37:27 --- write_reel_summary: final tab names ---
+08:37:27 --- write_reel_summary: CalculateFull ---
+08:37:27 --- write_reel_summary: Save ---
+08:37:28 write_reel_summary_report: 14.84s
+08:37:28 --- EXPORT: reel summary loop DONE 14.84s ---
+08:37:28 --- EXPORT: per-record loop START ---
+08:37:28 --- EXPORT: record FRN261013-1R-A ---
+08:37:28 --- write_packing_list START Packing List FRN261013-1R-A.xls ---
+08:37:28 --- write_packing_list: Workbooks.Open ---
+08:37:28 --- write_packing_list: writing header ---
+08:37:28 --- write_packing_list: writing item block in one call ---
+08:37:28 --- write_packing_list: Save ---
+08:37:28 write_packing_list_template: 0.42s
+08:37:28 --- write_scrap START Scrap Pick Up Request for Load FRN261013-1R-A.xls ---
+08:37:28 --- write_scrap: Workbooks.Open ---
+08:37:28 --- write_scrap: writing cells ---
+08:37:28 --- write_scrap: Save ---
+08:37:28 write_scrap_pickup_template: 0.40s
+08:37:28 --- EXPORT: FRN261013-1R-A source_matches=1 ---
+08:37:28 --- EXPORT: FRN261013-1R-A fetching PDF from Outlook ---
+08:37:29 fetch_attachment_bytes: 0.05s
+08:37:29 slice_first_pages: 0.01s
+08:37:29 annotate_pdf: 0.01s
+08:37:29 --- EXPORT: record FRN261013-1R-B ---
+08:37:29 --- write_packing_list START Packing List FRN261013-1R-B.xls ---
+08:37:29 --- write_packing_list: Workbooks.Open ---
+08:37:29 --- write_packing_list: writing header ---
+08:37:29 --- write_packing_list: writing item block in one call ---
+08:37:29 --- write_packing_list: Save ---
+08:37:29 write_packing_list_template: 0.33s
+08:37:29 --- write_scrap START Scrap Pick Up Request for Load FRN261013-1R-B.xls ---
+08:37:29 --- write_scrap: Workbooks.Open ---
+08:37:29 --- write_scrap: writing cells ---
+08:37:29 --- write_scrap: Save ---
+08:37:29 write_scrap_pickup_template: 0.41s
+08:37:29 --- EXPORT: FRN261013-1R-B source_matches=0 ---
+08:37:29 --- EXPORT: FRN261013-1R-B no source match, skipping PDF ---
+08:37:29 --- EXPORT: per-record loop DONE 1.65s ---
+08:37:29 --- EXPORT: releasing shared Excel ---
+08:37:29 _release_excel: 0.03s
+08:37:29 --- EXPORT: shared Excel released ---
+08:37:29 --- === EXPORT DONE === ---
+13:31:00 --- GUI: Import clicked, about to parse ---
+13:31:00 --- parse_incoming_packing_list START \\mserver\USERS$\sullivanl\Documents\Sully tutorial files\python\dist\VerizonPackingTools\PackingList\Working\Incoming FRN261013-1R.xls ---
+13:31:00 --- parse: DispatchEx ---
+13:31:01 --- parse: Workbooks.Open ---
+13:31:01 --- parse: reading header cells ---
+13:31:02 --- parse: reading item block in one call ---
+13:31:02 --- parse: items done (5) ---
+13:31:02 --- parse: releasing Excel ---
+13:31:02 _release_excel: 0.06s
+13:31:04 parse_incoming_packing_list: 3.82s
+13:31:04 --- GUI: Import parse returned ---
+13:31:34 --- === EXPORT START === ---
+13:31:34 --- EXPORT: before directory dialog ---
+13:31:39 --- EXPORT: directory chosen //mserver/USERS$/sullivanl/Documents/Sully tutorial files/test ---
+13:31:39 --- EXPORT: 2 record(s) to export ---
+13:31:39 --- EXPORT: building records_by_week ---
+13:31:39 --- EXPORT: 1 week bucket(s) ---
+13:31:39 --- EXPORT: DispatchEx shared Excel ---
+13:31:40 --- EXPORT: shared Excel ready ---
+13:31:40 --- EXPORT: reel summary loop START ---
+13:31:40 --- write_reel_summary START Reel Summary Report WE 10.12.26 ~ 10.16.26.xls (2 records) ---
+13:31:40 --- write_reel_summary: Open staged workbook ---
+13:31:41 --- write_reel_summary: scanning reel sheets ---
+13:31:42 --- write_reel_summary: found 20 reel sheets ---
+13:31:42 --- write_reel_summary: renaming to temporary names ---
+13:31:42 --- write_reel_summary: clearing old content (batched) ---
+13:31:47 --- write_reel_summary: clear done ---
+13:31:47 --- write_reel_summary: writing records ---
+13:31:47 --- write_reel_summary: final tab names ---
+13:31:51 --- write_reel_summary: CalculateFull ---
+13:31:52 --- write_reel_summary: Save ---
+13:31:52 write_reel_summary_report: 12.23s
+13:31:52 --- EXPORT: reel summary loop DONE 12.23s ---
+13:31:52 --- EXPORT: per-record loop START ---
+13:31:52 --- EXPORT: record FRN261013-1R-A ---
+13:31:52 --- write_packing_list START Packing List FRN261013-1R-A.xls ---
+13:31:52 --- write_packing_list: Workbooks.Open ---
+13:31:52 --- write_packing_list: writing header ---
+13:31:52 --- write_packing_list: writing item block in one call ---
+13:31:52 --- write_packing_list: Save ---
+13:31:52 write_packing_list_template: 0.38s
+13:31:52 --- write_scrap START Scrap Pick Up Request for Load FRN261013-1R-A.xls ---
+13:31:52 --- write_scrap: Workbooks.Open ---
+13:31:53 --- write_scrap: writing cells ---
+13:31:53 --- write_scrap: Save ---
+13:31:53 write_scrap_pickup_template: 0.38s
+13:31:53 --- EXPORT: FRN261013-1R-A source_matches=1 ---
+13:31:53 --- EXPORT: FRN261013-1R-A fetching PDF from Outlook ---
+13:31:53 fetch_attachment_bytes: 0.06s
+13:31:53 slice_first_pages: 0.01s
+13:31:53 annotate_pdf: 0.03s
+13:31:53 --- EXPORT: record FRN261013-1R-B ---
+13:31:53 --- write_packing_list START Packing List FRN261013-1R-B.xls ---
+13:31:53 --- write_packing_list: Workbooks.Open ---
+13:31:53 --- write_packing_list: writing header ---
+13:31:53 --- write_packing_list: writing item block in one call ---
+13:31:53 --- write_packing_list: Save ---
+13:31:53 write_packing_list_template: 0.33s
+13:31:53 --- write_scrap START Scrap Pick Up Request for Load FRN261013-1R-B.xls ---
+13:31:53 --- write_scrap: Workbooks.Open ---
+13:31:53 --- write_scrap: writing cells ---
+13:31:54 --- write_scrap: Save ---
+13:31:54 write_scrap_pickup_template: 0.38s
+13:31:54 --- EXPORT: FRN261013-1R-B source_matches=0 ---
+13:31:54 --- EXPORT: FRN261013-1R-B no source match, skipping PDF ---
+13:31:54 --- EXPORT: per-record loop DONE 1.58s ---
+13:31:54 --- EXPORT: releasing shared Excel ---
+13:31:54 _release_excel: 0.09s
+13:31:54 --- EXPORT: shared Excel released ---
+13:31:54 --- === EXPORT DONE === ---
