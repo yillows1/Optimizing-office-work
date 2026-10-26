@@ -64,22 +64,16 @@ from pathlib import Path as _Path
 
 
 def get_resource_path(relative: str) -> _Path:
-    """Read-only bundled files (Excel Bases). Works from source and frozen."""
     if getattr(_sys, "frozen", False) and hasattr(_sys, "_MEIPASS"):
         return _Path(_sys._MEIPASS) / relative
     return _Path(__file__).resolve().parent / relative
 
 
 def get_user_dir() -> _Path:
-    """User-writable folder (config, Working, Summaries). Lives next to the exe."""
     if getattr(_sys, "frozen", False):
         return _Path(_sys.executable).resolve().parent
     return _Path(__file__).resolve().parent
 
-
-# ---------------------------------------------------------------------------
-# Timing instrumentation (logs to packing_timing.log next to the app)
-# ---------------------------------------------------------------------------
 
 _TIMING_LOG = get_user_dir() / "packing_timing.log"
 
@@ -91,7 +85,6 @@ _logging.basicConfig(
 )
 
 def _timed(fn):
-    """Decorator: log how long fn() took. Passes return value through."""
     @_functools.wraps(fn)
     def wrapper(*args, **kwargs):
         start = _time.perf_counter()
@@ -133,7 +126,6 @@ MAX_ITEMS_PER_SUMMARY_TAB = 31
 RENAME_EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm"}
 RENAME_PDF_SUFFIXES = {".pdf"}
 
-# xlCalculationManual / xlCalculationAutomatic
 XL_CALC_MANUAL = -4135
 XL_CALC_AUTOMATIC = -4105
 
@@ -257,7 +249,6 @@ def _release_excel(excel, workbook=None) -> None:
 
 
 def _tune_excel_for_batch(excel) -> None:
-    """Turn off the slow stuff while we batch operations."""
     try:
         excel.ScreenUpdating = False
     except Exception:
@@ -305,12 +296,6 @@ def _safe_clear(sheet, address: str) -> None:
 
 
 def _clear_item_range(sheet, first_row: int, last_row: int, first_col: int, last_col: int) -> None:
-    """Clear a rectangular block of cells.
-
-    Batched: one Range.ClearContents() call instead of one per cell.
-    Falls back to per-cell only if the block contains merged cells
-    (which raise on bulk operations).
-    """
     try:
         rng = sheet.Range(
             sheet.Cells(first_row, first_col),
@@ -334,7 +319,6 @@ def _clear_item_range(sheet, first_row: int, last_row: int, first_col: int, last
 
 
 def _read_block(sheet, first_row: int, first_col: int, last_row: int, last_col: int):
-    """Read a rectangular block in one COM call."""
     return sheet.Range(
         sheet.Cells(first_row, first_col),
         sheet.Cells(last_row, last_col),
@@ -342,8 +326,6 @@ def _read_block(sheet, first_row: int, first_col: int, last_row: int, last_col: 
 
 
 def _as_grid(value, rows: int, cols: int) -> list[list]:
-    """Normalize Excel's block-read return to a list of lists of the
-    requested shape."""
     if value is None:
         return [[None] * cols for _ in range(rows)]
     if not isinstance(value, tuple):
@@ -663,15 +645,18 @@ class ScannerGroup:
     near_matches: list[NearMatch] = field(default_factory=list)
 
 
-class ItemRecord(TypedDict):
+class ItemRecord(TypedDict, total=False):
     description: str
     type: str
     gross: int
     tare: int
     net: int
+    # Dialog bookkeeping — attached while the user assigns items.
+    _address: str
+    _ritm: str
 
 
-class PackingListRecord(TypedDict):
+class PackingListRecord(TypedDict, total=False):
     group: str
     ritm: str
     letter: str
@@ -681,6 +666,9 @@ class PackingListRecord(TypedDict):
     location_address: str
     driver_plate: str
     items: list[ItemRecord]
+    # List of ExactMatch objects that sourced this record (may be empty
+    # for hand-typed RITMs that never got a rescan match).
+    source_matches: list[ExactMatch]
 
 
 class BlankZeroSpinBox(QSpinBox):
@@ -697,6 +685,30 @@ class BlankZeroSpinBox(QSpinBox):
             return self.minimum()
 
 
+def _item_address(item: ItemRecord) -> str:
+    return str(item.get("_address", "") or "").strip()
+
+
+def _item_ritm(item: ItemRecord) -> str:
+    return str(item.get("_ritm", "") or "").strip()
+
+
+def _record_source_matches(record: PackingListRecord) -> list[ExactMatch]:
+    return list(record.get("source_matches") or [])
+
+
+def _dedupe_matches(matches: list[ExactMatch]) -> list[ExactMatch]:
+    seen: set[tuple[str, str, str]] = set()
+    out: list[ExactMatch] = []
+    for match in matches:
+        key = (match.entry_id, match.filename, match.term)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(match)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Assignment dialog with live staging
 # ---------------------------------------------------------------------------
@@ -704,32 +716,33 @@ class BlankZeroSpinBox(QSpinBox):
 class AddressBatchDialog(QDialog):
     """Assignment dialog with live RITM staging.
 
-    Input (read-only at construction; the dialog makes its own copies):
-      unmatched_items:  items from the scan that didn't match an email RITM
-      staged_ritms:     RITM records the scan already assembled; items are
-                        movable out of these into the unmatched pool
-      record_template:  the scan's record, used as template for any RITM
-                        the user creates via the Request Item tab
+    Key invariant:
+      Every item from the input sheet lives in EXACTLY ONE of:
+        - self.unmatched_items       (still needs assignment)
+        - self.staged_ritms[i].items (assigned to a RITM)
+      There is no overlap. `_apply` moves items from the pool into a
+      staged RITM atomically; `_apply_removals` moves them back. Nothing
+      else touches item membership.
 
-    Behavior:
-      - Location / Request Item / Both tabs operate on the current
-        unmatched pool.
-      - Request Item and Both tabs, when a RITM is applied to item(s),
-        either merge the item(s) into an existing staged RITM with that
-        RITM (matching letter preserved), or create a new staged RITM
-        (this handles the "RITM wasn't on any email" case).
-      - Remove / Drop tab shows every staged RITM with one checkbox per
-        item. Checking and clicking "Apply removals" pulls items from
-        the staged RITM back into the unmatched pool. A RITM that loses
-        all items disappears from the Remove / Drop view.
-      - The Remove / Drop tab is EMPTY (shows a placeholder message) when
-        there are no staged RITMs. As soon as one is created via
-        assignment, it appears.
+    Per-item assignments are stored on the ItemRecord itself (`_address`
+    and `_ritm`) so index remapping cannot point at the wrong item.
 
-    On Finished (accept), the caller reads:
-      dialog.staged_ritms     final list of staged RITM records
-      dialog.unmatched_items  final list of still-unassigned items
+    Rescan behavior:
+      - Rescan looks at the RITM text in the field. It runs a scoped
+        scan for that RITM's item descriptions.
+      - Any emails whose subject/body mention the RITM are collected as
+        sources.
+      - If the RITM is already staged, sources are attached to it and
+        its location is backfilled from the matched PDF.
+      - If the RITM is not staged yet, sources are stashed in
+        `_last_rescan_matches` and used when the RITM is created by a
+        subsequent Apply.
+      - The signal `rescan_found_sources` fires with (ritm, matches,
+        packing_list) so the main window can drop them into the reply
+        email table immediately.
     """
+
+    rescan_found_sources = Signal(object)  # (ritm_str, list[ExactMatch], packing_list_str)
 
     def __init__(
         self,
@@ -737,38 +750,38 @@ class AddressBatchDialog(QDialog):
         unmatched_items: list[ItemRecord],
         staged_ritms: list[PackingListRecord],
         record_template: PackingListRecord,
+        subject_matches: list[ExactMatch] | None = None,
+        time_range: str = "2",
+        search_terms: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Assign location / Request Item, remove from RITMs")
-        self.setMinimumWidth(760)
-        self.setMinimumHeight(620)
+        self.setMinimumWidth(820)
+        self.setMinimumHeight(640)
 
         self._template: PackingListRecord = dict(record_template)
+        self._subject_matches: list[ExactMatch] = list(subject_matches or [])
+        self._time_range = time_range
+        self._search_terms = list(search_terms or [])
 
-        # Master pool: items currently not assigned to any RITM. Order
-        # matters — assignment indexes point into this list, and when
-        # items are moved back from a RITM they get appended to the end.
-        self.unmatched_items: list[ItemRecord] = list(unmatched_items)
+        self.unmatched_items: list[ItemRecord] = [dict(item) for item in unmatched_items]
+        self.staged_ritms: list[PackingListRecord] = []
+        for r in staged_ritms:
+            if not r.get("items"):
+                continue
+            copy_r = dict(r)
+            copy_r["items"] = [dict(item) for item in r["items"]]
+            copy_r.setdefault("source_matches", list(r.get("source_matches") or []))
+            self.staged_ritms.append(copy_r)
 
-        # Staged RITMs. Each entry is a PackingListRecord with a
-        # non-empty items list. Anything that loses all its items during
-        # editing is removed from this list.
-        self.staged_ritms: list[PackingListRecord] = [
-            dict(r) for r in staged_ritms if r.get("items")
-        ]
-        # Ensure the items lists are fresh copies so we can mutate freely.
-        for r in self.staged_ritms:
-            r["items"] = list(r["items"])
-
-        # Assignment dicts keyed by index into self.unmatched_items.
-        self.address_assignments: dict[int, str] = {}
-        self.ritm_assignments: dict[int, str] = {}
+        self._last_rescan_matches: list[ExactMatch] = []
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "Assign location/RITM to unmatched items, or pull items out of "
             "the staged RITMs. Any RITM you assign via the Request Item or "
-            "Both tab will be created if it doesn't already exist."
+            "Both tab will be created if it doesn't already exist. Use "
+            "'Rescan for this RITM' to search Outlook for the RITM you typed."
         ))
 
         self.tabs = QTabWidget()
@@ -783,14 +796,14 @@ class AddressBatchDialog(QDialog):
 
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #53645e;")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
-        # If there are no unmatched items to work with, focus Remove / Drop.
         if not self.unmatched_items:
             self.tabs.setCurrentWidget(self._remove_tab_widget)
 
     # ------------------------------------------------------------------
-    # Basic tab builders (Location / Request Item / Both)
+    # Tab builders
     # ------------------------------------------------------------------
 
     def _build_tab(self, title: str, builder) -> None:
@@ -808,11 +821,11 @@ class AddressBatchDialog(QDialog):
 
     def _populate_list(self, list_widget: QListWidget) -> None:
         list_widget.clear()
-        for index, item in enumerate(self.unmatched_items):
+        for item in self.unmatched_items:
             entry = QListWidgetItem(item["description"])
             entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             entry.setCheckState(Qt.CheckState.Unchecked)
-            entry.setData(Qt.ItemDataRole.UserRole, index)
+            entry.setData(Qt.ItemDataRole.UserRole, id(item))
             list_widget.addItem(entry)
 
     def _refresh_all_assignment_lists(self) -> None:
@@ -837,6 +850,10 @@ class AddressBatchDialog(QDialog):
         self.ritm_input.setPlaceholderText("e.g. RITM0011836256")
         row.addWidget(self.ritm_input, 1)
         tab_layout.addLayout(row)
+        self._add_rescan_row(
+            tab_layout,
+            lambda: self.ritm_input.text(),
+        )
         self._add_apply_buttons(tab_layout, "apply_ritm")
 
     def _build_both_tab(self, tab_layout, list_widget) -> None:
@@ -855,7 +872,22 @@ class AddressBatchDialog(QDialog):
         self.both_ritm_input.setPlaceholderText("e.g. RITM0011836256")
         row2.addWidget(self.both_ritm_input, 1)
         tab_layout.addLayout(row2)
+        self._add_rescan_row(
+            tab_layout,
+            lambda: self.both_ritm_input.text(),
+        )
         self._add_apply_buttons(tab_layout, "apply_both")
+
+    def _add_rescan_row(self, tab_layout, get_text) -> None:
+        row = QHBoxLayout()
+        rescan_button = QPushButton("Rescan for this RITM")
+        rescan_button.setStyleSheet(
+            "font-weight: bold; background: #4a6a93; color: white;"
+        )
+        rescan_button.clicked.connect(lambda: self._do_rescan(get_text()))
+        row.addWidget(rescan_button)
+        row.addStretch(1)
+        tab_layout.addLayout(row)
 
     def _add_apply_buttons(self, tab_layout, mode: str) -> None:
         button_row = QHBoxLayout()
@@ -932,7 +964,6 @@ class AddressBatchDialog(QDialog):
             if widget is not None:
                 widget.deleteLater()
 
-        # Prune empty staged RITMs.
         self.staged_ritms = [r for r in self.staged_ritms if r["items"]]
 
         if not self.staged_ritms:
@@ -942,7 +973,7 @@ class AddressBatchDialog(QDialog):
             ))
             layout.addStretch(1)
             self.apply_removals_button.setEnabled(False)
-            self._remove_checkboxes = {}
+            self._remove_checkboxes = []
             return
 
         self.apply_removals_button.setEnabled(True)
@@ -950,10 +981,9 @@ class AddressBatchDialog(QDialog):
         self._remove_checkboxes: list[tuple[PackingListRecord, list[QCheckBox]]] = []
 
         for record in self.staged_ritms:
-            identifier = _packing_list_identifier(record)
             ritm_label = record["ritm"] or "(no request item)"
             group = QGroupBox(
-                f"{identifier} — RITM {ritm_label} — "
+                f"RITM {ritm_label} — "
                 f"{len(record['items'])} item(s)"
             )
             group_layout = QVBoxLayout(group)
@@ -975,22 +1005,24 @@ class AddressBatchDialog(QDialog):
     # Apply assignment
     # ------------------------------------------------------------------
 
-    def _checked_indices(self, list_widget: QListWidget) -> list[int]:
-        indices: list[int] = []
+    def _checked_items(self, list_widget: QListWidget) -> list[ItemRecord]:
+        wanted_ids: set[int] = set()
         for row in range(list_widget.count()):
             entry = list_widget.item(row)
             if entry.checkState() == Qt.CheckState.Checked:
-                indices.append(int(entry.data(Qt.ItemDataRole.UserRole)))
-        return indices
+                wanted_ids.add(int(entry.data(Qt.ItemDataRole.UserRole)))
+        if not wanted_ids:
+            return []
+        return [item for item in self.unmatched_items if id(item) in wanted_ids]
 
     def _apply(self, mode: str) -> None:
         current_tab = self.tabs.currentIndex()
         if current_tab >= len(self.lists):
-            return  # not an assignment tab
+            return
         list_widget = self.lists[current_tab]
-        indices = self._checked_indices(list_widget)
+        items = self._checked_items(list_widget)
 
-        if not indices:
+        if not items:
             QMessageBox.information(
                 self, "Nothing selected",
                 "Check at least one item before applying.",
@@ -1019,79 +1051,43 @@ class AddressBatchDialog(QDialog):
                 )
                 return
 
-        # Record assignments on the pool items.
-        for idx in indices:
-            if location:
-                self.address_assignments[idx] = location
-            if ritm:
-                self.ritm_assignments[idx] = ritm
-
-        # If a RITM was applied, move those items into a staged RITM
-        # (creating one if needed).
+        if location:
+            for item in items:
+                item["_address"] = location
         if ritm:
-            self._move_items_to_ritm(indices, ritm, location)
+            for item in items:
+                item["_ritm"] = ritm
+            self._move_items_to_ritm(items, ritm, location)
 
-        # Remove assigned items from the visible lists. Note: for the
-        # Location-only mode, the item stays in the pool, but we still
-        # remove it from the visible list so the user doesn't re-select it.
-        # The pool self.unmatched_items is the authoritative list; only
-        # items moved into a staged RITM are actually removed from it.
-        self._remove_indices_from_visible_lists(indices)
-
+        # Only clear the LOCATION inputs. Keep the RITM text so a
+        # subsequent Rescan (Type -> Apply -> Rescan) still has it.
         self.location_input.clear()
-        self.ritm_input.clear()
         self.both_location_input.clear()
-        self.both_ritm_input.clear()
 
-        remaining_visible = self.lists[0].count() if self.lists else 0
-        if remaining_visible == 0 and not self.unmatched_items:
+        if not self.unmatched_items:
             self.status_label.setText(
                 "All items assigned. Click Finished to close."
             )
         else:
             self.status_label.setText(
-                f"Applied to {len(indices)} item(s). "
+                f"Applied to {len(items)} item(s). "
                 f"{len(self.unmatched_items)} unmatched item(s) remain."
             )
 
     def _move_items_to_ritm(
         self,
-        indices: list[int],
+        items: list[ItemRecord],
         ritm: str,
         location: str,
     ) -> None:
-        """Move the checked pool items into the staged RITM `ritm`.
+        moved_ids = {id(item) for item in items}
 
-        If a staged RITM with that RITM already exists, items merge into
-        it (preserving the existing letter). If not, a new staged RITM is
-        created using self._template as the base, with `ritm`, `location`,
-        and `location_address` set.
-
-        After moving, the indices are removed from self.unmatched_items and
-        the item indexes in self.address_assignments / self.ritm_assignments
-        are shifted appropriately (via a rebuild rather than in-place
-        manipulation).
-        """
-        # Partition pool into items-to-move and items-to-keep.
-        moved_items = [self.unmatched_items[i] for i in indices]
-        moved_set = set(indices)
-
-        kept_items: list[ItemRecord] = []
-        new_address: dict[int, str] = {}
-        new_ritm_map: dict[int, str] = {}
-        for old_idx, item in enumerate(self.unmatched_items):
-            if old_idx in moved_set:
-                continue
-            new_idx = len(kept_items)
-            kept_items.append(item)
-            if old_idx in self.address_assignments:
-                new_address[new_idx] = self.address_assignments[old_idx]
-            if old_idx in self.ritm_assignments:
-                new_ritm_map[new_idx] = self.ritm_assignments[old_idx]
-
-        self.unmatched_items = kept_items
-        self.address_assignments = new_address
-        self.ritm_assignments = new_ritm_map
+        # Remove moved items from the pool FIRST. This is the ONLY way
+        # items leave self.unmatched_items.
+        self.unmatched_items = [
+            item for item in self.unmatched_items if id(item) not in moved_ids
+        ]
+        self._refresh_all_assignment_lists()
 
         # Find or create the staged RITM.
         ritm_key = ritm.casefold()
@@ -1102,49 +1098,56 @@ class AddressBatchDialog(QDialog):
                 break
 
         if target is None:
-            # Create a new staged RITM from the template.
+            sources = self._sources_for_ritm(ritm)
+            # Backfill location from matched source if the user did not
+            # type one.
+            matched_location_address = ""
+            matched_location = ""
+            for match in sources:
+                if match.location_address:
+                    matched_location_address = match.location_address
+                    matched_location = match.location
+                    break
             new_ritm: PackingListRecord = {
                 "group": ritm_key,
                 "ritm": ritm,
                 "letter": "",
                 "date": self._template["date"],
                 "packing_list": self._template["packing_list"],
-                "location": self._location_from_address(location) if location else "",
-                "location_address": location,
+                "location": (
+                    self._location_from_address(location) if location
+                    else matched_location
+                ),
+                "location_address": location or matched_location_address,
                 "driver_plate": self._template["driver_plate"],
                 "items": [],
+                "source_matches": list(sources),
             }
-            # If the item count exceeds per-load max we may split later;
-            # for now, one record holds them.
             self.staged_ritms.append(new_ritm)
             target = new_ritm
 
-        target["items"].extend(moved_items)
+        for item in items:
+            item["_ritm"] = ritm
+            if location and not item.get("_address"):
+                item["_address"] = location
+        target["items"].extend(items)
         if location and not target["location_address"]:
             target["location_address"] = location
             target["location"] = self._location_from_address(location)
 
-        # Refresh the Remove / Drop tab so the RITM shows up (or updates
-        # its item count).
         self._rebuild_remove_tab()
 
-    def _remove_indices_from_visible_lists(self, indices: list[int]) -> None:
-        """Remove rows whose UserRole index is in `indices` from every list.
-
-        Note: `indices` are indexes into the *previous* self.unmatched_items.
-        For lists built before a _move_items_to_ritm call, this works. After
-        a move, all visible lists get rebuilt via _refresh_all_assignment_lists,
-        which we call at the end of _apply anyway.
-        """
-        index_set = set(indices)
-        for list_widget in self.lists:
-            row = 0
-            while row < list_widget.count():
-                entry = list_widget.item(row)
-                if int(entry.data(Qt.ItemDataRole.UserRole)) in index_set:
-                    list_widget.takeItem(row)
-                else:
-                    row += 1
+    def _sources_for_ritm(self, ritm: str) -> list[ExactMatch]:
+        ritm_key = ritm.casefold()
+        matches = [
+            match for match in self._subject_matches
+            if any(r.casefold() == ritm_key for r in match.subject_ritms)
+        ]
+        matches.extend(
+            match for match in self._last_rescan_matches
+            if any(r.casefold() == ritm_key for r in match.subject_ritms)
+        )
+        return _dedupe_matches(matches)
 
     def _another_batch(self) -> None:
         self.location_input.clear()
@@ -1156,7 +1159,152 @@ class AddressBatchDialog(QDialog):
         )
 
     # ------------------------------------------------------------------
-    # Apply removals (from staged RITMs back to pool)
+    # Rescan
+    # ------------------------------------------------------------------
+
+    def _do_rescan(self, ritm: str) -> None:
+        ritm = (ritm or "").strip()
+        if not ritm:
+            QMessageBox.information(
+                self, "No RITM entered",
+                "Type a Request Item number in the field above before "
+                "rescanning.",
+            )
+            return
+
+        # Build the term list: descriptions of every item currently
+        # unmatched plus every item already in the matching staged RITM
+        # (if any). Then ALWAYS append the RITM itself — that's what makes
+        # the scan find emails whose subject/body/filename contain the
+        # RITM even when the item descriptions aren't in the attachment
+        # text.
+        term_set: list[str] = []
+        seen_terms: set[str] = set()
+        for item in self.unmatched_items:
+            desc = item["description"].strip()
+            if desc and desc.casefold() not in seen_terms:
+                seen_terms.add(desc.casefold())
+                term_set.append(desc)
+        for r in self.staged_ritms:
+            if (r["ritm"] or "").casefold() != ritm.casefold():
+                continue
+            for item in r["items"]:
+                desc = item["description"].strip()
+                if desc and desc.casefold() not in seen_terms:
+                    seen_terms.add(desc.casefold())
+                    term_set.append(desc)
+
+        # Include the RITM itself as a search term.
+        if ritm.casefold() not in seen_terms:
+            seen_terms.add(ritm.casefold())
+            term_set.append(ritm)
+
+        if not term_set:
+            QMessageBox.information(
+                self, "Nothing to search",
+                "Add items or a RITM with items before rescanning.",
+            )
+            return
+
+        self.status_label.setText(
+            f"Rescanning Outlook for {len(term_set)} item description(s) "
+            f"matching {ritm}..."
+        )
+        QApplication.processEvents()
+
+        try:
+            import improvedScanner
+            with tempfile.TemporaryDirectory(prefix="rescan-") as temp_dir:
+                report_path = Path(temp_dir) / "rescan.txt"
+                results_path = Path(temp_dir) / "rescan.json"
+                improvedScanner.run_scan(
+                    self._time_range,
+                    term_set,
+                    str(report_path),
+                    str(results_path),
+                )
+                results = json.loads(results_path.read_text(encoding="utf-8"))
+        except Exception as error:
+            QMessageBox.critical(self, "Rescan failed", str(error))
+            self.status_label.setText("Rescan failed.")
+            return
+
+        new_matches: list[ExactMatch] = [
+            ExactMatch(
+                term=entry["term"],
+                filename=entry["filename"],
+                folder=entry["folder"],
+                subject=entry["subject"],
+                received=entry["received"],
+                sender=entry.get("sender", ""),
+                sender_email=entry.get("sender_email", ""),
+                entry_id=entry.get("entry_id", ""),
+                store_id=entry.get("store_id", ""),
+                ritms=entry.get("ritms", []),
+                subject_ritms=entry.get("subject_ritms", []),
+                location=entry.get("location", ""),
+                location_address=entry.get("location_address", ""),
+            )
+            for entry in results["exact_matches"]
+        ]
+
+        ritm_key = ritm.casefold()
+        # Accept a hit if the RITM appears anywhere the scanner looked:
+        # subject, body/attachment ritms, OR because the RITM itself was
+        # one of the search terms that matched.
+        hits = _dedupe_matches([
+            match for match in new_matches
+            if (
+                any(r.casefold() == ritm_key for r in match.subject_ritms)
+                or any(r.casefold() == ritm_key for r in match.ritms)
+                or match.term.casefold() == ritm_key
+            )
+        ])
+
+        if not hits:
+            self.status_label.setText(
+                f"Rescan found no emails mentioning {ritm}. "
+                "The RITM will be exported without a source PDF."
+            )
+            return
+
+        # Attach to any staged RITM with this number, or stash for later.
+        self._last_rescan_matches.extend(hits)
+        attached = 0
+        for r in self.staged_ritms:
+            if (r["ritm"] or "").casefold() != ritm_key:
+                continue
+            current = list(r.get("source_matches") or [])
+            seen = {(m.entry_id, m.filename, m.term) for m in current}
+            for match in hits:
+                key = (match.entry_id, match.filename, match.term)
+                if key in seen:
+                    continue
+                seen.add(key)
+                current.append(match)
+                attached += 1
+            r["source_matches"] = current
+            if not r["location_address"]:
+                for match in hits:
+                    if match.location_address:
+                        r["location_address"] = match.location_address
+                        r["location"] = match.location
+                        break
+
+        # Notify parent so the main window can:
+        #   1. update already-committed records for this RITM
+        #   2. push the found emails into the reply table right away
+        self.rescan_found_sources.emit(
+            (ritm, list(hits), self._template["packing_list"])
+        )
+
+        self.status_label.setText(
+            f"Rescan found {len(hits)} source email(s) for {ritm}"
+            + (f"; {attached} new attachment(s) attached." if attached else ".")
+        )
+
+    # ------------------------------------------------------------------
+    # Apply removals
     # ------------------------------------------------------------------
 
     def _apply_removals(self) -> None:
@@ -1175,6 +1323,8 @@ class AddressBatchDialog(QDialog):
             kept = [item for i, item in enumerate(record["items"]) if i not in drop_set]
             freed = [item for i, item in enumerate(record["items"]) if i in drop_set]
             record["items"] = kept
+            for item in freed:
+                item["_ritm"] = ""
             newly_freed.extend(freed)
 
         if not any_checked:
@@ -1184,22 +1334,14 @@ class AddressBatchDialog(QDialog):
             )
             return
 
-        # Append freed items back to the pool.
-        for item in newly_freed:
-            self.unmatched_items.append(item)
-
-        # Rebuild all visible lists from the current pool.
+        self.unmatched_items.extend(newly_freed)
         self._refresh_all_assignment_lists()
-
-        # Rebuild Remove / Drop (prunes emptied RITMs).
         self._rebuild_remove_tab()
 
         self.status_label.setText(
             f"Pulled {len(newly_freed)} item(s) back into the unmatched pool. "
             f"{len(self.unmatched_items)} unmatched item(s) available."
         )
-
-        # Switch to Location tab for re-assignment.
         self.tabs.setCurrentIndex(0)
 
     # ------------------------------------------------------------------
@@ -1510,11 +1652,6 @@ def working_dir() -> Path:
 
 
 def copy_template_to_working(preferred_dir: Path | None = None) -> Path:
-    """Copy the blank input template to a working location.
-
-    `preferred_dir` (usually the last-imported folder) is used if it exists;
-    otherwise we fall back to the app's Working dir, then the app dir.
-    """
     src = template_path()
     if not src.exists():
         raise FileNotFoundError(
@@ -1613,7 +1750,7 @@ def parse_incoming_packing_list(path: str | Path) -> PackingListRecord:
 
         _log_marker("parse: reading item block in one call")
         rows_count = IN_LAST_ITEM_ROW - IN_FIRST_ITEM_ROW + 1
-        cols_count = 5  # B..F
+        cols_count = 5
         raw = _read_block(sheet, IN_FIRST_ITEM_ROW, 2, IN_LAST_ITEM_ROW, 6)
         grid = _as_grid(raw, rows_count, cols_count)
 
@@ -1710,7 +1847,7 @@ def write_packing_list_template(
         _safe_write(sheet, "H10", _packing_list_identifier(record))
 
         _log_marker("write_packing_list: writing item block in one call")
-        num_rows = MAX_ITEMS_PER_LOAD  # 23
+        num_rows = MAX_ITEMS_PER_LOAD
         grid = [["" for _ in range(9)] for _ in range(num_rows)]
         for i, item in enumerate(record["items"]):
             if i >= num_rows:
@@ -1718,14 +1855,14 @@ def write_packing_list_template(
             description = item["description"]
             if item["type"]:
                 description = f"{description} ({item['type']})"
-            grid[i][0] = description   # B
-            grid[i][6] = item["gross"] # H
-            grid[i][7] = item["tare"]  # I
-            grid[i][8] = item["net"]   # J
+            grid[i][0] = description
+            grid[i][6] = item["gross"]
+            grid[i][7] = item["tare"]
+            grid[i][8] = item["net"]
 
         block = sheet.Range(
-            sheet.Cells(13, 2),     # B13
-            sheet.Cells(13 + num_rows - 1, 10),  # J35
+            sheet.Cells(13, 2),
+            sheet.Cells(13 + num_rows - 1, 10),
         )
         try:
             if block.MergeCells:
@@ -1908,7 +2045,6 @@ def _read_reel_summary_record(sheet) -> PackingListRecord | None:
             "net": gross - tare,
         })
 
-    # Driver/plate live in F8/F9 (that's where the writer below puts them).
     trucker = str(sheet.Range("F8").Value or "").strip()
     trailer = str(sheet.Range("F9").Value or "").strip()
     return {
@@ -2112,15 +2248,15 @@ def write_reel_summary_report(
                     if i >= block_rows:
                         break
                     reel_id, reel_size = _split_reel_id(item["description"])
-                    grid[i][0] = reel_id            # D
-                    grid[i][1] = reel_size          # E
-                    grid[i][2] = item["type"]       # F
-                    grid[i][3] = item["gross"]      # G
-                    grid[i][4] = item["tare"]       # H
+                    grid[i][0] = reel_id
+                    grid[i][1] = reel_size
+                    grid[i][2] = item["type"]
+                    grid[i][3] = item["gross"]
+                    grid[i][4] = item["tare"]
 
                 block = sheet.Range(
-                    sheet.Cells(12, 4),  # D12
-                    sheet.Cells(12 + block_rows - 1, 8),  # H42
+                    sheet.Cells(12, 4),
+                    sheet.Cells(12 + block_rows - 1, 8),
                 )
                 try:
                     if block.MergeCells:
@@ -3021,16 +3157,22 @@ class PackingListApp(QMainWindow):
         self,
         record: PackingListRecord,
         items: list[ItemRecord],
-        address_assignments: dict[int, str],
-        ritm_assignments: dict[int, str],
         staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]],
     ) -> list[PackingListRecord]:
+        """Build one record per (address, ritm) bucket from leftover items.
+
+        IMPORTANT: `items` is guaranteed by AddressBatchDialog to contain
+        ONLY items that did not end up in any staged RITM. Attaches source
+        matches from `staged_ritm_records` and from the template's
+        `source_matches` when applicable, so hand-typed RITMs that were
+        rescanned still get their PDF.
+        """
         packing_list_key = record["packing_list"].casefold()
 
         buckets: dict[tuple[str, str], list[ItemRecord]] = {}
-        for idx, item in enumerate(items):
-            addr = address_assignments.get(idx, "").strip()
-            r = ritm_assignments.get(idx, "").strip()
+        for item in items:
+            addr = _item_address(item)
+            r = _item_ritm(item)
             buckets.setdefault((addr, r), []).append(item)
 
         def existing_ritm_records() -> dict[str, PackingListRecord]:
@@ -3041,6 +3183,19 @@ class PackingListApp(QMainWindow):
                 and rec["ritm"]
                 and rec["ritm"].casefold() != "no request item"
             }
+
+        def matches_for_ritm(ritm_value: str) -> list[ExactMatch]:
+            if not ritm_value:
+                return []
+            ritm_key = ritm_value.casefold()
+            collected: list[ExactMatch] = []
+            for staged_rec, matches in staged_ritm_records:
+                if (staged_rec["ritm"] or "").casefold() == ritm_key:
+                    collected.extend(matches)
+            for match in _record_source_matches(record):
+                if any(r.casefold() == ritm_key for r in match.subject_ritms):
+                    collected.append(match)
+            return _dedupe_matches(collected)
 
         new_records: list[PackingListRecord] = []
 
@@ -3053,6 +3208,7 @@ class PackingListApp(QMainWindow):
                         target, group_items, packing_list_key
                     )
                     continue
+                source_matches = matches_for_ritm(chosen_ritm)
                 new_record: PackingListRecord = {
                     **record,
                     "group": chosen_ritm.casefold(),
@@ -3061,6 +3217,7 @@ class PackingListApp(QMainWindow):
                     "location": self._location_from_address(address) if address else "",
                     "location_address": address,
                     "items": group_items,
+                    "source_matches": source_matches,
                 }
                 self._append_record(new_record)
                 new_records.append(new_record)
@@ -3073,6 +3230,7 @@ class PackingListApp(QMainWindow):
                     "location": self._location_from_address(address) if address else "",
                     "location_address": address,
                     "items": group_items,
+                    "source_matches": [],
                 }
                 self._append_record(new_record)
                 new_records.append(new_record)
@@ -3094,6 +3252,7 @@ class PackingListApp(QMainWindow):
                     **current,
                     "letter": "",
                     "items": [],
+                    "source_matches": list(current.get("source_matches") or []),
                 }
                 self._append_record(sibling)
                 current = sibling
@@ -3204,7 +3363,6 @@ class PackingListApp(QMainWindow):
     def _merge_matched_emails(
         self,
         exact_matches: list[ExactMatch],
-        fallback_ritms: list[str],
         ritm_letters: dict[str, str],
         packing_list: str,
     ) -> None:
@@ -3212,12 +3370,10 @@ class PackingListApp(QMainWindow):
             message_key = match.entry_id or "|".join(
                 (match.folder, match.subject, match.received)
             )
-            email_ritms = match.ritms or fallback_ritms
+            email_ritms = match.subject_ritms or match.ritms
             for ritm in email_ritms:
                 ritm_key = ritm.casefold()
-                letter = ritm_letters.get(ritm_key)
-                if letter is None:
-                    continue
+                letter = ritm_letters.get(ritm_key, "")
                 email_key = f"{message_key}|{ritm_key}|{packing_list.casefold()}|{letter}"
                 email = self.matched_emails_by_key.get(email_key)
                 if email is None:
@@ -3269,6 +3425,57 @@ class PackingListApp(QMainWindow):
                     item.setData(Qt.ItemDataRole.UserRole, email.key)
                 self.email_table.setItem(row, column, item)
         self._update_reply_button()
+
+    def _on_rescan_sources(self, payload) -> None:
+        """Slot for AddressBatchDialog.rescan_found_sources.
+
+        Attaches newly found sources to any matching record in self.records
+        (the "Applied + Finished before rescanning" case), and immediately
+        pushes the found emails into the reply email table so the user can
+        reply to them even before finishing the dialog.
+        """
+        try:
+            ritm, matches, packing_list = payload
+        except Exception:
+            return
+        if not matches:
+            return
+        ritm_key = (ritm or "").casefold()
+        packing_list_key = (packing_list or "").casefold()
+
+        # 1. Attach to any already-committed record for this RITM.
+        for record in self.records:
+            if record["packing_list"].casefold() != packing_list_key:
+                continue
+            if (record["ritm"] or "").casefold() != ritm_key:
+                continue
+            current = list(record.get("source_matches") or [])
+            seen = {(m.entry_id, m.filename, m.term) for m in current}
+            for match in matches:
+                key = (match.entry_id, match.filename, match.term)
+                if key in seen:
+                    continue
+                seen.add(key)
+                current.append(match)
+            record["source_matches"] = current
+            if not record.get("location_address"):
+                for match in matches:
+                    if match.location_address:
+                        record["location_address"] = match.location_address
+                        record["location"] = match.location
+                        break
+            identifier = _packing_list_identifier(record)
+            self.record_source_matches[identifier] = current
+
+        # 2. Push the found emails into the reply table.
+        ritm_letters = {ritm_key: ""}
+        for r in self.records:
+            if r["packing_list"].casefold() != packing_list_key:
+                continue
+            if (r["ritm"] or "").casefold() == ritm_key:
+                ritm_letters[ritm_key] = r["letter"]
+                break
+        self._merge_matched_emails(list(matches), ritm_letters, packing_list)
 
     def _find_outlook_message(self, namespace, email: MatchedEmail):
         if email.entry_id:
@@ -3360,11 +3567,13 @@ class PackingListApp(QMainWindow):
             )
             return
 
+        # Gather every queue record on this load that shares the selected
+        # email's RITM — whether it was auto-matched or hand-typed.
+        ritm_key = email.ritm.casefold()
         ritm_records = [
             record for record in self.records
-            if record["group"] == email.ritm.casefold()
+            if (record["ritm"] or "").casefold() == ritm_key
             and record["packing_list"].casefold() == email.packing_list.casefold()
-            and record["letter"] == email.letter
         ]
         if ritm_records:
             item_descriptions = list(dict.fromkeys(
@@ -3538,9 +3747,23 @@ class PackingListApp(QMainWindow):
             self._set_processing_state(True)
             return
 
+        time_range = self.range_selector.currentData()
+        search_terms_for_rescan = list(dict.fromkeys(
+            item["description"] for item in record["items"] if item["description"].strip()
+        ))
+
         subject_matches = [match for match in results.exact_matches if match.subject_ritms]
         if not subject_matches:
-            dialog = AddressBatchDialog(self, record["items"], [], record)
+            dialog = AddressBatchDialog(
+                self,
+                record["items"],
+                [],
+                record,
+                subject_matches=[],
+                time_range=time_range,
+                search_terms=search_terms_for_rescan,
+            )
+            dialog.rescan_found_sources.connect(self._on_rescan_sources)
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 self.pending_record = None
                 self.imported_record = None
@@ -3548,7 +3771,7 @@ class PackingListApp(QMainWindow):
                 self._set_processing_state(True)
                 self.status_label.setText("Scan finished. Nothing queued.")
                 return
-            self._commit_dialog_state(record, dialog, [], None)
+            self._commit_dialog_state(record, dialog, [])
             self.pending_record = None
             self.imported_record = None
             self.imported_source_path = None
@@ -3644,19 +3867,28 @@ class PackingListApp(QMainWindow):
                 results.near_matches,
             )
             self.groups[group.key] = group
+
+            matched_location_address = next(
+                (m.location_address for m in ritm_matches if m.location_address),
+                "",
+            )
+            matched_location = next(
+                (m.location for m in ritm_matches if m.location),
+                "",
+            )
+
             ritm_record: PackingListRecord = {
                 **record,
                 "ritm": ritm,
                 "letter": "",
                 "group": ritm_key,
-                "location": next(
-                    (match.location for match in ritm_matches if match.location), ""
-                ) or record.get("location", ""),
-                "location_address": next(
-                    (match.location_address for match in ritm_matches if match.location_address),
-                    "",
-                ) or record.get("location_address", ""),
-                "items": matched_items,
+                "location": matched_location or record.get("location", ""),
+                "location_address": matched_location_address or record.get("location_address", ""),
+                "items": [
+                    {**item, "_ritm": ritm}
+                    for item in matched_items
+                ],
+                "source_matches": list(ritm_matches),
             }
             staged_ritm_records.append((ritm_record, ritm_matches))
             staged.append(ritm_record)
@@ -3666,7 +3898,16 @@ class PackingListApp(QMainWindow):
             if index not in assigned_item_indexes
         ]
 
-        dialog = AddressBatchDialog(self, unmatched_items, staged, record)
+        dialog = AddressBatchDialog(
+            self,
+            unmatched_items,
+            staged,
+            record,
+            subject_matches=subject_matches,
+            time_range=time_range,
+            search_terms=search_terms_for_rescan,
+        )
+        dialog.rescan_found_sources.connect(self._on_rescan_sources)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self.pending_record = None
             self.imported_record = None
@@ -3676,7 +3917,7 @@ class PackingListApp(QMainWindow):
             return
 
         self._commit_dialog_state(
-            record, dialog, staged_ritm_records, subject_matches
+            record, dialog, staged_ritm_records
         )
 
         queued_packing_lists = [
@@ -3692,35 +3933,6 @@ class PackingListApp(QMainWindow):
         self.imported_info_label.setText("No input sheet imported yet.")
         self._set_processing_state(True)
 
-
-        # Attach source-match info for RITMs that survived the dialog.
-        # Key by (packing_list, RITM) rather than by identifier, because
-        # _assign_letters_by_priority may have re-lettered records during
-        # the commit. Looking up by post-dialog identifier would fail
-        # whenever the letter changed.
-        matches_by_ritm: dict[tuple[str, str], list[ExactMatch]] = {}
-        for rec, matches in staged_ritm_records:
-            if not matches:
-                continue
-            key = (
-                rec["packing_list"].casefold(),
-                (rec["ritm"] or "").casefold(),
-            )
-            matches_by_ritm.setdefault(key, []).extend(matches)
-
-        for final_rec in self.records:
-            identifier = _packing_list_identifier(final_rec)
-            if (final_rec["packing_list"].casefold()
-                    != record["packing_list"].casefold()):
-                continue
-            key = (
-                final_rec["packing_list"].casefold(),
-                (final_rec["ritm"] or "").casefold(),
-            )
-            matches = matches_by_ritm.get(key)
-            if matches:
-                self.record_source_matches[identifier] = list(matches)
-
         ritm_letters: dict[str, str] = {}
         for r in self.records:
             if r["packing_list"].casefold() == record["packing_list"].casefold():
@@ -3729,7 +3941,6 @@ class PackingListApp(QMainWindow):
 
         self._merge_matched_emails(
             subject_matches,
-            [],
             ritm_letters,
             record["packing_list"],
         )
@@ -3739,7 +3950,8 @@ class PackingListApp(QMainWindow):
             f"Exact item matches across {matched_email_count} email(s):\n"
             f"{chr(10).join(exact_summary)}\n"
             f"Accepted near-match attachments: {total_accepted_files}. "
-            "Select an email below and choose Reply to open a draft."
+            "Select an email below and choose Reply to open a draft. "
+            "Hand-typed RITMs work with Reply too."
         )
         self.status_label.setText(
             f"Processed packing list IDs {', '.join(queued_packing_lists)}."
@@ -3750,45 +3962,20 @@ class PackingListApp(QMainWindow):
         template_record: PackingListRecord,
         dialog: AddressBatchDialog,
         staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]],
-        subject_matches: list[ExactMatch] | None,
     ) -> None:
-        """Move the dialog's final staged state into self.records.
-
-        - RITMs the scan found that the dialog still contains are appended
-          or merged into self.records.
-        - RITMs the scan found that the dialog dropped (because the user
-          pulled all their items out) are REMOVED from self.records, along
-          with their record_source_matches entry, so they can't be
-          exported.
-        - Any leftover unmatched items get built into records (No Request
-          Item or with the assignments the user made).
-        - Letters are recalculated for the whole packing-list family.
-        - The queue table is refreshed.
-        """
-        # Identifiers the scan originally staged. Used to detect drops.
         input_identifiers = {
             _packing_list_identifier(rec) for rec, _ in staged_ritm_records
         }
-        # Identifiers the dialog still has after user edits.
         output_identifiers = {
             _packing_list_identifier(r) for r in dialog.staged_ritms
         }
         dropped_identifiers = input_identifiers - output_identifiers
 
-        # 1. Remove records that the dialog dropped entirely.
-        #    This covers both:
-        #      - A record just added by an earlier call in this same session
-        #      - A record left over from a prior session/export with the
-        #        same identifier
-        #    Either way, if the user pulled every item out of that RITM in
-        #    the dialog, it should not appear in the queue or the export.
         if dropped_identifiers:
             for record in list(self.records):
                 identifier = _packing_list_identifier(record)
                 if identifier not in dropped_identifiers:
                     continue
-                # Only drop records belonging to the current packing list,
-                # not the entire queue.
                 if (record["packing_list"].casefold()
                         != template_record["packing_list"].casefold()):
                     continue
@@ -3802,7 +3989,6 @@ class PackingListApp(QMainWindow):
                         identifier.casefold()
                     )
 
-        # 2. Commit staged RITMs (append or merge).
         for ritm_record in dialog.staged_ritms:
             items = ritm_record["items"]
             if not items:
@@ -3819,20 +4005,25 @@ class PackingListApp(QMainWindow):
             )
             if existing is not None:
                 existing["items"].extend(items)
+                current = list(existing.get("source_matches") or [])
+                seen = {(m.entry_id, m.filename, m.term) for m in current}
+                for match in _record_source_matches(ritm_record):
+                    key = (match.entry_id, match.filename, match.term)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    current.append(match)
+                existing["source_matches"] = current
             else:
                 self._append_record(ritm_record)
 
-        # 3. Build records for any leftover unmatched items.
         if dialog.unmatched_items:
             self._build_unmatched_records(
                 template_record,
                 dialog.unmatched_items,
-                dialog.address_assignments,
-                dialog.ritm_assignments,
                 staged_ritm_records,
             )
 
-        # 4. Re-letter and refresh.
         self._assign_letters_by_priority(template_record["packing_list"].casefold())
         self._refresh_queue_table()
 
@@ -3906,7 +4097,6 @@ class PackingListApp(QMainWindow):
             return dialog.chosen
         return None
 
-    
     def _save_records(self) -> None:
         _log_marker("=== EXPORT START ===")
         if not self.records:
@@ -4053,6 +4243,7 @@ class PackingListApp(QMainWindow):
         _log_marker(f"EXPORT: {len(records_by_week)} week bucket(s)")
 
         pdf_failures: list[str] = []
+        pdf_skipped_no_source: list[str] = []
 
         shared_excel = None
         try:
@@ -4082,13 +4273,16 @@ class PackingListApp(QMainWindow):
                 load_folder.mkdir(parents=True, exist_ok=True)
                 write_scrap_pickup_template(record, sp_path, excel=shared_excel)
 
-                matches = self.record_source_matches.get(identifier, [])
+                matches = self.record_source_matches.get(identifier)
+                if matches is None:
+                    matches = _record_source_matches(record)
                 _log_marker(
                     f"EXPORT: {identifier} source_matches={len(matches)}"
                 )
                 chosen = self._pick_source_match(identifier, matches)
                 if chosen is None:
                     _log_marker(f"EXPORT: {identifier} no source match, skipping PDF")
+                    pdf_skipped_no_source.append(identifier)
                     continue
 
                 _log_marker(f"EXPORT: {identifier} fetching PDF from Outlook")
@@ -4144,7 +4338,8 @@ class PackingListApp(QMainWindow):
 
         info_lines = [
             f"Saved {count} packing-list workbook(s) (top-level)",
-            f"Created {count} per-load folder(s) with Scrap Pickup + Request Item PDF",
+            f"Created {count} per-load folder(s) with Scrap Pickup"
+            + (f" + {count - len(pdf_skipped_no_source)} Request Item PDF(s)" if pdf_skipped_no_source else " + Request Item PDF"),
             f"Wrote {week_count} weekly Reel Summary Report(s) to "
             f"{self.summaries_folder}",
         ]
@@ -4152,6 +4347,14 @@ class PackingListApp(QMainWindow):
             info_lines.append("")
             info_lines.append("FRN date warnings:")
             info_lines.extend(f"  - {msg}" for msg in frn_date_warnings)
+        if pdf_skipped_no_source:
+            info_lines.append("")
+            info_lines.append(
+                "Request Item PDFs skipped (no source email on file — "
+                "use Rescan in the assignment dialog if you have an RITM "
+                "you know about):"
+            )
+            info_lines.extend(f"  - {msg}" for msg in pdf_skipped_no_source)
         if pdf_failures:
             info_lines.append("")
             info_lines.append("PDF warnings:")

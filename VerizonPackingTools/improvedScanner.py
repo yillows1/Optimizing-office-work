@@ -98,13 +98,6 @@ def find_ritms_in_text(text):
 
 
 def _looks_like_address_line(line: str) -> bool:
-    """Return True if a line looks like part of an address.
-
-    Address material almost always has a comma or a digit, or is a short
-    run of capitalized tokens (e.g. 'MA', 'USA', 'Suite 200'). Normal prose
-    like 'Please communicate with the below mentioned Contact Person...'
-    has none of these, so it gets rejected.
-    """
     stripped = line.strip()
     if not stripped:
         return False
@@ -125,7 +118,6 @@ def find_location_address_in_text(text):
 
         address = match.group(1).strip()
         for following_line in lines[index + 1:index + 4]:
-            # Stop as soon as we have a street and a city.
             address_parts = [part.strip() for part in address.split(",")]
             if len(address_parts) >= 2 and address_parts[0] and address_parts[1]:
                 break
@@ -153,6 +145,7 @@ def find_location_in_text(text):
         if state_match:
             return f"{city} {state_match.group(1).upper()}"
     return city
+
 
 def _build_words_by_len(text):
     words = set(WORD_RE.findall(text))
@@ -271,15 +264,18 @@ def run_scan(time_range_choice, search_terms, log_path, json_results_path=None):
             email_files = set()
             need_json = bool(json_results_path)
 
+            # Always read subject/body; they become part of the searchable
+            # haystack so terms in titles or body prose still match.
+            try:
+                email_subject = str(message.Subject or "")
+            except Exception:
+                email_subject = ""
+            try:
+                email_body = str(message.Body or "")
+            except Exception:
+                email_body = ""
+
             if need_json:
-                try:
-                    email_subject = str(message.Subject or "")
-                except Exception:
-                    email_subject = ""
-                try:
-                    email_body = str(message.Body or "")
-                except Exception:
-                    email_body = ""
                 try:
                     sender_name = str(message.SenderName or "")
                 except Exception:
@@ -300,6 +296,8 @@ def run_scan(time_range_choice, search_terms, log_path, json_results_path=None):
                 subject_ritms = find_ritms_in_text(email_subject)
                 email_ritms = find_ritms_in_text(f"{email_subject}\n{email_body}")
 
+            email_context_text = f"{email_subject}\n{email_body}"
+
             attachment_records = []
             for attachment in message.Attachments:
                 filename = attachment.FileName
@@ -307,7 +305,11 @@ def run_scan(time_range_choice, search_terms, log_path, json_results_path=None):
                 if data is None:
                     continue
                 content = extract_text_from_bytes(data, filename)
-                hits = find_terms_in_text(content, search_terms_lower)
+                # Check attachment text + filename + subject/body. Any of
+                # them matching counts as a hit, so RITM-titled PDFs and
+                # RITMs only in the email title still match.
+                haystack = f"{content}\n{filename}\n{email_context_text}"
+                hits = find_terms_in_text(haystack, search_terms_lower)
                 attachment_records.append({
                     "filename": filename,
                     "content": content,
