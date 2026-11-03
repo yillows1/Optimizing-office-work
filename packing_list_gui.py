@@ -1,0 +1,4940 @@
+import re
+import os
+import io
+import gc
+import json
+import sqlite3
+import html
+import subprocess
+import sys
+import tempfile
+import shutil
+import time as _time
+import functools as _functools
+import logging as _logging
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, TypedDict
+
+import pythoncom
+
+from PySide6.QtCore import QEvent, QThread, Qt, Signal
+from PySide6.QtGui import QKeyEvent
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSpinBox,
+    QStyle,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+import win32com.client
+
+from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+
+
+# ---------------------------------------------------------------------------
+# Config / paths
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+from pathlib import Path as _Path
+
+
+def get_resource_path(relative: str) -> _Path:
+    if getattr(_sys, "frozen", False) and hasattr(_sys, "_MEIPASS"):
+        return _Path(_sys._MEIPASS) / relative
+    return _Path(__file__).resolve().parent / relative
+
+
+def get_user_dir() -> _Path:
+    if getattr(_sys, "frozen", False):
+        return _Path(_sys.executable).resolve().parent
+    return _Path(__file__).resolve().parent
+
+
+_TIMING_LOG = get_user_dir() / "packing_timing.log"
+
+_logging.basicConfig(
+    filename=str(_TIMING_LOG),
+    level=_logging.INFO,
+    format="%(asctime)s %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+def _timed(fn):
+    @_functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = _time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            elapsed = _time.perf_counter() - start
+            _logging.info(f"{fn.__name__}: {elapsed:.2f}s")
+    return wrapper
+
+
+def _log_marker(text: str) -> None:
+    _logging.info(f"--- {text} ---")
+
+
+CONFIG_PATH = get_user_dir() / "scanner_config.json"
+DEFAULT_SUMMARIES_DIR = get_user_dir() / "Summaries"
+
+TEMPLATE_RELATIVE_PATH = Path("Excel Bases") / "Incoming Packing List.xls"
+WORKING_DIR_RELATIVE_PATH = Path("Working")
+INPUT_SHEET_NAME = "Packing List"
+
+IN_DATE = "E8"
+IN_PLATE = "C9"
+IN_RECEIVED = "E9"
+IN_CONT = "C10"
+IN_PACKING_LIST = "E10"
+
+IN_FIRST_ITEM_ROW = 13
+IN_LAST_ITEM_ROW = 35
+IN_DESC_COL = "B"
+IN_MATERIAL_COL = "D"
+IN_GROSS_COL = "E"
+IN_TARE_COL = "F"
+
+MAX_ITEMS_PER_LOAD = 23
+MAX_ITEMS_PER_SUMMARY_TAB = 31
+
+RENAME_EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm"}
+RENAME_PDF_SUFFIXES = {".pdf"}
+
+XL_CALC_MANUAL = -4135
+XL_CALC_AUTOMATIC = -4105
+
+
+def load_app_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_app_config(data: dict) -> None:
+    try:
+        CONFIG_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def parse_date(value: str) -> date:
+    for date_format in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(value.strip(), date_format).date()
+        except ValueError:
+            continue
+    raise ValueError("Enter the date as YYYY-MM-DD or MM/DD/YYYY.")
+
+
+def normalize_item_type(value: str) -> str:
+    cleaned = " ".join(value.split())
+    common_types = {
+        "99 fo": "99 FO",
+        "99fo": "99 FO",
+        "23": "23",
+        "type 23": "Type 23",
+        "type23": "Type 23",
+        "type 3": "Type 3",
+        "type3": "Type 3",
+        "type 4": "Type 4",
+        "type4": "Type 4",
+        "69s": "69S",
+    }
+    return common_types.get(cleaned.casefold(), cleaned.upper())
+
+
+def normalize_ritm(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", value).upper()
+
+
+# ---------------------------------------------------------------------------
+# Database helpers (Access via ODBC)
+# ---------------------------------------------------------------------------
+#
+# The database is optional. If no path is configured, every DB operation is a
+# no-op and the app behaves exactly as it did before the database existed.
+#
+# Schema (must match the tables created in Access):
+#
+#   Reel_Load_Database (
+#       Packing_List_Number  TEXT(50) PRIMARY KEY,   -- lettered FRN, e.g. FRN261021-2R-A
+#       Receiving_Date       DATE,
+#       RITM_Number          TEXT(30),               -- NULL for "No Request Item"
+#       Location             TEXT(100),
+#       Truck                TEXT(50),
+#       Truck_Number         TEXT(50),
+#       Total_Gross_Weight   LONG,
+#       Total_Tare           LONG,
+#       Total_Net_Weight     LONG,
+#       Number_of_Reels      LONG
+#   )
+#
+#   Reel_Items (
+#       Item_ID              AUTOINCREMENT PRIMARY KEY,
+#       Packing_List_Number  TEXT(50),
+#       RITM_Number          TEXT(30),               -- NULL for "No Request Item"
+#       Item_Description     TEXT(255),
+#       Item_Type            TEXT(20),
+#       Gross                LONG,
+#       Tare                 LONG,
+#       Net                  LONG
+#   )
+#
+# Composite unique index on Reel_Items (RITM_Number, Item_Description).
+# Access ignores NULLs in that index, so no-RITM items never collide.
+
+# ---------------------------------------------------------------------------
+# Database helpers (SQLite)
+# ---------------------------------------------------------------------------
+#
+# SQLite ships with Python's standard library, so end users need NOTHING
+# installed beyond Excel and Outlook. The .db file lives wherever the user
+# points it (network drive, Desktop, etc.) and schema is created automatically
+# on first connect.
+#
+# Schema (identical shape to the old Access schema):
+#
+#   Reel_Load_Database (
+#       Packing_List_Number  TEXT PRIMARY KEY,
+#       Receiving_Date       TEXT,       -- ISO 'YYYY-MM-DD'
+#       RITM_Number          TEXT,       -- NULL for "No Request Item"
+#       Location             TEXT,
+#       Truck                TEXT,
+#       Truck_Number         TEXT,
+#       Total_Gross_Weight   INTEGER,
+#       Total_Tare           INTEGER,
+#       Total_Net_Weight     INTEGER,
+#       Number_of_Reels      INTEGER
+#   )
+#
+#   Reel_Items (
+#       Item_ID              INTEGER PRIMARY KEY AUTOINCREMENT,
+#       Packing_List_Number  TEXT,
+#       RITM_Number          TEXT,       -- NULL for "No Request Item"
+#       Item_Description     TEXT,
+#       Item_Type            TEXT,
+#       Gross                INTEGER,
+#       Tare                 INTEGER,
+#       Net                  INTEGER
+#   )
+#
+# Composite unique index on Reel_Items (RITM_Number, Item_Description).
+# SQLite treats NULLs as distinct in unique indexes, so no-RITM rows never
+# collide.
+
+import sqlite3
+import threading
+
+_SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS Reel_Load_Database (
+    Packing_List_Number  TEXT PRIMARY KEY,
+    Receiving_Date       TEXT,
+    RITM_Number          TEXT,
+    Location             TEXT,
+    Truck                TEXT,
+    Truck_Number         TEXT,
+    Total_Gross_Weight   INTEGER,
+    Total_Tare           INTEGER,
+    Total_Net_Weight     INTEGER,
+    Number_of_Reels      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS Reel_Items (
+    Item_ID              INTEGER PRIMARY KEY AUTOINCREMENT,
+    Packing_List_Number  TEXT,
+    RITM_Number          TEXT,
+    Item_Description     TEXT,
+    Item_Type            TEXT,
+    Gross                INTEGER,
+    Tare                 INTEGER,
+    Net                  INTEGER,
+    FOREIGN KEY (Packing_List_Number)
+        REFERENCES Reel_Load_Database(Packing_List_Number)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ritm_item
+    ON Reel_Items (RITM_Number, Item_Description);
+
+CREATE INDEX IF NOT EXISTS idx_items_pl
+    ON Reel_Items (Packing_List_Number);
+
+CREATE INDEX IF NOT EXISTS idx_master_ritm
+    ON Reel_Load_Database (RITM_Number);
+"""
+
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY: dict[str, bool] = {}
+
+
+def db_path() -> Path | None:
+    """Return the configured .db path, or None if not set."""
+    configured = load_app_config().get("database_path")
+    if not configured:
+        return None
+    return Path(configured)
+
+
+def db_configured() -> bool:
+    return db_path() is not None
+
+
+def _ensure_schema(conn: sqlite3.Connection, path: Path) -> None:
+    key = str(path.resolve()).casefold()
+    if _SCHEMA_READY.get(key):
+        return
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY.get(key):
+            return
+        conn.executescript(_SQLITE_SCHEMA)
+        _SCHEMA_READY[key] = True
+
+
+def db_connect() -> sqlite3.Connection:
+    """Open a fresh SQLite connection with foreign keys on and schema ready."""
+    path = db_path()
+    if path is None:
+        raise RuntimeError(
+            "No database configured. Use the Database button."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=10.0, isolation_level=None)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    _ensure_schema(conn, path)
+    return conn
+
+
+def with_db_retry(fn, attempts: int = 6, base_delay: float = 0.4):
+    """Retry on transient 'database is locked' / 'busy' errors."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            transient = "locked" in msg or "busy" in msg or "disk" in msg
+            if not transient or i == attempts - 1:
+                raise
+            last = e
+            _time.sleep(base_delay * (2 ** i))
+    if last is not None:
+        raise last
+
+
+def _db_ritm_value(ritm: str | None) -> str | None:
+    """Normalize the RITM for storage: NULL for missing / 'No Request Item'."""
+    if not ritm:
+        return None
+    if ritm.strip().casefold() == "no request item":
+        return None
+    return ritm.strip()
+
+
+def ritm_item_exists_in_db(ritm: str, item_descriptions: list[str]) -> bool:
+    """True if this RITM already has any of these items in the DB."""
+    if not db_configured():
+        return False
+    ritm_value = _db_ritm_value(ritm)
+    if ritm_value is None:
+        return False
+    descriptions = [d.strip() for d in item_descriptions if d and d.strip()]
+    if not descriptions:
+        return False
+
+    def _query() -> bool:
+        conn = db_connect()
+        try:
+            placeholders = ",".join(["?"] * len(descriptions))
+            row = conn.execute(
+                f"SELECT 1 FROM Reel_Items "
+                f"WHERE RITM_Number = ? AND Item_Description IN ({placeholders}) "
+                f"LIMIT 1",
+                (ritm_value, *descriptions),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    try:
+        return with_db_retry(_query)
+    except Exception as e:
+        _logging.info(f"DB duplicate check failed for {ritm}: {e}")
+        return False
+
+
+def record_db_duplicates(
+    records: list[PackingListRecord],
+) -> list[tuple[str, str, str]]:
+    """Return (ritm, item_description, existing_frn) tuples that already exist
+    in the DB under a *different* Packing_List_Number.
+    """
+    if not db_configured() or not records:
+        return []
+
+    def _query() -> list[tuple[str, str, str]]:
+        conn = db_connect()
+        try:
+            out: list[tuple[str, str, str]] = []
+            seen: set[tuple[str, str, str]] = set()
+            for record in records:
+                ritm_value = _db_ritm_value(record.get("ritm", ""))
+                if ritm_value is None:
+                    continue
+                current_frn = _packing_list_identifier(record)
+                for item in record.get("items") or []:
+                    desc = (item.get("description") or "").strip()
+                    if not desc:
+                        continue
+                    row = conn.execute(
+                        "SELECT Packing_List_Number FROM Reel_Items "
+                        "WHERE RITM_Number = ? AND Item_Description = ?",
+                        (ritm_value, desc),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    existing_frn = str(row[0] or "")
+                    if existing_frn.casefold() == current_frn.casefold():
+                        continue
+                    key = (ritm_value, desc, existing_frn)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(key)
+            return out
+        finally:
+            conn.close()
+
+    try:
+        return with_db_retry(_query)
+    except Exception as e:
+        _logging.info(f"DB duplicate scan failed: {e}")
+        return []
+
+
+def _base_frn(packing_list_identifier: str) -> str:
+    """Strip a trailing -A / -B / ... letter suffix, returning the base FRN."""
+    match = re.fullmatch(r"(.+)-([A-Za-z]+)", packing_list_identifier.strip())
+    if match is None:
+        return packing_list_identifier.strip()
+    return match.group(1)
+
+
+def delete_base_frn_from_db(packing_list_identifier: str) -> int:
+    """Delete every row (any letter) whose Packing_List_Number starts with the
+    base FRN. Items first, then master.
+    """
+    if not db_configured():
+        return 0
+    base = _base_frn(packing_list_identifier)
+    if not base:
+        return 0
+    like = f"{base}%"
+
+    def _delete() -> int:
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                "DELETE FROM Reel_Items WHERE Packing_List_Number LIKE ?",
+                (like,),
+            )
+            cur = conn.execute(
+                "DELETE FROM Reel_Load_Database WHERE Packing_List_Number LIKE ?",
+                (like,),
+            )
+            deleted = cur.rowcount
+            conn.execute("COMMIT")
+            return max(deleted, 0)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    try:
+        return with_db_retry(_delete)
+    except Exception as e:
+        _logging.info(f"DB delete failed for base FRN {base}: {e}")
+        return 0
+
+
+def insert_record_to_db(record: PackingListRecord) -> tuple[int, int]:
+    """Insert one record's master row + item rows.
+
+    Returns (items_inserted, items_skipped). Item-level unique violations are
+    caught and counted as skipped; master insert failure aborts the whole record.
+    """
+    if not db_configured():
+        return (0, 0)
+
+    pl_number = _packing_list_identifier(record)
+    ritm_value = _db_ritm_value(record.get("ritm", ""))
+    items = list(record.get("items") or [])
+    driver, plate = _split_driver_and_plate(record.get("driver_plate", ""))
+    try:
+        receiving_date = parse_date(record["date"]).isoformat()
+    except Exception:
+        receiving_date = None
+
+    total_gross = sum(int(i.get("gross", 0) or 0) for i in items)
+    total_tare = sum(int(i.get("tare", 0) or 0) for i in items)
+    total_net = sum(int(i.get("net", 0) or 0) for i in items)
+
+    def _insert() -> tuple[int, int]:
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN")
+            conn.execute(
+                "INSERT INTO Reel_Load_Database "
+                "(Packing_List_Number, Receiving_Date, RITM_Number, Location, "
+                " Truck, Truck_Number, Total_Gross_Weight, Total_Tare, "
+                " Total_Net_Weight, Number_of_Reels) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    pl_number,
+                    receiving_date,
+                    ritm_value,
+                    record.get("location_address") or record.get("location") or "",
+                    driver,
+                    plate,
+                    total_gross,
+                    total_tare,
+                    total_net,
+                    len(items),
+                ),
+            )
+
+            inserted = 0
+            skipped = 0
+            for item in items:
+                desc = (item.get("description") or "").strip()
+                if not desc:
+                    continue
+                try:
+                    conn.execute(
+                        "INSERT INTO Reel_Items "
+                        "(Packing_List_Number, RITM_Number, Item_Description, "
+                        " Item_Type, Gross, Tare, Net) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            pl_number,
+                            ritm_value,
+                            desc,
+                            item.get("type") or "",
+                            int(item.get("gross", 0) or 0),
+                            int(item.get("tare", 0) or 0),
+                            int(item.get("net", 0) or 0),
+                        ),
+                    )
+                    inserted += 1
+                except sqlite3.IntegrityError:
+                    skipped += 1
+                    _logging.info(f"DB skipped duplicate item: {ritm_value} + {desc}")
+
+            conn.execute("COMMIT")
+            return inserted, skipped
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    try:
+        return with_db_retry(_insert)
+    except Exception as e:
+        _logging.info(f"DB insert failed for {pl_number}: {e}")
+        return (0, len(items))
+
+
+# ---------------------------------------------------------------------------
+# Week helpers
+# ---------------------------------------------------------------------------
+def week_range(iso_date: str) -> tuple[date, date]:
+    d = parse_date(iso_date)
+    weekday = d.weekday()
+    if weekday >= 5:
+        monday = d + timedelta(days=(7 - weekday))
+    else:
+        monday = d - timedelta(days=weekday)
+    friday = monday + timedelta(days=4)
+    return monday, friday
+
+
+def summary_filename(monday: date, friday: date) -> str:
+    return (
+        f"Reel Summary Report WE "
+        f"{monday.month}.{monday.day}.{monday.strftime('%y')} ~ "
+        f"{friday.month}.{friday.day}.{friday.strftime('%y')}.xls"
+    )
+
+
+_FRN_DATE_RE = re.compile(r"FRN(\d{2})(\d{2})(\d{2})", re.IGNORECASE)
+
+
+def _date_from_frn(packing_list_number: str) -> tuple[date | None, str]:
+    if not packing_list_number:
+        return None, "empty packing list number"
+    match = _FRN_DATE_RE.search(packing_list_number)
+    if not match:
+        return None, "no FRN date found"
+    yy, mm, dd = match.groups()
+    try:
+        return date(2000 + int(yy), int(mm), int(dd)), ""
+    except ValueError as error:
+        return None, str(error)
+
+
+# ---------------------------------------------------------------------------
+# Excel COM lifetime helpers
+# ---------------------------------------------------------------------------
+
+@_timed
+def _release_excel(excel, workbook=None) -> None:
+    if workbook is not None:
+        try:
+            workbook.Close(SaveChanges=False)
+        except Exception:
+            pass
+    if excel is not None:
+        try:
+            excel.Calculation = XL_CALC_AUTOMATIC
+        except Exception:
+            pass
+        try:
+            excel.ScreenUpdating = True
+        except Exception:
+            pass
+        try:
+            excel.Quit()
+        except Exception:
+            pass
+    del excel
+    del workbook
+    try:
+        pythoncom.CoFreeUnusedLibraries()
+    except Exception:
+        pass
+    gc.collect()
+
+
+def _tune_excel_for_batch(excel) -> None:
+    try:
+        excel.ScreenUpdating = False
+    except Exception:
+        pass
+    try:
+        excel.DisplayAlerts = False
+    except Exception:
+        pass
+    try:
+        excel.EnableEvents = False
+    except Exception:
+        pass
+    try:
+        excel.Calculation = XL_CALC_MANUAL
+    except Exception:
+        pass
+    try:
+        excel.AskToUpdateLinks = False
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Excel helpers (merge-safe)
+# ---------------------------------------------------------------------------
+
+def _safe_write(sheet, address: str, value) -> None:
+    rng = sheet.Range(address)
+    try:
+        if rng.MergeCells:
+            rng = rng.MergeArea.Cells(1, 1)
+    except Exception:
+        pass
+    rng.Value = value
+
+
+def _safe_clear(sheet, address: str) -> None:
+    rng = sheet.Range(address)
+    try:
+        if rng.MergeCells:
+            rng = rng.MergeArea.Cells(1, 1)
+    except Exception:
+        pass
+    rng.ClearContents()
+
+
+def _clear_item_range(sheet, first_row: int, last_row: int, first_col: int, last_col: int) -> None:
+    try:
+        rng = sheet.Range(
+            sheet.Cells(first_row, first_col),
+            sheet.Cells(last_row, last_col),
+        )
+        if rng.MergeCells:
+            raise RuntimeError("merged block")
+        rng.ClearContents()
+        return
+    except Exception:
+        pass
+    for r in range(first_row, last_row + 1):
+        for c in range(first_col, last_col + 1):
+            cell = sheet.Cells(r, c)
+            try:
+                if cell.MergeCells:
+                    continue
+            except Exception:
+                pass
+            cell.ClearContents()
+
+
+def _read_block(sheet, first_row: int, first_col: int, last_row: int, last_col: int):
+    return sheet.Range(
+        sheet.Cells(first_row, first_col),
+        sheet.Cells(last_row, last_col),
+    ).Value
+
+
+def _as_grid(value, rows: int, cols: int) -> list[list]:
+    if value is None:
+        return [[None] * cols for _ in range(rows)]
+    if not isinstance(value, tuple):
+        return [[value] + [None] * (cols - 1)]
+    if rows == 1 and cols == 1:
+        return [[value[0]]] if isinstance(value, tuple) else [[value]]
+    if rows == 1:
+        return [list(value)]
+    if cols == 1:
+        return [[v] for v in value]
+    return [list(row) for row in value]
+
+
+# ---------------------------------------------------------------------------
+# PDF helpers
+# ---------------------------------------------------------------------------
+
+@_timed
+def slice_first_pages(source_bytes: bytes, max_pages: int = 2) -> bytes | None:
+    try:
+        reader = PdfReader(io.BytesIO(source_bytes))
+        if not reader.pages:
+            return None
+        writer = PdfWriter()
+        for page in reader.pages[:max_pages]:
+            writer.add_page(page)
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+@_timed
+def annotate_pdf(source_bytes: bytes, note: str) -> bytes | None:
+    try:
+        reader = PdfReader(io.BytesIO(source_bytes))
+        writer = PdfWriter()
+
+        first_page = reader.pages[0]
+        mb = first_page.mediabox
+        page_w = float(mb.width)
+        page_h = float(mb.height)
+
+        buf = io.BytesIO()
+        can = canvas.Canvas(buf, pagesize=(page_w, page_h))
+        can.setFont("Helvetica-Bold", 11)
+        can.setFillColorRGB(1, 0, 0)
+        can.drawCentredString(page_w * 0.40, page_h - 25, note)
+        can.save()
+        buf.seek(0)
+        overlay_page = PdfReader(buf).pages[0]
+
+        for index, page in enumerate(reader.pages):
+            if index == 0:
+                page.merge_page(overlay_page)
+            writer.add_page(page)
+
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+@_timed
+def fetch_attachment_bytes(
+    entry_id: str,
+    store_id: str,
+    filename: str,
+) -> bytes | None:
+    if not entry_id:
+        return None
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        message = None
+        if store_id:
+            try:
+                message = namespace.GetItemFromID(entry_id, store_id)
+            except Exception:
+                message = None
+        if message is None:
+            try:
+                message = namespace.GetItemFromID(entry_id)
+            except Exception:
+                message = None
+        if message is None:
+            return None
+
+        for attachment in message.Attachments:
+            if str(attachment.FileName).casefold() == filename.casefold():
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=Path(filename).suffix
+                ) as tmp:
+                    tmp_path = tmp.name
+                try:
+                    attachment.SaveAsFile(tmp_path)
+                    data = Path(tmp_path).read_bytes()
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                return data
+    except Exception:
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# File-renaming helpers
+# ---------------------------------------------------------------------------
+
+_FRN_IN_TEXT = re.compile(
+    r"(FRN\d{6}-\d+[A-Z]?)(?:-([A-Za-z]+))?",
+    re.IGNORECASE,
+)
+
+
+def _extract_frn_from_text(text: str) -> tuple[str, str]:
+    if not text:
+        return "", ""
+    match = _FRN_IN_TEXT.search(text)
+    if not match:
+        return "", ""
+    frn = match.group(1).upper()
+    letter = (match.group(2) or "").upper()
+    return frn, letter
+
+
+def _extract_frn_from_excel(path: Path, excel=None) -> tuple[str, str]:
+    owns_excel = excel is None
+    workbook = None
+    excel_local = excel
+    try:
+        if owns_excel:
+            excel_local = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel_local)
+
+        workbook = excel_local.Workbooks.Open(
+            str(path), UpdateLinks=0, ReadOnly=True
+        )
+
+        candidates: list[str] = []
+        for sheet in workbook.Worksheets:
+            for address in ("E10", "H10", "M2", "E11", "C10"):
+                value = sheet.Range(address).Value
+                if value is None:
+                    continue
+                text = str(value).strip()
+                if text:
+                    candidates.append(text)
+
+        for text in candidates:
+            frn, letter = _extract_frn_from_text(text)
+            if frn:
+                return frn, letter
+        return "", ""
+    except Exception:
+        return "", ""
+    finally:
+        if owns_excel:
+            _release_excel(excel_local, workbook)
+        else:
+            if workbook is not None:
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
+
+
+def _extract_frn_from_pdf(path: Path) -> tuple[str, str]:
+    try:
+        reader = PdfReader(str(path))
+        if not reader.pages:
+            return "", ""
+        text = reader.pages[0].extract_text() or ""
+        frn, letter = _extract_frn_from_text(text)
+        return frn, letter
+    except Exception:
+        return "", ""
+
+
+def plan_file_renames(folder: Path, progress=None) -> list[dict]:
+    entries = [
+        e for e in sorted(folder.iterdir())
+        if e.is_file()
+        and not e.name.startswith(".")
+        and not e.name.startswith("~$")
+    ]
+    total = len(entries)
+
+    plans: list[dict] = []
+    excel = None
+    try:
+        if any(e.suffix.casefold() in RENAME_EXCEL_SUFFIXES for e in entries):
+            excel = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel)
+
+        for index, entry in enumerate(entries, start=1):
+            if progress is not None:
+                progress(index, total, entry.name)
+
+            stem = entry.stem
+            suffix = entry.suffix
+
+            frn, letter = _extract_frn_from_text(stem)
+            source = "filename" if frn else ""
+
+            if not frn and suffix.casefold() in RENAME_EXCEL_SUFFIXES:
+                frn, letter = _extract_frn_from_excel(entry, excel=excel)
+                if frn:
+                    source = "excel"
+
+            if not frn and suffix.casefold() in RENAME_PDF_SUFFIXES:
+                frn, letter = _extract_frn_from_pdf(entry)
+                if frn:
+                    source = "pdf"
+
+            if not letter:
+                tail_letter = re.search(r"[-_]([A-Za-z])$", stem)
+                if tail_letter:
+                    letter = tail_letter.group(1).upper()
+
+            new_name = ""
+            reason = ""
+
+            if not frn:
+                reason = "No FRN found in filename or file contents"
+            else:
+                new_stem = f"Incoming {frn}"
+                if letter:
+                    new_stem += f"-{letter}"
+                new_name = new_stem + suffix
+                if new_name == entry.name:
+                    reason = "Already named correctly"
+                else:
+                    reason = f"Matched via {source}"
+
+            plans.append({
+                "path": entry,
+                "old_name": entry.name,
+                "new_name": new_name,
+                "frn": frn,
+                "letter": letter,
+                "reason": reason,
+            })
+    finally:
+        _release_excel(excel, None)
+    return plans
+
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class NearMatch:
+    term: str
+    guess: str
+    similarity: float
+    filename: str
+    folder: str
+    subject: str
+    received: str
+    subject_ritms: list[str]
+
+
+@dataclass(frozen=True)
+class ExactMatch:
+    term: str
+    filename: str
+    folder: str
+    subject: str
+    received: str
+    sender: str
+    sender_email: str
+    entry_id: str
+    store_id: str
+    ritms: list[str]
+    subject_ritms: list[str]
+    location: str
+    location_address: str
+
+
+@dataclass
+class MatchedEmail:
+    key: str
+    ritm: str
+    packing_list: str
+    letter: str
+    entry_id: str
+    store_id: str
+    sender: str
+    sender_email: str
+    subject: str
+    received: str
+    folder: str
+    attachments: set[str] = field(default_factory=set)
+    item_terms: set[str] = field(default_factory=set)
+
+
+@dataclass
+class ScanResults:
+    exact_matches: list[ExactMatch]
+    near_matches: list[NearMatch]
+
+
+@dataclass
+class ScannerGroup:
+    key: str
+    label: str
+    terms: list[str]
+    files: list[str]
+    exact_files: list[str] = field(default_factory=list)
+    near_matches: list[NearMatch] = field(default_factory=list)
+
+
+class ItemRecord(TypedDict, total=False):
+    description: str
+    type: str
+    gross: int
+    tare: int
+    net: int
+    # Dialog bookkeeping — attached while the user assigns items.
+    _address: str
+    _ritm: str
+
+
+class PackingListRecord(TypedDict, total=False):
+    group: str
+    ritm: str
+    letter: str
+    date: str
+    packing_list: str
+    location: str
+    location_address: str
+    driver_plate: str
+    items: list[ItemRecord]
+    # List of ExactMatch objects that sourced this record (may be empty
+    # for hand-typed RITMs that never got a rescan match).
+    source_matches: list[ExactMatch]
+
+
+class BlankZeroSpinBox(QSpinBox):
+    def textFromValue(self, value: int) -> str:
+        return "" if value == self.minimum() else str(value)
+
+    def valueFromText(self, text: str) -> int:
+        cleaned = text.strip().replace(",", "")
+        if not cleaned:
+            return self.minimum()
+        try:
+            return int(cleaned)
+        except ValueError:
+            return self.minimum()
+
+
+def _item_address(item: ItemRecord) -> str:
+    return str(item.get("_address", "") or "").strip()
+
+
+def _item_ritm(item: ItemRecord) -> str:
+    return str(item.get("_ritm", "") or "").strip()
+
+
+def _record_source_matches(record: PackingListRecord) -> list[ExactMatch]:
+    return list(record.get("source_matches") or [])
+
+
+def _dedupe_matches(matches: list[ExactMatch]) -> list[ExactMatch]:
+    seen: set[tuple[str, str, str]] = set()
+    out: list[ExactMatch] = []
+    for match in matches:
+        key = (match.entry_id, match.filename, match.term)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(match)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Assignment dialog with live staging
+# ---------------------------------------------------------------------------
+
+class AddressBatchDialog(QDialog):
+    """Assignment dialog with live RITM staging.
+
+    Key invariant:
+      Every item from the input sheet lives in EXACTLY ONE of:
+        - self.unmatched_items       (still needs assignment)
+        - self.staged_ritms[i].items (assigned to a RITM)
+      There is no overlap. `_apply` moves items from the pool into a
+      staged RITM atomically; `_apply_removals` moves them back. Nothing
+      else touches item membership.
+
+    Per-item assignments are stored on the ItemRecord itself (`_address`
+    and `_ritm`) so index remapping cannot point at the wrong item.
+
+    Rescan behavior:
+      - Rescan looks at the RITM text in the field. It runs a scoped
+        scan for that RITM's item descriptions.
+      - Any emails whose subject/body mention the RITM are collected as
+        sources.
+      - If the RITM is already staged, sources are attached to it and
+        its location is backfilled from the matched PDF.
+      - If the RITM is not staged yet, sources are stashed in
+        `_last_rescan_matches` and used when the RITM is created by a
+        subsequent Apply.
+      - The signal `rescan_found_sources` fires with (ritm, matches,
+        packing_list) so the main window can drop them into the reply
+        email table immediately.
+    """
+
+    rescan_found_sources = Signal(object)  # (ritm_str, list[ExactMatch], packing_list_str)
+
+    def __init__(
+        self,
+        parent,
+        unmatched_items: list[ItemRecord],
+        staged_ritms: list[PackingListRecord],
+        record_template: PackingListRecord,
+        subject_matches: list[ExactMatch] | None = None,
+        time_range: str = "2",
+        search_terms: list[str] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Assign location / Request Item, remove from RITMs")
+        self.setMinimumWidth(820)
+        self.setMinimumHeight(640)
+
+        self._template: PackingListRecord = dict(record_template)
+        self._subject_matches: list[ExactMatch] = list(subject_matches or [])
+        self._time_range = time_range
+        self._search_terms = list(search_terms or [])
+
+        self.unmatched_items: list[ItemRecord] = [dict(item) for item in unmatched_items]
+        self.staged_ritms: list[PackingListRecord] = []
+        for r in staged_ritms:
+            if not r.get("items"):
+                continue
+            copy_r = dict(r)
+            copy_r["items"] = [dict(item) for item in r["items"]]
+            copy_r.setdefault("source_matches", list(r.get("source_matches") or []))
+            self.staged_ritms.append(copy_r)
+
+        self._last_rescan_matches: list[ExactMatch] = []
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Assign location/RITM to unmatched items, or pull items out of "
+            "the staged RITMs. Any RITM you assign via the Request Item or "
+            "Both tab will be created if it doesn't already exist. Use "
+            "'Rescan for this RITM' to search Outlook for the RITM you typed."
+        ))
+
+        self.tabs = QTabWidget()
+
+        self.lists: list[QListWidget] = []
+        self._build_tab("Location", self._build_location_tab)
+        self._build_tab("Request Item", self._build_ritm_tab)
+        self._build_tab("Both", self._build_both_tab)
+        self._build_remove_tab()
+
+        layout.addWidget(self.tabs)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #53645e;")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        if not self.unmatched_items:
+            self.tabs.setCurrentWidget(self._remove_tab_widget)
+
+    # ------------------------------------------------------------------
+    # Tab builders
+    # ------------------------------------------------------------------
+
+    def _build_tab(self, title: str, builder) -> None:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        list_widget = QListWidget()
+        list_widget.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        self._populate_list(list_widget)
+        self.lists.append(list_widget)
+        tab_layout.addWidget(list_widget)
+
+        builder(tab_layout, list_widget)
+        self.tabs.addTab(tab, title)
+
+    def _populate_list(self, list_widget: QListWidget) -> None:
+        list_widget.clear()
+        for item in self.unmatched_items:
+            entry = QListWidgetItem(item["description"])
+            entry.setFlags(entry.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            entry.setCheckState(Qt.CheckState.Unchecked)
+            entry.setData(Qt.ItemDataRole.UserRole, id(item))
+            list_widget.addItem(entry)
+
+    def _refresh_all_assignment_lists(self) -> None:
+        for list_widget in self.lists:
+            self._populate_list(list_widget)
+
+    def _build_location_tab(self, tab_layout, list_widget) -> None:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Location:"))
+        self.location_input = QLineEdit()
+        self.location_input.setPlaceholderText(
+            "Street, City, State ZIP  (leave blank for No Location)"
+        )
+        row.addWidget(self.location_input, 1)
+        tab_layout.addLayout(row)
+        self._add_apply_buttons(tab_layout, "apply_location")
+
+    def _build_ritm_tab(self, tab_layout, list_widget) -> None:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Request Item:"))
+        self.ritm_input = QLineEdit()
+        self.ritm_input.setPlaceholderText("e.g. RITM0011836256")
+        row.addWidget(self.ritm_input, 1)
+        tab_layout.addLayout(row)
+        self._add_rescan_row(
+            tab_layout,
+            lambda: self.ritm_input.text(),
+        )
+        self._add_apply_buttons(tab_layout, "apply_ritm")
+
+    def _build_both_tab(self, tab_layout, list_widget) -> None:
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Location:"))
+        self.both_location_input = QLineEdit()
+        self.both_location_input.setPlaceholderText(
+            "Street, City, State ZIP  (leave blank for No Location)"
+        )
+        row1.addWidget(self.both_location_input, 1)
+        tab_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("Request Item:"))
+        self.both_ritm_input = QLineEdit()
+        self.both_ritm_input.setPlaceholderText("e.g. RITM0011836256")
+        row2.addWidget(self.both_ritm_input, 1)
+        tab_layout.addLayout(row2)
+        self._add_rescan_row(
+            tab_layout,
+            lambda: self.both_ritm_input.text(),
+        )
+        self._add_apply_buttons(tab_layout, "apply_both")
+
+    def _add_rescan_row(self, tab_layout, get_text) -> None:
+        row = QHBoxLayout()
+        rescan_button = QPushButton("Rescan for this RITM")
+        rescan_button.setStyleSheet(
+            "font-weight: bold; background: #4a6a93; color: white;"
+        )
+        rescan_button.clicked.connect(lambda: self._do_rescan(get_text()))
+        row.addWidget(rescan_button)
+        row.addStretch(1)
+        tab_layout.addLayout(row)
+
+    def _add_apply_buttons(self, tab_layout, mode: str) -> None:
+        button_row = QHBoxLayout()
+        apply_button = QPushButton("Apply to selected")
+        apply_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        apply_button.clicked.connect(lambda: self._apply(mode))
+        button_row.addWidget(apply_button)
+
+        another_button = QPushButton("Another batch")
+        another_button.clicked.connect(self._another_batch)
+        button_row.addWidget(another_button)
+
+        finished_button = QPushButton("Finished")
+        finished_button.setStyleSheet("font-weight: bold;")
+        finished_button.clicked.connect(self.accept)
+        button_row.addWidget(finished_button)
+
+        button_row.addStretch(1)
+        tab_layout.addLayout(button_row)
+
+    # ------------------------------------------------------------------
+    # Remove / Drop tab
+    # ------------------------------------------------------------------
+
+    def _build_remove_tab(self) -> None:
+        tab = QWidget()
+        tab_layout = QVBoxLayout(tab)
+
+        tab_layout.addWidget(QLabel(
+            "Check items to pull out of a staged RITM. They return to the "
+            "unmatched pool so you can re-assign them. If a RITM loses all "
+            "its items, it is dropped entirely."
+        ))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(6, 6, 6, 6)
+        scroll.setWidget(container)
+
+        tab_layout.addWidget(scroll, 1)
+
+        button_row = QHBoxLayout()
+        self.apply_removals_button = QPushButton("Apply removals")
+        self.apply_removals_button.setStyleSheet(
+            "font-weight: bold; background: #8b2f2f; color: white;"
+        )
+        self.apply_removals_button.clicked.connect(self._apply_removals)
+        button_row.addWidget(self.apply_removals_button)
+
+        finished_button = QPushButton("Finished")
+        finished_button.setStyleSheet("font-weight: bold;")
+        finished_button.clicked.connect(self.accept)
+        button_row.addWidget(finished_button)
+
+        button_row.addStretch(1)
+        tab_layout.addLayout(button_row)
+
+        self._remove_container_layout = container_layout
+        self._remove_scroll = scroll
+        self._remove_tab_widget = tab
+
+        self.tabs.addTab(tab, "Remove / Drop")
+        self._rebuild_remove_tab()
+
+    def _rebuild_remove_tab(self) -> None:
+        layout = self._remove_container_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.staged_ritms = [r for r in self.staged_ritms if r["items"]]
+
+        if not self.staged_ritms:
+            layout.addWidget(QLabel(
+                "(No RITMs staged yet. Assign a RITM in the Request Item "
+                "or Both tab to create one.)"
+            ))
+            layout.addStretch(1)
+            self.apply_removals_button.setEnabled(False)
+            self._remove_checkboxes = []
+            return
+
+        self.apply_removals_button.setEnabled(True)
+
+        self._remove_checkboxes: list[tuple[PackingListRecord, list[QCheckBox]]] = []
+
+        for record in self.staged_ritms:
+            ritm_label = record["ritm"] or "(no request item)"
+            group = QGroupBox(
+                f"RITM {ritm_label} — "
+                f"{len(record['items'])} item(s)"
+            )
+            group_layout = QVBoxLayout(group)
+            boxes: list[QCheckBox] = []
+            for item in record["items"]:
+                box = QCheckBox(
+                    f"{item['description']}  ({item['type']}, "
+                    f"net {item['net']:,})"
+                )
+                box.setChecked(False)
+                group_layout.addWidget(box)
+                boxes.append(box)
+            self._remove_checkboxes.append((record, boxes))
+            layout.addWidget(group)
+
+        layout.addStretch(1)
+
+    # ------------------------------------------------------------------
+    # Apply assignment
+    # ------------------------------------------------------------------
+
+    def _checked_items(self, list_widget: QListWidget) -> list[ItemRecord]:
+        wanted_ids: set[int] = set()
+        for row in range(list_widget.count()):
+            entry = list_widget.item(row)
+            if entry.checkState() == Qt.CheckState.Checked:
+                wanted_ids.add(int(entry.data(Qt.ItemDataRole.UserRole)))
+        if not wanted_ids:
+            return []
+        return [item for item in self.unmatched_items if id(item) in wanted_ids]
+
+    def _apply(self, mode: str) -> None:
+        current_tab = self.tabs.currentIndex()
+        if current_tab >= len(self.lists):
+            return
+        list_widget = self.lists[current_tab]
+        items = self._checked_items(list_widget)
+
+        if not items:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "Check at least one item before applying.",
+            )
+            return
+
+        location = ""
+        ritm = ""
+        if mode == "apply_location":
+            location = self.location_input.text().strip()
+        elif mode == "apply_ritm":
+            ritm = self.ritm_input.text().strip()
+            if not ritm:
+                QMessageBox.information(
+                    self, "No RITM entered",
+                    "Type a Request Item number before applying.",
+                )
+                return
+        elif mode == "apply_both":
+            location = self.both_location_input.text().strip()
+            ritm = self.both_ritm_input.text().strip()
+            if not location and not ritm:
+                QMessageBox.information(
+                    self, "Nothing to apply",
+                    "Enter a location and/or a Request Item before applying.",
+                )
+                return
+
+        if location:
+            for item in items:
+                item["_address"] = location
+        if ritm:
+            for item in items:
+                item["_ritm"] = ritm
+            self._move_items_to_ritm(items, ritm, location)
+
+        # Only clear the LOCATION inputs. Keep the RITM text so a
+        # subsequent Rescan (Type -> Apply -> Rescan) still has it.
+        self.location_input.clear()
+        self.both_location_input.clear()
+
+        if not self.unmatched_items:
+            self.status_label.setText(
+                "All items assigned. Click Finished to close."
+            )
+        else:
+            self.status_label.setText(
+                f"Applied to {len(items)} item(s). "
+                f"{len(self.unmatched_items)} unmatched item(s) remain."
+            )
+
+    def _move_items_to_ritm(
+        self,
+        items: list[ItemRecord],
+        ritm: str,
+        location: str,
+    ) -> None:
+        moved_ids = {id(item) for item in items}
+
+        # Remove moved items from the pool FIRST. This is the ONLY way
+        # items leave self.unmatched_items.
+        self.unmatched_items = [
+            item for item in self.unmatched_items if id(item) not in moved_ids
+        ]
+        self._refresh_all_assignment_lists()
+
+        # Find or create the staged RITM.
+        ritm_key = ritm.casefold()
+        target = None
+        for r in self.staged_ritms:
+            if (r["ritm"] or "").casefold() == ritm_key:
+                target = r
+                break
+
+        if target is None:
+            sources = self._sources_for_ritm(ritm)
+            # Backfill location from matched source if the user did not
+            # type one.
+            matched_location_address = ""
+            matched_location = ""
+            for match in sources:
+                if match.location_address:
+                    matched_location_address = match.location_address
+                    matched_location = match.location
+                    break
+            new_ritm: PackingListRecord = {
+                "group": ritm_key,
+                "ritm": ritm,
+                "letter": "",
+                "date": self._template["date"],
+                "packing_list": self._template["packing_list"],
+                "location": (
+                    self._location_from_address(location) if location
+                    else matched_location
+                ),
+                "location_address": location or matched_location_address,
+                "driver_plate": self._template["driver_plate"],
+                "items": [],
+                "source_matches": list(sources),
+            }
+            self.staged_ritms.append(new_ritm)
+            target = new_ritm
+
+        for item in items:
+            item["_ritm"] = ritm
+            if location and not item.get("_address"):
+                item["_address"] = location
+        target["items"].extend(items)
+        if location and not target["location_address"]:
+            target["location_address"] = location
+            target["location"] = self._location_from_address(location)
+
+        self._rebuild_remove_tab()
+
+    def _sources_for_ritm(self, ritm: str) -> list[ExactMatch]:
+        ritm_key = ritm.casefold()
+        matches = [
+            match for match in self._subject_matches
+            if any(r.casefold() == ritm_key for r in match.subject_ritms)
+        ]
+        matches.extend(
+            match for match in self._last_rescan_matches
+            if any(r.casefold() == ritm_key for r in match.subject_ritms)
+        )
+        return _dedupe_matches(matches)
+
+    def _another_batch(self) -> None:
+        self.location_input.clear()
+        self.ritm_input.clear()
+        self.both_location_input.clear()
+        self.both_ritm_input.clear()
+        self.status_label.setText(
+            "New batch started. Check items and enter the next values."
+        )
+
+    # ------------------------------------------------------------------
+    # Rescan
+    # ------------------------------------------------------------------
+
+    def _do_rescan(self, ritm: str) -> None:
+        ritm = (ritm or "").strip()
+        if not ritm:
+            QMessageBox.information(
+                self, "No RITM entered",
+                "Type a Request Item number in the field above before "
+                "rescanning.",
+            )
+            return
+
+        # Build the term list: descriptions of every item currently
+        # unmatched plus every item already in the matching staged RITM
+        # (if any). Then ALWAYS append the RITM itself — that's what makes
+        # the scan find emails whose subject/body/filename contain the
+        # RITM even when the item descriptions aren't in the attachment
+        # text.
+        term_set: list[str] = []
+        seen_terms: set[str] = set()
+        for item in self.unmatched_items:
+            desc = item["description"].strip()
+            if desc and desc.casefold() not in seen_terms:
+                seen_terms.add(desc.casefold())
+                term_set.append(desc)
+        for r in self.staged_ritms:
+            if (r["ritm"] or "").casefold() != ritm.casefold():
+                continue
+            for item in r["items"]:
+                desc = item["description"].strip()
+                if desc and desc.casefold() not in seen_terms:
+                    seen_terms.add(desc.casefold())
+                    term_set.append(desc)
+
+        # Include the RITM itself as a search term.
+        if ritm.casefold() not in seen_terms:
+            seen_terms.add(ritm.casefold())
+            term_set.append(ritm)
+
+        if not term_set:
+            QMessageBox.information(
+                self, "Nothing to search",
+                "Add items or a RITM with items before rescanning.",
+            )
+            return
+
+        self.status_label.setText(
+            f"Rescanning Outlook for {len(term_set)} item description(s) "
+            f"matching {ritm}..."
+        )
+        QApplication.processEvents()
+
+        try:
+            import improvedScanner
+            with tempfile.TemporaryDirectory(prefix="rescan-") as temp_dir:
+                report_path = Path(temp_dir) / "rescan.txt"
+                results_path = Path(temp_dir) / "rescan.json"
+                improvedScanner.run_scan(
+                    self._time_range,
+                    term_set,
+                    str(report_path),
+                    str(results_path),
+                )
+                results = json.loads(results_path.read_text(encoding="utf-8"))
+        except Exception as error:
+            QMessageBox.critical(self, "Rescan failed", str(error))
+            self.status_label.setText("Rescan failed.")
+            return
+
+        new_matches: list[ExactMatch] = [
+            ExactMatch(
+                term=entry["term"],
+                filename=entry["filename"],
+                folder=entry["folder"],
+                subject=entry["subject"],
+                received=entry["received"],
+                sender=entry.get("sender", ""),
+                sender_email=entry.get("sender_email", ""),
+                entry_id=entry.get("entry_id", ""),
+                store_id=entry.get("store_id", ""),
+                ritms=entry.get("ritms", []),
+                subject_ritms=entry.get("subject_ritms", []),
+                location=entry.get("location", ""),
+                location_address=entry.get("location_address", ""),
+            )
+            for entry in results["exact_matches"]
+        ]
+
+        ritm_key = ritm.casefold()
+        # Accept a hit if the RITM appears anywhere the scanner looked:
+        # subject, body/attachment ritms, OR because the RITM itself was
+        # one of the search terms that matched.
+        hits = _dedupe_matches([
+            match for match in new_matches
+            if (
+                any(r.casefold() == ritm_key for r in match.subject_ritms)
+                or any(r.casefold() == ritm_key for r in match.ritms)
+                or match.term.casefold() == ritm_key
+            )
+        ])
+
+        if not hits:
+            self.status_label.setText(
+                f"Rescan found no emails mentioning {ritm}. "
+                "The RITM will be exported without a source PDF."
+            )
+            return
+
+        # Attach to any staged RITM with this number, or stash for later.
+        self._last_rescan_matches.extend(hits)
+        attached = 0
+        for r in self.staged_ritms:
+            if (r["ritm"] or "").casefold() != ritm_key:
+                continue
+            current = list(r.get("source_matches") or [])
+            seen = {(m.entry_id, m.filename, m.term) for m in current}
+            for match in hits:
+                key = (match.entry_id, match.filename, match.term)
+                if key in seen:
+                    continue
+                seen.add(key)
+                current.append(match)
+                attached += 1
+            r["source_matches"] = current
+            if not r["location_address"]:
+                for match in hits:
+                    if match.location_address:
+                        r["location_address"] = match.location_address
+                        r["location"] = match.location
+                        break
+
+        # Notify parent so the main window can:
+        #   1. update already-committed records for this RITM
+        #   2. push the found emails into the reply table right away
+        self.rescan_found_sources.emit(
+            (ritm, list(hits), self._template["packing_list"])
+        )
+
+        self.status_label.setText(
+            f"Rescan found {len(hits)} source email(s) for {ritm}"
+            + (f"; {attached} new attachment(s) attached." if attached else ".")
+        )
+
+    # ------------------------------------------------------------------
+    # Apply removals
+    # ------------------------------------------------------------------
+
+    def _apply_removals(self) -> None:
+        if not getattr(self, "_remove_checkboxes", None):
+            return
+
+        any_checked = False
+        newly_freed: list[ItemRecord] = []
+
+        for record, boxes in self._remove_checkboxes:
+            drop_indexes = [i for i, box in enumerate(boxes) if box.isChecked()]
+            if not drop_indexes:
+                continue
+            any_checked = True
+            drop_set = set(drop_indexes)
+            kept = [item for i, item in enumerate(record["items"]) if i not in drop_set]
+            freed = [item for i, item in enumerate(record["items"]) if i in drop_set]
+            record["items"] = kept
+            for item in freed:
+                item["_ritm"] = ""
+            newly_freed.extend(freed)
+
+        if not any_checked:
+            QMessageBox.information(
+                self, "Nothing selected",
+                "Check at least one item to remove.",
+            )
+            return
+
+        self.unmatched_items.extend(newly_freed)
+        self._refresh_all_assignment_lists()
+        self._rebuild_remove_tab()
+
+        self.status_label.setText(
+            f"Pulled {len(newly_freed)} item(s) back into the unmatched pool. "
+            f"{len(self.unmatched_items)} unmatched item(s) available."
+        )
+        self.tabs.setCurrentIndex(0)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _location_from_address(address: str) -> str:
+        parts = [p.strip() for p in address.split(",")]
+        if len(parts) < 2:
+            return ""
+        city_state = ", ".join(parts[1:])
+        city_state = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", city_state).strip()
+        return city_state.replace(",", "")
+
+
+# ---------------------------------------------------------------------------
+# Near-match confirmation dialog
+# ---------------------------------------------------------------------------
+
+class NearMatchConfirmDialog(QDialog):
+    def __init__(self, parent, candidate: NearMatch, index: int, total: int) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Possible item match ({index} of {total})")
+        self.setMinimumWidth(560)
+
+        self.accepted: bool = False
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Your item description:"))
+        mine = QLabel(candidate.term)
+        mine.setStyleSheet("font-weight: bold; font-size: 12pt; padding: 4px;")
+        layout.addWidget(mine)
+
+        layout.addWidget(QLabel("Close match found in email attachment:"))
+        theirs = QLabel(candidate.guess)
+        theirs.setStyleSheet("font-weight: bold; font-size: 12pt; padding: 4px;")
+        layout.addWidget(theirs)
+
+        detail = QLabel(
+            f"Similarity: {candidate.similarity:.0%}\n"
+            f"File: {candidate.folder} / {candidate.filename}\n"
+            f"Email: {candidate.subject}\n"
+            f"Received: {candidate.received}"
+        )
+        detail.setStyleSheet("color: #53645e; padding-top: 6px;")
+        layout.addWidget(detail)
+
+        layout.addWidget(QLabel("\nAre these the same item?"))
+
+        buttons = QDialogButtonBox()
+        same_button = buttons.addButton(
+            "Same", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        not_same_button = buttons.addButton(
+            "Not the same", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        same_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white; padding: 6px 16px;"
+        )
+        not_same_button.setStyleSheet("padding: 6px 16px;")
+        buttons.accepted.connect(self._on_same)
+        buttons.rejected.connect(self._on_not_same)
+        layout.addWidget(buttons)
+
+    def _on_same(self) -> None:
+        self.accepted = True
+        self.accept()
+
+    def _on_not_same(self) -> None:
+        self.accepted = False
+        self.reject()
+
+
+# ---------------------------------------------------------------------------
+# Resend picker dialog
+# ---------------------------------------------------------------------------
+
+class ResendPickerDialog(QDialog):
+    def __init__(
+        self,
+        parent,
+        ritm: str,
+        older: ExactMatch,
+        newer: ExactMatch,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Duplicate RITM detected: {ritm}")
+        self.setMinimumWidth(1000)
+        self.chosen: ExactMatch | None = None
+        self.older = older
+        self.newer = newer
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"RITM {ritm} was found in two emails. "
+            "The newer email is preselected. Review both and pick one, "
+            "or choose 'Skip this RITM' to leave it out of the queue."
+        ))
+
+        columns = QHBoxLayout()
+
+        def make_column(title: str, match: ExactMatch, is_newer: bool) -> QWidget:
+            box = QGroupBox(title)
+            box_layout = QVBoxLayout(box)
+
+            def add_field(label: str, value: str) -> None:
+                row = QHBoxLayout()
+                tag = QLabel(f"{label}:")
+                tag.setStyleSheet("font-weight: bold;")
+                tag.setFixedWidth(80)
+                row.addWidget(tag)
+                body = QLabel(value or "(none)")
+                body.setWordWrap(True)
+                row.addWidget(body, 1)
+                box_layout.addLayout(row)
+
+            add_field("Received", match.received)
+            add_field("From", f"{match.sender} <{match.sender_email}>")
+            add_field("Subject", match.subject)
+            add_field("Folder", match.folder)
+            add_field("File", match.filename)
+            add_field("Terms", ", ".join(sorted({match.term})))
+
+            if is_newer:
+                box.setStyleSheet(
+                    "QGroupBox { border: 2px solid #315b52; border-radius: 4px; "
+                    "margin-top: 8px; padding-top: 10px; }"
+                    "QGroupBox::title { subcontrol-origin: margin; "
+                    "subcontrol-position: top left; padding: 0 6px; "
+                    "color: #315b52; font-weight: bold; }"
+                )
+            return box
+
+        self.radio_older = QRadioButton("Use OLDER")
+        self.radio_newer = QRadioButton("Use NEWER")
+        self.radio_newer.setChecked(True)
+
+        older_col = QVBoxLayout()
+        older_col.addWidget(self.radio_older)
+        older_col.addWidget(make_column("OLDER email", older, is_newer=False))
+        columns.addLayout(older_col, 1)
+
+        newer_col = QVBoxLayout()
+        newer_col.addWidget(self.radio_newer)
+        newer_col.addWidget(make_column("NEWER email", newer, is_newer=True))
+        columns.addLayout(newer_col, 1)
+
+        layout.addLayout(columns)
+
+        buttons = QDialogButtonBox()
+        use_btn = buttons.addButton(
+            "Use selected", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        skip_btn = buttons.addButton(
+            "Skip this RITM", QDialogButtonBox.ButtonRole.RejectRole
+        )
+        use_btn.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white; padding: 6px 16px;"
+        )
+        buttons.accepted.connect(self._on_use)
+        buttons.rejected.connect(self._on_skip)
+        layout.addWidget(buttons)
+
+    def _on_use(self) -> None:
+        self.chosen = self.newer if self.radio_newer.isChecked() else self.older
+        self.accept()
+
+    def _on_skip(self) -> None:
+        self.chosen = None
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Rename preview dialog
+# ---------------------------------------------------------------------------
+
+class RenamePreviewDialog(QDialog):
+    def __init__(self, parent, plans: list[dict]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Rename Files")
+        self.setMinimumWidth(820)
+        self.setMinimumHeight(520)
+
+        self.plans = plans
+        self.checkboxes: list[QCheckBox] = []
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Uncheck any file you don't want renamed, then click Apply."
+        ))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(6, 6, 6, 6)
+
+        for plan in plans:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 2, 0, 2)
+
+            box = QCheckBox()
+            can_rename = bool(plan["new_name"]) and plan["new_name"] != plan["old_name"]
+            box.setChecked(can_rename)
+            box.setEnabled(can_rename)
+            self.checkboxes.append(box)
+            row_layout.addWidget(box)
+
+            if can_rename:
+                label_text = (
+                    f"{plan['old_name']}\n"
+                    f"    -> {plan['new_name']}\n"
+                    f"    ({plan['reason']})"
+                )
+            else:
+                label_text = (
+                    f"{plan['old_name']}\n"
+                    f"    -> (skipped: {plan['reason']})"
+                )
+            label = QLabel(label_text)
+            if not can_rename:
+                label.setStyleSheet("color: #9baea6;")
+            row_layout.addWidget(label, 1)
+
+            container_layout.addWidget(row)
+
+        container_layout.addStretch(1)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Apply")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_plans(self) -> list[dict]:
+        chosen: list[dict] = []
+        for box, plan in zip(self.checkboxes, self.plans):
+            if box.isChecked() and plan["new_name"]:
+                chosen.append(plan)
+        return chosen
+
+
+# ---------------------------------------------------------------------------
+# Source match picker dialog
+# ---------------------------------------------------------------------------
+
+class SourceMatchPickerDialog(QDialog):
+    def __init__(self, parent, identifier: str, matches: list[ExactMatch]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Choose source email for {identifier}")
+        self.setMinimumWidth(600)
+        self.chosen: ExactMatch | None = None
+        self.matches: list[ExactMatch] = list(matches)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"This load matched multiple emails. Which one should the "
+            f"'Request Item for Load {identifier}' PDF come from?"
+        ))
+
+        self.radios: list[QRadioButton] = []
+        for index, match in enumerate(self.matches):
+            label = (
+                f"{match.subject}\n"
+                f"   From:   {match.sender} <{match.sender_email}>\n"
+                f"   Folder: {match.folder}\n"
+                f"   File:   {match.filename}\n"
+                f"   Recv:   {match.received}"
+            )
+            radio = QRadioButton(label)
+            if index == 0:
+                radio.setChecked(True)
+            layout.addWidget(radio)
+            self.radios.append(radio)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_ok)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_ok(self) -> None:
+        for index, radio in enumerate(self.radios):
+            if radio.isChecked():
+                self.chosen = self.matches[index]
+                break
+        self.accept()
+
+
+# ---------------------------------------------------------------------------
+# Input-sheet parsing / template handling
+# ---------------------------------------------------------------------------
+def template_path() -> Path:
+    return get_resource_path(str(TEMPLATE_RELATIVE_PATH))
+
+
+def working_dir() -> Path:
+    return get_user_dir() / WORKING_DIR_RELATIVE_PATH
+
+
+def copy_template_to_working(preferred_dir: Path | None = None) -> Path:
+    src = template_path()
+    if not src.exists():
+        raise FileNotFoundError(
+            f"Input template not found: {src}\n"
+            f"Put 'Incoming Packing List.xls' in the 'Excel Bases' folder."
+        )
+
+    if preferred_dir is not None and Path(preferred_dir).is_dir():
+        dst_dir = Path(preferred_dir)
+    elif working_dir().is_dir():
+        dst_dir = working_dir()
+    else:
+        dst_dir = Path(__file__).resolve().parent
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    dst = dst_dir / f"Incoming Packing List {timestamp}.xls"
+
+    counter = 1
+    while dst.exists():
+        dst = dst_dir / f"Incoming Packing List {timestamp} ({counter}).xls"
+        counter += 1
+
+    shutil.copy2(src, dst)
+    return dst
+
+
+def _cell_str(sheet, address: str) -> str:
+    value = sheet.Range(address).Value
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _to_int(value: object) -> int:
+    if not isinstance(value, (str, int, float)):
+        return 0
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _normalize_excel_date(value: object) -> str:
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        raise ValueError(f"The Date cell ({IN_DATE}) is empty.")
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(
+        f"Could not read the Date cell ({IN_DATE}): {text!r}. "
+        "Use YYYY-MM-DD or MM/DD/YYYY."
+    )
+
+
+@_timed
+def parse_incoming_packing_list(path: str | Path) -> PackingListRecord:
+    _log_marker(f"parse_incoming_packing_list START {path}")
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input sheet not found: {path}")
+
+    excel = None
+    workbook = None
+    try:
+        _log_marker("parse: DispatchEx")
+        excel = win32com.client.DispatchEx("Excel.Application")
+        _tune_excel_for_batch(excel)
+        _log_marker("parse: Workbooks.Open")
+        workbook = excel.Workbooks.Open(str(path), UpdateLinks=0, ReadOnly=True)
+        try:
+            sheet = workbook.Worksheets(INPUT_SHEET_NAME)
+        except Exception:
+            sheet = workbook.Worksheets(1)
+
+        _log_marker("parse: reading header cells")
+        date_iso = _normalize_excel_date(sheet.Range(IN_DATE).Value)
+        packing_list = _cell_str(sheet, IN_PACKING_LIST)
+        if not packing_list:
+            raise ValueError(
+                f"The Packing List cell ({IN_PACKING_LIST}) is empty. "
+                "Fill in something like FRN260914-1R."
+            )
+        plate = _cell_str(sheet, IN_PLATE)
+        cont = _cell_str(sheet, IN_CONT)
+
+        _log_marker("parse: reading item block in one call")
+        rows_count = IN_LAST_ITEM_ROW - IN_FIRST_ITEM_ROW + 1
+        cols_count = 5
+        raw = _read_block(sheet, IN_FIRST_ITEM_ROW, 2, IN_LAST_ITEM_ROW, 6)
+        grid = _as_grid(raw, rows_count, cols_count)
+
+        items: list[ItemRecord] = []
+        for row_values in grid:
+            description = str(row_values[0] or "").strip()
+            if not description:
+                continue
+            material = str(row_values[2] or "").strip()
+            gross = _to_int(row_values[3])
+            tare = _to_int(row_values[4])
+            items.append({
+                "description": description,
+                "type": normalize_item_type(material),
+                "gross": gross,
+                "tare": tare,
+                "net": gross - tare,
+            })
+        _log_marker(f"parse: items done ({len(items)})")
+
+        if not items:
+            raise ValueError(
+                f"No item rows were found in "
+                f"{IN_DESC_COL}{IN_FIRST_ITEM_ROW}:"
+                f"{IN_DESC_COL}{IN_LAST_ITEM_ROW} (column {IN_DESC_COL} "
+                "is blank everywhere)."
+            )
+
+        driver_plate = plate
+        if cont:
+            driver_plate = f"{plate} / {cont}" if plate else cont
+
+        return {
+            "group": "",
+            "ritm": "",
+            "letter": "",
+            "date": date_iso,
+            "packing_list": packing_list,
+            "location": "",
+            "location_address": "",
+            "driver_plate": driver_plate,
+            "items": items,
+        }
+    finally:
+        _log_marker("parse: releasing Excel")
+        _release_excel(excel, workbook)
+
+
+# ---------------------------------------------------------------------------
+# Output template writers
+# ---------------------------------------------------------------------------
+
+@_timed
+def write_packing_list_template(
+    record: PackingListRecord,
+    destination: Path,
+    excel=None,
+) -> Path:
+    _log_marker(f"write_packing_list START {destination.name}")
+    template = get_resource_path("Excel Bases/packing list example.xls")
+    if not template.exists():
+        raise FileNotFoundError(f"Packing-list template not found: {template}")
+    if len(record["items"]) > MAX_ITEMS_PER_LOAD:
+        raise ValueError(
+            "The packing-list template has 23 item rows; split this RITM "
+            "into another letter."
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(template, destination)
+
+    owns_excel = excel is None
+    excel_local = excel
+    workbook = None
+    try:
+        if owns_excel:
+            _log_marker("write_packing_list: DispatchEx (owns)")
+            excel_local = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel_local)
+
+        _log_marker("write_packing_list: Workbooks.Open")
+        workbook = excel_local.Workbooks.Open(
+            str(destination), UpdateLinks=0, ReadOnly=False
+        )
+        sheet = workbook.Worksheets("Packing List")
+
+        _log_marker("write_packing_list: writing header")
+        _safe_write(
+            sheet, "H8",
+            datetime.combine(parse_date(record["date"]), datetime.min.time()),
+        )
+        sheet.Range("H8").NumberFormat = "mm/dd/yyyy"
+        _safe_write(sheet, "H9", record["location"].strip() or "No Location")
+        _safe_write(sheet, "H10", _packing_list_identifier(record))
+
+        _log_marker("write_packing_list: writing item block in one call")
+        num_rows = MAX_ITEMS_PER_LOAD
+        grid = [["" for _ in range(9)] for _ in range(num_rows)]
+        for i, item in enumerate(record["items"]):
+            if i >= num_rows:
+                break
+            description = item["description"]
+            if item["type"]:
+                description = f"{description} ({item['type']})"
+            grid[i][0] = description
+            grid[i][6] = item["gross"]
+            grid[i][7] = item["tare"]
+            grid[i][8] = item["net"]
+
+        block = sheet.Range(
+            sheet.Cells(13, 2),
+            sheet.Cells(13 + num_rows - 1, 10),
+        )
+        try:
+            if block.MergeCells:
+                raise RuntimeError("merged block")
+            block.Value = grid
+        except Exception:
+            for i, item in enumerate(record["items"]):
+                row = 13 + i
+                description = item["description"]
+                if item["type"]:
+                    description = f"{description} ({item['type']})"
+                _safe_write(sheet, f"B{row}", description)
+                _safe_write(sheet, f"H{row}", item["gross"])
+                _safe_write(sheet, f"I{row}", item["tare"])
+                _safe_write(sheet, f"J{row}", item["net"])
+
+        _log_marker("write_packing_list: Save")
+        workbook.Save()
+    finally:
+        if owns_excel:
+            _log_marker("write_packing_list: releasing own Excel")
+            _release_excel(excel_local, workbook)
+        else:
+            if workbook is not None:
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
+    return destination
+
+
+@_timed
+def write_scrap_pickup_template(
+    record: PackingListRecord,
+    destination: Path,
+    excel=None,
+) -> Path:
+    _log_marker(f"write_scrap START {destination.name}")
+    template = get_resource_path("Excel Bases/Scrap Pick Up Request for Load.xls")
+    if not template.exists():
+        raise FileNotFoundError(f"Scrap pickup template not found: {template}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(template, destination)
+
+    owns_excel = excel is None
+    excel_local = excel
+    workbook = None
+    try:
+        if owns_excel:
+            _log_marker("write_scrap: DispatchEx (owns)")
+            excel_local = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel_local)
+
+        _log_marker("write_scrap: Workbooks.Open")
+        workbook = excel_local.Workbooks.Open(
+            str(destination), UpdateLinks=0, ReadOnly=False
+        )
+        sheet = workbook.Worksheets("SCRAPREM")
+        _log_marker("write_scrap: writing cells")
+        request_date = datetime.combine(parse_date(record["date"]), datetime.min.time())
+        for address in ("D15", "D33"):
+            _safe_write(sheet, address, request_date)
+            sheet.Range(address).NumberFormat = "mm/dd/yyyy"
+
+        location_parts = [
+            part.strip() for part in record["location_address"].split(",")
+        ]
+        if record["location_address"].strip() and location_parts[0]:
+            street = location_parts[0]
+            city = ", ".join(location_parts[1:]).strip()
+            if not city:
+                city = record["location"].strip()
+        else:
+            street = "No Location"
+            city = ""
+
+        _safe_write(sheet, "F16", record["ritm"] or "No Request Item")
+        _safe_write(sheet, "D19", street)
+        _safe_write(sheet, "D20", city)
+        _safe_write(sheet, "D34", _packing_list_identifier(record))
+        _safe_write(sheet, "D35", record["driver_plate"].replace(" / ", "# "))
+        _log_marker("write_scrap: Save")
+        workbook.Save()
+    finally:
+        if owns_excel:
+            _log_marker("write_scrap: releasing own Excel")
+            _release_excel(excel_local, workbook)
+        else:
+            if workbook is not None:
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
+    return destination
+
+
+# ---------------------------------------------------------------------------
+# Helpers used by the reel summary
+# ---------------------------------------------------------------------------
+
+def _packing_list_identifier(record: PackingListRecord) -> str:
+    letter = (record.get("letter") or "").strip()
+    if letter:
+        return f"{record['packing_list']}-{letter}"
+    return record["packing_list"]
+
+
+def _split_driver_and_plate(value: str) -> tuple[str, str]:
+    if "/" not in value:
+        return value.strip(), ""
+    driver, plate = value.split("/", 1)
+    return driver.strip(), plate.strip()
+
+
+def _split_reel_id(description: str) -> tuple[str, str]:
+    cleaned = description.strip()
+    match = re.fullmatch(r"(.*\d)([A-Za-z]+)", cleaned)
+    if match is None:
+        return cleaned, ""
+    return match.group(1), match.group(2).upper()
+
+
+def _reel_summary_sort_key(record: PackingListRecord) -> tuple[int, int, str, str]:
+    frn_date, _reason = _date_from_frn(record["packing_list"])
+    if frn_date is None:
+        try:
+            frn_date = parse_date(record["date"])
+        except Exception:
+            frn_date = date(2000, 1, 1)
+    receiving_date = frn_date.toordinal()
+    reel_number = re.search(r"-(\d+)R(?:-|$)", record["packing_list"], re.IGNORECASE)
+    reel_order = int(reel_number.group(1)) if reel_number else 1_000_000
+    letter = (record.get("letter") or "").strip().casefold()
+    return (
+        receiving_date,
+        reel_order,
+        letter,
+        _packing_list_identifier(record).casefold(),
+    )
+
+
+def _read_reel_summary_record(sheet) -> PackingListRecord | None:
+    identifier = str(sheet.Range("M2").Value or "").strip()
+    if not identifier:
+        return None
+
+    identifier_parts = re.fullmatch(r"(.+)-([A-Za-z]+)", identifier)
+    if identifier_parts is None:
+        packing_list, letter = identifier, ""
+    else:
+        packing_list, letter = identifier_parts.groups()
+
+    received = sheet.Range("M4").Value
+    if isinstance(received, datetime):
+        normalized_date = received.date().isoformat()
+    elif isinstance(received, date):
+        normalized_date = received.isoformat()
+    else:
+        normalized_date = parse_date(str(received)).isoformat()
+
+    rows_count = 31
+    cols_count = 5
+    raw = _read_block(sheet, 12, 4, 42, 8)
+    grid = _as_grid(raw, rows_count, cols_count)
+
+    items: list[ItemRecord] = []
+    for row_values in grid:
+        reel_id = str(row_values[0] or "").strip()
+        if not reel_id:
+            continue
+        reel_size = str(row_values[1] or "").strip()
+        gross = int(float(row_values[3] or 0))
+        tare = int(float(row_values[4] or 0))
+        items.append({
+            "description": f"{reel_id}{reel_size}",
+            "type": str(row_values[2] or "").strip(),
+            "gross": gross,
+            "tare": tare,
+            "net": gross - tare,
+        })
+
+    trucker = str(sheet.Range("F8").Value or "").strip()
+    trailer = str(sheet.Range("F9").Value or "").strip()
+    return {
+        "group": "",
+        "ritm": str(sheet.Range("M5").Value or "").strip(),
+        "letter": letter,
+        "date": normalized_date,
+        "packing_list": packing_list,
+        "location": str(sheet.Range("C7").Value or "").strip(),
+        "location_address": "",
+        "driver_plate": f"{trucker} / {trailer}" if trucker or trailer else "",
+        "items": items,
+    }
+
+
+def _reel_sheet_names_in_book(workbook) -> set[str]:
+    return {sheet.Name.casefold() for sheet in workbook.Worksheets}
+
+
+def _is_reel_sheet_name(name: str) -> bool:
+    return re.fullmatch(r"\d+R(?:\s*\(\d+\))?", name, re.IGNORECASE) is not None
+
+
+def _next_free_r_number(existing_names: set[str]) -> int:
+    n = 1
+    while f"{n}r" in existing_names:
+        n += 1
+    return n
+
+
+def _copy_template_reel_tabs(
+    workbook,
+    template_workbook,
+    count: int,
+) -> list[Any]:
+    source_sheet = None
+    for sheet in template_workbook.Worksheets:
+        if _is_reel_sheet_name(sheet.Name):
+            source_sheet = sheet
+            break
+    if source_sheet is None:
+        raise ValueError(
+            "The Reel Summary template has no numbered R tabs to copy from."
+        )
+
+    created: list[Any] = []
+    existing_names = _reel_sheet_names_in_book(workbook)
+    after_sheet = workbook.Worksheets(workbook.Worksheets.Count)
+
+    for _ in range(count):
+        n = _next_free_r_number(existing_names)
+        source_sheet.Copy(After=after_sheet)
+        new_sheet = workbook.Worksheets(workbook.Worksheets.Count)
+        new_sheet.Name = f"__NEW_R_{n}"
+        existing_names.add(f"__new_r_{n}".casefold())
+        after_sheet = new_sheet
+        created.append(new_sheet)
+        for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
+            _safe_write(new_sheet, address, "")
+        _clear_item_range(new_sheet, 12, 42, 4, 8)
+
+    return created
+
+
+@_timed
+def write_reel_summary_report(
+    records: list[PackingListRecord],
+    destination: Path,
+    excel=None,
+) -> Path:
+    _log_marker(f"write_reel_summary START {destination.name} ({len(records)} records)")
+    template = get_resource_path("Excel Bases/Reel Summary Report.XLS")
+    if not template.exists():
+        raise FileNotFoundError(f"Reel Summary template not found: {template}")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_path = destination if destination.exists() else template
+    descriptor, staged_name = tempfile.mkstemp(
+        prefix=".reel-summary-", suffix=destination.suffix or ".xls", dir=destination.parent
+    )
+    os.close(descriptor)
+    staged_path = Path(staged_name)
+
+    owns_excel = excel is None
+    excel_local = excel
+    workbook = None
+    template_workbook = None
+
+    try:
+        shutil.copy2(source_path, staged_path)
+
+        if owns_excel:
+            _log_marker("write_reel_summary: DispatchEx (owns)")
+            excel_local = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(excel_local)
+
+        try:
+            _log_marker("write_reel_summary: Open staged workbook")
+            workbook = excel_local.Workbooks.Open(
+                str(staged_path), UpdateLinks=0, ReadOnly=False
+            )
+
+            _log_marker("write_reel_summary: scanning reel sheets")
+            report_records: dict[str, PackingListRecord] = {}
+            reel_sheets: list[Any] = []
+            for sheet in workbook.Worksheets:
+                is_numbered_reel_sheet = _is_reel_sheet_name(sheet.Name)
+                identifier = str(sheet.Range("M2").Value or "").strip()
+                is_populated_reel_sheet = bool(identifier) and sheet.Name.casefold().endswith("r")
+                if not is_numbered_reel_sheet and not is_populated_reel_sheet:
+                    continue
+                reel_sheets.append(sheet)
+                previous_record = _read_reel_summary_record(sheet)
+                if previous_record is not None:
+                    key = _packing_list_identifier(previous_record).casefold()
+                    report_records[key] = previous_record
+            _log_marker(f"write_reel_summary: found {len(reel_sheets)} reel sheets")
+
+            if not reel_sheets:
+                raise ValueError("The selected workbook does not contain any numbered R tabs.")
+
+            for record in records:
+                identifier = _packing_list_identifier(record)
+                if not identifier:
+                    raise ValueError("A queued packing list is missing its packing-list number.")
+                report_records[identifier.casefold()] = record
+
+            ordered_records = sorted(report_records.values(), key=_reel_summary_sort_key)
+
+            if any(len(record["items"]) > MAX_ITEMS_PER_SUMMARY_TAB for record in ordered_records):
+                record = next(
+                    record for record in ordered_records
+                    if len(record["items"]) > MAX_ITEMS_PER_SUMMARY_TAB
+                )
+                raise ValueError(
+                    f"{_packing_list_identifier(record)} has more reels than a "
+                    "report tab supports."
+                )
+
+            if len(ordered_records) > len(reel_sheets):
+                needed = len(ordered_records) - len(reel_sheets)
+                _log_marker(f"write_reel_summary: copying {needed} new template tabs")
+                template_workbook = excel_local.Workbooks.Open(
+                    str(template), UpdateLinks=0, ReadOnly=True
+                )
+                new_sheets = _copy_template_reel_tabs(workbook, template_workbook, needed)
+                reel_sheets.extend(new_sheets)
+
+            populated_tab_names = [
+                f"{_packing_list_identifier(record)}R" for record in ordered_records
+            ]
+            if any(len(name) > 31 for name in populated_tab_names):
+                raise ValueError("A packing-list number is too long to use as an Excel tab name.")
+
+            reel_sheet_names = {sheet.Name.casefold() for sheet in reel_sheets}
+            non_reel_sheet_names = {
+                sheet.Name.casefold()
+                for sheet in workbook.Worksheets
+                if sheet.Name.casefold() not in reel_sheet_names
+            }
+            if any(name.casefold() in non_reel_sheet_names for name in populated_tab_names):
+                raise ValueError("A packing-list tab name conflicts with another workbook tab.")
+
+            _log_marker("write_reel_summary: renaming to temporary names")
+            existing_names = {sheet.Name.casefold() for sheet in workbook.Worksheets}
+            for index, sheet in enumerate(reel_sheets, start=1):
+                temporary_name = f"__R_TEMP_{index}"
+                while temporary_name.casefold() in existing_names:
+                    temporary_name += "_"
+                sheet.Name = temporary_name
+                existing_names.add(temporary_name.casefold())
+
+            _log_marker("write_reel_summary: clearing old content (batched)")
+            for sheet in reel_sheets:
+                for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
+                    _safe_write(sheet, address, "")
+                _clear_item_range(sheet, 12, 42, 4, 8)
+            _log_marker("write_reel_summary: clear done")
+
+            _log_marker("write_reel_summary: writing records")
+            for sheet, record in zip(reel_sheets, ordered_records):
+                driver, plate = _split_driver_and_plate(record["driver_plate"])
+                _safe_write(sheet, "M2", _packing_list_identifier(record))
+                _safe_write(
+                    sheet, "M4",
+                    datetime.combine(parse_date(record["date"]), datetime.min.time()),
+                )
+                sheet.Range("M4").NumberFormat = "mm/dd/yyyy"
+                _safe_write(sheet, "M5", record["ritm"])
+                _safe_write(sheet, "C7", record["location"].strip() or "No Location")
+                _safe_write(sheet, "I7", sum(item["gross"] for item in record["items"]))
+                _safe_write(sheet, "C8", "N/A")
+                _safe_write(sheet, "F8", driver)
+                _safe_write(sheet, "C9", "N/A")
+                _safe_write(sheet, "F9", plate)
+
+                block_rows = 31
+                block_cols = 5
+                grid = [["" for _ in range(block_cols)] for _ in range(block_rows)]
+                for i, item in enumerate(record["items"]):
+                    if i >= block_rows:
+                        break
+                    reel_id, reel_size = _split_reel_id(item["description"])
+                    grid[i][0] = reel_id
+                    grid[i][1] = reel_size
+                    grid[i][2] = item["type"]
+                    grid[i][3] = item["gross"]
+                    grid[i][4] = item["tare"]
+
+                block = sheet.Range(
+                    sheet.Cells(12, 4),
+                    sheet.Cells(12 + block_rows - 1, 8),
+                )
+                try:
+                    if block.MergeCells:
+                        raise RuntimeError("merged block")
+                    block.Value = grid
+                except Exception:
+                    for i, item in enumerate(record["items"]):
+                        row = 12 + i
+                        reel_id, reel_size = _split_reel_id(item["description"])
+                        _safe_write(sheet, f"D{row}", reel_id)
+                        _safe_write(sheet, f"E{row}", reel_size)
+                        _safe_write(sheet, f"F{row}", item["type"])
+                        _safe_write(sheet, f"G{row}", item["gross"])
+                        _safe_write(sheet, f"H{row}", item["tare"])
+
+            _log_marker("write_reel_summary: final tab names")
+            for index, sheet in enumerate(reel_sheets, start=1):
+                if index <= len(ordered_records):
+                    sheet.Name = populated_tab_names[index - 1]
+                else:
+                    n = index
+                    candidate = f"{n}R"
+                    while candidate.casefold() in {
+                        s.Name.casefold() for s in workbook.Worksheets if s is not sheet
+                    }:
+                        n += 1
+                        candidate = f"{n}R"
+                    sheet.Name = candidate
+            _log_marker("write_reel_summary: CalculateFull")
+            excel_local.CalculateFull()
+            _log_marker("write_reel_summary: Save")
+            workbook.Save()
+        finally:
+            if template_workbook is not None:
+                try:
+                    template_workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            if workbook is not None:
+                try:
+                    workbook.Close(SaveChanges=False)
+                except Exception:
+                    pass
+            if owns_excel:
+                _log_marker("write_reel_summary: releasing own Excel")
+                _release_excel(excel_local, None)
+
+        os.replace(staged_path, destination)
+    finally:
+        if staged_path.exists():
+            try:
+                staged_path.unlink()
+            except Exception:
+                pass
+    return destination
+
+
+# ---------------------------------------------------------------------------
+# Scanner worker
+# ---------------------------------------------------------------------------
+
+class ScannerWorker(QThread):
+    scan_complete = Signal(object)
+    scan_failed = Signal(str)
+
+    def __init__(self, time_range: str, search_terms: list[str]) -> None:
+        super().__init__()
+        self.time_range = time_range
+        self.search_terms = list(dict.fromkeys(
+            term.strip() for term in search_terms if term.strip()
+        ))
+
+    def run(self) -> None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="packing-list-scan-") as temp_dir:
+                report_path = Path(temp_dir) / "scan_results.txt"
+                results_path = Path(temp_dir) / "scan_results.json"
+
+                import improvedScanner
+                improvedScanner.run_scan(
+                    self.time_range,
+                    self.search_terms,
+                    str(report_path),
+                    str(results_path),
+                )
+
+                results = json.loads(results_path.read_text(encoding="utf-8"))
+                exact_matches = [
+                    ExactMatch(
+                        term=entry["term"],
+                        filename=entry["filename"],
+                        folder=entry["folder"],
+                        subject=entry["subject"],
+                        received=entry["received"],
+                        sender=entry.get("sender", ""),
+                        sender_email=entry.get("sender_email", ""),
+                        entry_id=entry.get("entry_id", ""),
+                        store_id=entry.get("store_id", ""),
+                        ritms=entry.get("ritms", []),
+                        subject_ritms=entry.get("subject_ritms", []),
+                        location=entry.get("location", ""),
+                        location_address=entry.get("location_address", ""),
+                    )
+                    for entry in results["exact_matches"]
+                ]
+                near_entries = {}
+                for entry in results["near_matches"]:
+                    near_match = NearMatch(
+                        term=entry["term"],
+                        guess=entry["guess"],
+                        similarity=entry["similarity"],
+                        filename=entry["filename"],
+                        folder=entry["folder"],
+                        subject=entry["subject"],
+                        received=entry["received"],
+                        subject_ritms=entry.get("subject_ritms", []),
+                    )
+                    key = (
+                        near_match.term.casefold(),
+                        near_match.folder.casefold(),
+                        near_match.filename.casefold(),
+                    )
+                    existing_match = near_entries.get(key)
+                    if existing_match is None or near_match.similarity > existing_match.similarity:
+                        near_entries[key] = near_match
+
+                exact_matches.sort(key=lambda m: (
+                    m.received, m.folder.casefold(), m.subject.casefold(),
+                    m.filename.casefold(), m.term.casefold(),
+                ))
+                near_list = list(near_entries.values())
+                near_list.sort(key=lambda m: (
+                    m.received, m.folder.casefold(), m.subject.casefold(),
+                    m.filename.casefold(), m.term.casefold(), -m.similarity,
+                ))
+                self.scan_complete.emit(ScanResults(exact_matches, near_list))
+        except Exception as error:
+            self.scan_failed.emit(str(error))
+
+
+# ---------------------------------------------------------------------------
+# Main window
+# ---------------------------------------------------------------------------
+
+class PackingListApp(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Scanner Packing Lists")
+        self.resize(1180, 900)
+        self.setMinimumSize(920, 720)
+
+        self.app_config = load_app_config()
+        self.summaries_folder = self._resolve_summaries_folder()
+
+        self.records: list[PackingListRecord] = []
+        self.exported_record_ids_by_directory: dict[str, set[str]] = {}
+        self.current_items: list[ItemRecord] = []
+        self.groups: dict[str, ScannerGroup] = {}
+        self.matched_emails_by_key: dict[str, MatchedEmail] = {}
+        self.visible_email_matches: list[MatchedEmail] = []
+        self.scan_worker: ScannerWorker | None = None
+        self.pending_record: PackingListRecord | None = None
+        self.imported_record: PackingListRecord | None = None
+        self.imported_source_path: Path | None = None
+        self.record_source_matches: dict[str, list[ExactMatch]] = {}
+        self.setStyleSheet(
+            "QMainWindow, QWidget { background: #f2f5f3; color: #20332e; }"
+            "QLabel { font-size: 10pt; }"
+            "QLineEdit { background: white; border: 1px solid #9baea6;"
+            " border-radius: 3px; padding: 8px; font-size: 10pt; }"
+            "QPushButton { background: #e2e9e5; border: 1px solid #9baea6;"
+            " border-radius: 3px; padding: 8px 12px; font-size: 10pt; }"
+            "QPushButton:hover { background: #d5e1da; }"
+            "QTableWidget { background: white; alternate-background-color: #f5f8f6;"
+            " gridline-color: #d7dfda; font-size: 10pt; }"
+            "QHeaderView::section { background: #e2e9e5; padding: 7px;"
+            " border: 0; font-weight: bold; }"
+        )
+
+        self._build_interface()
+
+    # ------------------------------------------------------------------
+    # Summaries folder
+    # ------------------------------------------------------------------
+
+    def _resolve_summaries_folder(self) -> Path:
+        configured = self.app_config.get("summaries_folder")
+        if configured:
+            p = Path(configured)
+            if p.is_dir():
+                return p
+        DEFAULT_SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+        return DEFAULT_SUMMARIES_DIR
+
+    # ------------------------------------------------------------------
+    # Interface
+    # ------------------------------------------------------------------
+
+    def _build_interface(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(22, 22, 22, 22)
+
+        title = QLabel("Scanner Packing Lists")
+        title.setStyleSheet("font-size: 18pt; font-weight: bold;")
+        root.addWidget(title)
+        hint = QLabel(
+            "Open the input sheet, fill it in Excel, then Import. "
+            "Scan afterward to match RITMs."
+        )
+        hint.setStyleSheet("color: #53645e; margin-bottom: 8px;")
+        root.addWidget(hint)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Summaries folder:"))
+        self.summaries_label = QLabel(
+            f"{self.summaries_folder}  (auto-set from the Export Folder)"
+        )
+        self.summaries_label.setStyleSheet("color: #53645e;")
+        self.summaries_label.setWordWrap(True)
+        folder_row.addWidget(self.summaries_label, 1)
+        root.addLayout(folder_row)
+
+        input_row = QHBoxLayout()
+        self.open_sheet_button = QPushButton("Open Input Sheet")
+        self.open_sheet_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        self.open_sheet_button.clicked.connect(self._open_input_sheet)
+        input_row.addWidget(self.open_sheet_button)
+
+        self.import_sheet_button = QPushButton("Import Input Sheet")
+        self.import_sheet_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        self.import_sheet_button.clicked.connect(self._import_input_sheet)
+        input_row.addWidget(self.import_sheet_button)
+
+        self.rename_files_button = QPushButton("Rename Files")
+        self.rename_files_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        self.rename_files_button.clicked.connect(self._rename_files)
+        input_row.addWidget(self.rename_files_button)
+
+        self.next_load_button = QPushButton("Next Load")
+        self.next_load_button.clicked.connect(self._next_load)
+        input_row.addWidget(self.next_load_button)
+
+        input_row.addStretch(1)
+        root.addLayout(input_row)
+
+        self.imported_info_label = QLabel("No input sheet imported yet.")
+        self.imported_info_label.setWordWrap(True)
+        self.imported_info_label.setStyleSheet("color: #53645e; margin-bottom: 8px;")
+        root.addWidget(self.imported_info_label)
+
+        toggle_row = QHBoxLayout()
+        self.manual_toggle_button = QPushButton("Show Manual Entry")
+        self.manual_toggle_button.setCheckable(True)
+        self.manual_toggle_button.toggled.connect(self._toggle_manual_entry)
+        toggle_row.addWidget(self.manual_toggle_button)
+        toggle_row.addStretch(1)
+        root.addLayout(toggle_row)
+
+        self.manual_panel = QWidget()
+        manual_root = QVBoxLayout(self.manual_panel)
+        manual_root.setContentsMargins(0, 0, 0, 0)
+
+        form = QHBoxLayout()
+        self.date_input = self._add_field(form, "Date", date.today().isoformat())
+        self.packing_list_input = self._add_field(form, "Packing List #")
+        self.driver_plate_input = self._add_field(form, "Driver / Plate #")
+        self.driver_plate_input.setPlaceholderText("e.g. Jane Doe / ABC123")
+        manual_root.addLayout(form)
+
+        item_form = QHBoxLayout()
+        self.description_input = self._add_field(item_form, "Item Description")
+        self.type_input = self._add_field(item_form, "Type")
+        self.type_input.setPlaceholderText("e.g. 99 FO, 23, Type 3, Type 4, 69S")
+        self.gross_input = self._add_weight_field(item_form, "Gross")
+        self.tare_input = self._add_weight_field(item_form, "Tare")
+        self.item_input_fields = [
+            self.description_input,
+            self.type_input,
+            self.gross_input,
+            self.tare_input,
+        ]
+        for field in self.item_input_fields:
+            field.installEventFilter(self)
+            if isinstance(field, QSpinBox):
+                field.lineEdit().installEventFilter(self)
+        self.net_preview = self._add_field(item_form, "Net", "0")
+        self.net_preview.setReadOnly(True)
+        next_field_button = QToolButton()
+        next_field_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowRight)
+        )
+        next_field_button.setToolTip("Move to the next item field")
+        next_field_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        next_field_button.clicked.connect(self._focus_next_item_field)
+        item_form.addWidget(next_field_button, 0, Qt.AlignmentFlag.AlignBottom)
+        self.description_input.returnPressed.connect(self._focus_next_item_field)
+        self.type_input.returnPressed.connect(self._focus_next_item_field)
+        manual_root.addLayout(item_form)
+        self.gross_input.valueChanged.connect(self._update_totals)
+        self.tare_input.valueChanged.connect(self._update_totals)
+
+        item_actions = QHBoxLayout()
+        self.add_item_button = QPushButton("Add Item")
+        self.add_item_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        self.add_item_button.clicked.connect(self._add_item)
+        item_actions.addWidget(self.add_item_button)
+        self.delete_item_button = QPushButton("Delete Item")
+        self.delete_item_button.clicked.connect(self._remove_selected_item)
+        item_actions.addWidget(self.delete_item_button)
+        item_actions.addStretch(1)
+        manual_root.addLayout(item_actions)
+
+        self.items_table = QTableWidget(0, 5)
+        self.items_table.setHorizontalHeaderLabels(
+            ["Item Description", "Type", "Gross", "Tare", "Net"]
+        )
+        self.items_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.items_table.setSelectionMode(
+            QTableWidget.SelectionMode.ExtendedSelection
+        )
+        self.items_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.items_table.setAlternatingRowColors(True)
+        self.items_table.verticalHeader().setVisible(False)
+        self.items_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.items_table.setMaximumHeight(190)
+        manual_root.addWidget(self.items_table)
+
+        totals_row = QHBoxLayout()
+        self.gross_total_label = QLabel("Gross total: 0.00")
+        self.tare_total_label = QLabel("Tare total: 0.00")
+        self.net_total_label = QLabel("Net total: 0.00")
+        for total_label in (
+            self.gross_total_label,
+            self.tare_total_label,
+            self.net_total_label,
+        ):
+            total_label.setStyleSheet("font-weight: bold; color: #20332e;")
+            totals_row.addWidget(total_label)
+        totals_row.addStretch(1)
+        manual_root.addLayout(totals_row)
+
+        self.manual_panel.setVisible(False)
+        root.addWidget(self.manual_panel)
+
+        db_toggle_row = QHBoxLayout()
+        self.ignore_db_checkbox = QCheckBox("Ignore database entirely")
+        self.ignore_db_checkbox.setToolTip(
+            "When checked, no database reads or writes occur. "
+            "The app behaves exactly as it did before the database existed."
+        )
+        self.ignore_db_checkbox.toggled.connect(self._update_db_toggle_state)
+        db_toggle_row.addWidget(self.ignore_db_checkbox)
+
+        self.repeat_load_checkbox = QCheckBox(
+            "Repeat load (replace this FRN in the database)"
+        )
+        self.repeat_load_checkbox.setToolTip(
+            "When checked, all rows for this FRN's base (including any letter "
+            "variants) are deleted from the database and re-inserted on export."
+        )
+        db_toggle_row.addWidget(self.repeat_load_checkbox)
+
+        db_toggle_row.addStretch(1)
+        root.addLayout(db_toggle_row)
+
+        scan_row = QHBoxLayout()
+        scan_row.addWidget(QLabel("Email date range:"))
+        self.range_selector = QComboBox()
+        for label, value in (
+            ("Past 3 months", "1"),
+            ("Past 6 months", "2"),
+            ("Past 12 months", "3"),
+            ("All time", "4"),
+        ):
+            self.range_selector.addItem(label, value)
+        scan_row.addWidget(self.range_selector)
+        self.scan_button = QPushButton("Scan Item List")
+        self.scan_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        self.scan_button.clicked.connect(self._start_scan)
+        scan_row.addWidget(self.scan_button)
+        scan_row.addStretch(1)
+        root.addLayout(scan_row)
+        self.scan_results_label = QLabel(
+            "Matching emails and attachments will appear here."
+        )
+        self.scan_results_label.setWordWrap(True)
+        self.scan_results_label.setStyleSheet("color: #53645e;")
+        root.addWidget(self.scan_results_label)
+
+        self.email_table = QTableWidget(0, 6)
+        self.email_table.setHorizontalHeaderLabels([
+            "RITM", "Sender", "Subject", "Received",
+            "Outlook Folder", "Matched Attachment(s)",
+        ])
+        self.email_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.email_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.email_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.email_table.setAlternatingRowColors(True)
+        self.email_table.verticalHeader().setVisible(False)
+        self.email_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.email_table.setMaximumHeight(190)
+        self.email_table.itemSelectionChanged.connect(self._update_reply_button)
+        root.addWidget(self.email_table)
+        email_actions = QHBoxLayout()
+        self.reply_button = QPushButton("Reply to Selected Email")
+        self.reply_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white;"
+        )
+        self.reply_button.setEnabled(False)
+        self.reply_button.clicked.connect(self._reply_to_selected_email)
+        email_actions.addWidget(self.reply_button)
+        email_actions.addStretch(1)
+        root.addLayout(email_actions)
+
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels([
+            "Packing List ID", "RITM", "Date", "Packing List #",
+            "Driver / Plate", "Items", "Gross Total", "Tare Total", "Net Total",
+        ])
+        self.table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QTableWidget.SelectionMode.ExtendedSelection
+        )
+        self.table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.table.setMaximumHeight(320)
+        root.addWidget(self.table, 1)
+
+        footer = QHBoxLayout()
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: #53645e;")
+        footer.addWidget(self.status_label, 1)
+
+        self.export_folder_button = QToolButton()
+        self.export_folder_button.setText("📁 Export Folder…")
+        self.export_folder_button.setToolTip(
+            "Choose where the packing list workbooks and per-load folders go"
+        )
+        self.export_folder_button.clicked.connect(self._save_records)
+        footer.addWidget(self.export_folder_button)
+
+        self.database_button = QToolButton()
+        self.database_button.setText("🗄 Database…")
+        self.database_button.setToolTip(
+            "Select or create the SQLite .db file used for duplicate checks"
+        )
+        self.database_button.clicked.connect(self._choose_database)
+        footer.addWidget(self.database_button)
+
+        root.addLayout(footer)
+
+        self._update_db_toggle_state()
+
+    def _update_db_toggle_state(self, *_args) -> None:
+        configured = db_configured()
+        ignore = self.ignore_db_checkbox.isChecked()
+        self.ignore_db_checkbox.setEnabled(configured)
+        self.repeat_load_checkbox.setEnabled(configured and not ignore)
+        if not configured:
+            tooltip = (
+                "No database configured. Use the Database button "
+                "to select or create the .db file."
+            )
+            self.ignore_db_checkbox.setToolTip(tooltip)
+            self.repeat_load_checkbox.setToolTip(tooltip)
+
+    def _choose_database(self) -> None:
+        last_dir = self.app_config.get("database_path", "")
+        start_dir = str(Path(last_dir).parent) if last_dir else str(get_user_dir())
+        chosen, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select or create the SQLite database file",    
+            str(Path(start_dir) / "PackingLists.db"),
+            "SQLite database (*.db);;All files (*)",
+        )
+        if not chosen:
+            return
+        self.app_config["database_path"] = chosen
+        save_app_config(self.app_config)
+        self._update_db_toggle_state()
+        self.status_label.setText(f"Database set: {chosen}")
+
+    @staticmethod
+    def _add_weight_field(layout: QHBoxLayout, label: str) -> QSpinBox:
+        field = QVBoxLayout()
+        field.addWidget(QLabel(label))
+        value = BlankZeroSpinBox()
+        value.setRange(0, 1_000_000_000)
+        value.setSingleStep(1)
+        field.addWidget(value)
+        layout.addLayout(field, 1)
+        return value
+
+    @staticmethod
+    def _add_field(layout: QHBoxLayout, label: str, value: str = "") -> QLineEdit:
+        field = QVBoxLayout()
+        field.addWidget(QLabel(label))
+        entry = QLineEdit(value)
+        field.addWidget(entry)
+        layout.addLayout(field, 1)
+        return entry
+
+    # ------------------------------------------------------------------
+    # Input-sheet buttons
+    # ------------------------------------------------------------------
+
+    def _open_input_sheet(self) -> None:
+        last_import_folder = self.app_config.get("last_import_folder")
+        preferred_dir = Path(last_import_folder) if last_import_folder else None
+
+        try:
+            working = copy_template_to_working(preferred_dir=preferred_dir)
+        except Exception as error:
+            QMessageBox.critical(self, "Could not open input sheet", str(error))
+            return
+
+        self.app_config["last_import_folder"] = str(working.parent)
+        save_app_config(self.app_config)
+
+        try:
+            os.startfile(str(working))
+        except AttributeError:
+            QMessageBox.information(
+                self,
+                "Open input sheet",
+                f"Edit this file in Excel:\n{working}",
+            )
+        self.status_label.setText(
+            f"Opened {working.name}. Fill it in, save, close Excel, then "
+            "click Import Input Sheet."
+        )
+        self.imported_info_label.setText(
+            f"Working file: {working}\n"
+            "Edit in Excel, save, close, then click Import Input Sheet."
+        )
+
+    def _import_input_sheet(self) -> None:
+        last_import_folder = (
+            self.app_config.get("last_import_folder")
+            or str(working_dir())
+        )
+        if not Path(last_import_folder).is_dir():
+            last_import_folder = (
+                str(working_dir())
+                if working_dir().is_dir()
+                else str(Path.home())
+            )
+
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select the filled-in Incoming Packing List",
+            last_import_folder,
+            "Excel 97-2003 (*.xls);;All files (*)",
+        )
+        if not chosen:
+            return
+        chosen_path = Path(chosen)
+
+        self.app_config["last_import_folder"] = str(chosen_path.parent)
+        save_app_config(self.app_config)
+
+        _log_marker("GUI: Import clicked, about to parse")
+        try:
+            record = parse_incoming_packing_list(chosen_path)
+        except Exception as error:
+            QMessageBox.critical(self, "Could not read input sheet", str(error))
+            return
+        _log_marker("GUI: Import parse returned")
+
+        if self.imported_record is not None:
+            answer = QMessageBox.question(
+                self,
+                "Replace pending import?",
+                "There is already an imported input sheet waiting to be scanned:\n"
+                f"{self.imported_record['packing_list']} "
+                f"({len(self.imported_record['items'])} item(s)).\n\n"
+                "Replace it with the newly imported data?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        self.imported_record = record
+        self.imported_source_path = chosen_path
+        self.pending_record = record
+
+        gross_total = sum(item["gross"] for item in record["items"])
+        tare_total = sum(item["tare"] for item in record["items"])
+        net_total = sum(item["net"] for item in record["items"])
+        self.imported_info_label.setText(
+            f"Imported: {chosen_path.name}\n"
+            f"Packing List: {record['packing_list']}\n"
+            f"Date: {record['date']}\n"
+            f"Driver / Plate: {record['driver_plate'] or '(none)'}\n"
+            f"Items: {len(record['items'])}  |  "
+            f"Gross {gross_total:,}  |  "
+            f"Tare {tare_total:,}  |  "
+            f"Net {net_total:,}"
+        )
+        self.status_label.setText(
+            f"Imported {record['packing_list']}. Click Scan Item List to "
+            "match it against Outlook."
+        )
+
+    def _rename_files(self) -> None:
+        last_rename_folder = (
+            self.app_config.get("last_rename_folder")
+            or str(working_dir())
+        )
+        if not Path(last_rename_folder).is_dir():
+            last_rename_folder = (
+                str(working_dir())
+                if working_dir().is_dir()
+                else str(Path.home())
+            )
+
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Choose the folder whose files should be renamed",
+            last_rename_folder,
+        )
+        if not chosen:
+            return
+        folder = Path(chosen)
+
+        self.app_config["last_rename_folder"] = str(folder)
+        save_app_config(self.app_config)
+
+        self.status_label.setText(f"Scanning {folder} for FRN numbers...")
+        QApplication.processEvents()
+
+        try:
+            plans = plan_file_renames(folder)
+        except Exception as error:
+            QMessageBox.critical(self, "Could not scan folder", str(error))
+            self.status_label.setText("Rename cancelled.")
+            return
+
+        if not plans:
+            QMessageBox.information(
+                self, "Nothing to do",
+                "That folder has no files to rename.",
+            )
+            self.status_label.setText("Rename cancelled.")
+            return
+
+        dialog = RenamePreviewDialog(self, plans)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Rename cancelled.")
+            return
+
+        selected = dialog.selected_plans()
+        if not selected:
+            self.status_label.setText("No files selected for renaming.")
+            return
+
+        renamed = 0
+        failures: list[str] = []
+        for plan in selected:
+            src: Path = plan["path"]
+            dst = src.with_name(plan["new_name"])
+            if dst.exists() and dst != src:
+                failures.append(
+                    f"{src.name}: '{plan['new_name']}' already exists"
+                )
+                continue
+            try:
+                src.rename(dst)
+                renamed += 1
+            except OSError as error:
+                failures.append(f"{src.name}: {error}")
+
+        message_lines = [f"Renamed {renamed} file(s)."]
+        if failures:
+            message_lines.append("")
+            message_lines.append("Warnings:")
+            message_lines.extend(f"  - {line}" for line in failures)
+        QMessageBox.information(
+            self, "Rename complete", "\n".join(message_lines)
+        )
+        self.status_label.setText(f"Renamed {renamed} file(s) in {folder}")
+
+    def _next_load(self) -> None:
+        if self.imported_record is not None:
+            answer = QMessageBox.question(
+                self,
+                "Clear current import?",
+                f"Discard the imported sheet for "
+                f"{self.imported_record['packing_list']} without scanning it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.imported_record = None
+        self.imported_source_path = None
+        self.pending_record = None
+        self.imported_info_label.setText("No input sheet imported yet.")
+        self.status_label.setText("Ready for the next load.")
+        self.scan_results_label.setText(
+            "Matching emails and attachments will appear here."
+        )
+
+    def _toggle_manual_entry(self, checked: bool) -> None:
+        self.manual_panel.setVisible(checked)
+        self.manual_toggle_button.setText(
+            "Hide Manual Entry" if checked else "Show Manual Entry"
+        )
+
+    # ------------------------------------------------------------------
+    # Manual entry helpers
+    # ------------------------------------------------------------------
+
+    def _focused_item_field_index(self) -> int | None:
+        focused = QApplication.focusWidget()
+        for index, field in enumerate(self.item_input_fields):
+            if focused is field:
+                return index
+            if isinstance(field, QSpinBox) and focused is field.lineEdit():
+                return index
+        return None
+
+    def _focus_item_field(self, index: int) -> None:
+        self.item_input_fields[index % len(self.item_input_fields)].setFocus()
+
+    def _focus_next_item_field(self) -> None:
+        index = self._focused_item_field_index()
+        self._focus_item_field(0 if index is None else index + 1)
+
+    def eventFilter(self, watched: QWidget, event: QEvent) -> bool:
+        if not isinstance(event, QKeyEvent) or event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(watched, event)
+        if event.modifiers() != Qt.KeyboardModifier.NoModifier:
+            return super().eventFilter(watched, event)
+
+        direction = 0
+        if event.key() == Qt.Key.Key_Right:
+            direction = 1
+        elif event.key() == Qt.Key.Key_Left:
+            direction = -1
+        if not direction:
+            return super().eventFilter(watched, event)
+
+        index = self._focused_item_field_index()
+        if index is None:
+            return super().eventFilter(watched, event)
+        numeric_field = isinstance(self.item_input_fields[index], QSpinBox)
+        if isinstance(watched, QLineEdit) and not numeric_field:
+            if watched.hasSelectedText():
+                return super().eventFilter(watched, event)
+            cursor = watched.cursorPosition()
+            if direction > 0 and cursor < len(watched.text()):
+                return super().eventFilter(watched, event)
+            if direction < 0 and cursor > 0:
+                return super().eventFilter(watched, event)
+
+        self._focus_item_field(index + direction)
+        return True
+
+    def _add_item(self) -> None:
+        description = self.description_input.text().strip()
+        item_type = normalize_item_type(self.type_input.text())
+        gross = self.gross_input.value()
+        tare = self.tare_input.value()
+        if not description or not item_type:
+            QMessageBox.warning(
+                self, "Missing item details", "Enter an item description and type."
+            )
+            return
+        if gross <= 0:
+            QMessageBox.warning(
+                self, "Check gross weight", "Gross weight must be greater than zero."
+            )
+            return
+        if tare > gross:
+            QMessageBox.warning(
+                self, "Check tare weight", "Tare cannot be greater than gross."
+            )
+            return
+
+        item: ItemRecord = {
+            "description": description,
+            "type": item_type,
+            "gross": gross,
+            "tare": tare,
+            "net": gross - tare,
+        }
+        self.current_items.append(item)
+        row = self.items_table.rowCount()
+        self.items_table.insertRow(row)
+        values = (
+            description,
+            item_type,
+            f"{gross:,}",
+            f"{tare:,}",
+            f"{item['net']:,}",
+        )
+        for column, value in enumerate(values):
+            self.items_table.setItem(row, column, QTableWidgetItem(value))
+        self.description_input.clear()
+        self.type_input.clear()
+        self.gross_input.setValue(0)
+        self.tare_input.setValue(0)
+        self.description_input.setFocus()
+        self._update_totals()
+
+    def _remove_selected_item(self) -> None:
+        indexes = sorted(
+            {index.row() for index in self.items_table.selectionModel().selectedRows()},
+            reverse=True,
+        )
+        if not indexes:
+            self.status_label.setText("Select one or more current items to remove")
+            return
+        for index in indexes:
+            self.current_items.pop(index)
+            self.items_table.removeRow(index)
+        self._update_totals()
+
+    def _update_totals(self) -> None:
+        entered_gross = self.gross_input.value()
+        entered_tare = self.tare_input.value()
+        entered_net = entered_gross - entered_tare
+        self.net_preview.setText(f"{entered_net:,}")
+
+        gross_total = sum(item["gross"] for item in self.current_items) + entered_gross
+        tare_total = sum(item["tare"] for item in self.current_items) + entered_tare
+        net_total = sum(item["net"] for item in self.current_items) + entered_net
+        self.gross_total_label.setText(f"Gross total: {gross_total:,}")
+        self.tare_total_label.setText(f"Tare total: {tare_total:,}")
+        self.net_total_label.setText(f"Net total: {net_total:,}")
+
+    def _build_current_record(self) -> PackingListRecord | None:
+        if self.imported_record is not None:
+            return self.imported_record
+
+        raw_date = self.date_input.text().strip()
+        packing_list = self.packing_list_input.text().strip()
+        if not raw_date or not packing_list:
+            QMessageBox.warning(
+                self,
+                "Missing information",
+                "Fill in the date and packing-list number, or import an input sheet.",
+            )
+            return None
+        try:
+            normalized_date = parse_date(raw_date).isoformat()
+        except ValueError as error:
+            QMessageBox.warning(self, "Check the date", str(error))
+            self.date_input.setFocus()
+            return None
+        if not self.current_items:
+            QMessageBox.warning(
+                self,
+                "No items",
+                "Add at least one item, or import an input sheet.",
+            )
+            return None
+        record: PackingListRecord = {
+            "group": "",
+            "ritm": "",
+            "letter": "",
+            "date": normalized_date,
+            "packing_list": packing_list,
+            "location": "",
+            "location_address": "",
+            "driver_plate": self.driver_plate_input.text().strip(),
+            "items": self.current_items.copy(),
+        }
+        return record
+
+    # ------------------------------------------------------------------
+    # Queue / record helpers
+    # ------------------------------------------------------------------
+
+    def _append_record(self, record: PackingListRecord) -> None:
+        self.records.append(record)
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        gross_total = sum(item["gross"] for item in record["items"])
+        tare_total = sum(item["tare"] for item in record["items"])
+        net_total = sum(item["net"] for item in record["items"])
+        values = (
+            _packing_list_identifier(record),
+            record["ritm"],
+            record["date"],
+            record["packing_list"],
+            record["driver_plate"],
+            str(len(record["items"])),
+            f"{gross_total:,}",
+            f"{tare_total:,}",
+            f"{net_total:,}",
+        )
+        for column, value in enumerate(values):
+            self.table.setItem(row, column, QTableWidgetItem(value))
+
+    def _next_packing_list_letter(self, packing_list_key: str) -> str:
+        taken: set[str] = set()
+        for existing in self.records:
+            if existing["packing_list"].casefold() == packing_list_key:
+                if existing["letter"]:
+                    taken.add(existing["letter"].upper())
+
+        number = 1
+        while True:
+            candidate = ""
+            n = number
+            while n:
+                n, rem = divmod(n - 1, 26)
+                candidate = chr(ord("A") + rem) + candidate
+            if candidate not in taken:
+                return candidate
+            number += 1
+
+    def _location_from_address(self, address: str) -> str:
+        parts = [p.strip() for p in address.split(",")]
+        if len(parts) < 2:
+            return ""
+        city_state = ", ".join(parts[1:])
+        city_state = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", city_state).strip()
+        return city_state.replace(",", "")
+
+    def _build_unmatched_records(
+        self,
+        record: PackingListRecord,
+        items: list[ItemRecord],
+        staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]],
+    ) -> list[PackingListRecord]:
+        """Build one record per (address, ritm) bucket from leftover items.
+
+        IMPORTANT: `items` is guaranteed by AddressBatchDialog to contain
+        ONLY items that did not end up in any staged RITM. Attaches source
+        matches from `staged_ritm_records` and from the template's
+        `source_matches` when applicable, so hand-typed RITMs that were
+        rescanned still get their PDF.
+        """
+        packing_list_key = record["packing_list"].casefold()
+
+        buckets: dict[tuple[str, str], list[ItemRecord]] = {}
+        for item in items:
+            addr = _item_address(item)
+            r = _item_ritm(item)
+            buckets.setdefault((addr, r), []).append(item)
+
+        def existing_ritm_records() -> dict[str, PackingListRecord]:
+            return {
+                rec["ritm"].casefold(): rec
+                for rec in self.records
+                if rec["packing_list"].casefold() == packing_list_key
+                and rec["ritm"]
+                and rec["ritm"].casefold() != "no request item"
+            }
+
+        def matches_for_ritm(ritm_value: str) -> list[ExactMatch]:
+            if not ritm_value:
+                return []
+            ritm_key = ritm_value.casefold()
+            collected: list[ExactMatch] = []
+            for staged_rec, matches in staged_ritm_records:
+                if (staged_rec["ritm"] or "").casefold() == ritm_key:
+                    collected.extend(matches)
+            for match in _record_source_matches(record):
+                if any(r.casefold() == ritm_key for r in match.subject_ritms):
+                    collected.append(match)
+            return _dedupe_matches(collected)
+
+        new_records: list[PackingListRecord] = []
+
+        for (address, ritm), group_items in buckets.items():
+            if ritm:
+                chosen_ritm = self._resolve_ritm_typo(ritm, packing_list_key)
+                target = existing_ritm_records().get(chosen_ritm.casefold())
+                if target is not None:
+                    self._merge_items_into_record(
+                        target, group_items, packing_list_key
+                    )
+                    continue
+                source_matches = matches_for_ritm(chosen_ritm)
+                new_record: PackingListRecord = {
+                    **record,
+                    "group": chosen_ritm.casefold(),
+                    "ritm": chosen_ritm,
+                    "letter": "",
+                    "location": self._location_from_address(address) if address else "",
+                    "location_address": address,
+                    "items": group_items,
+                    "source_matches": source_matches,
+                }
+                self._append_record(new_record)
+                new_records.append(new_record)
+            else:
+                new_record: PackingListRecord = {
+                    **record,
+                    "group": "no request item",
+                    "ritm": "No Request Item",
+                    "letter": "",
+                    "location": self._location_from_address(address) if address else "",
+                    "location_address": address,
+                    "items": group_items,
+                    "source_matches": [],
+                }
+                self._append_record(new_record)
+                new_records.append(new_record)
+
+        return new_records
+
+    def _merge_items_into_record(
+        self,
+        target: PackingListRecord,
+        items: list[ItemRecord],
+        packing_list_key: str,
+    ) -> None:
+        remaining = list(items)
+        current = target
+        while remaining:
+            space = MAX_ITEMS_PER_LOAD - len(current["items"])
+            if space <= 0:
+                sibling: PackingListRecord = {
+                    **current,
+                    "letter": "",
+                    "items": [],
+                    "source_matches": list(current.get("source_matches") or []),
+                }
+                self._append_record(sibling)
+                current = sibling
+                space = MAX_ITEMS_PER_LOAD
+            take = min(space, len(remaining))
+            current["items"].extend(remaining[:take])
+            remaining = remaining[take:]
+
+        self._refresh_queue_table()
+
+    def _resolve_ritm_typo(self, typed_ritm: str, packing_list_key: str) -> str:
+        typed_norm = normalize_ritm(typed_ritm)
+        known = {
+            rec["ritm"]: rec["ritm"]
+            for rec in self.records
+            if rec["packing_list"].casefold() == packing_list_key
+            and rec["ritm"]
+            and rec["ritm"].casefold() != "no request item"
+        }
+        if not known:
+            return typed_ritm
+        for existing in known:
+            if normalize_ritm(existing) == typed_norm:
+                return existing
+
+        candidates: list[tuple[str, float]] = []
+        for existing in known:
+            existing_norm = normalize_ritm(existing)
+            ratio = SequenceMatcher(None, typed_norm, existing_norm).ratio()
+            if ratio >= 0.90:
+                candidates.append((existing, ratio))
+        if not candidates:
+            return typed_ritm
+        candidates.sort(key=lambda x: -x[1])
+        best, ratio = candidates[0]
+        answer = QMessageBox.question(
+            self,
+            "Possible RITM typo",
+            f"You typed: {typed_ritm}\n\n"
+            f"A Request Item on this load is very close:\n"
+            f"    {best}   (similarity {ratio:.0%})\n\n"
+            f"Did you mean {best}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            return best
+        return typed_ritm
+
+    def _refresh_queue_table(self) -> None:
+        self.table.setRowCount(0)
+        for record in self.records:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            gross_total = sum(item["gross"] for item in record["items"])
+            tare_total = sum(item["tare"] for item in record["items"])
+            net_total = sum(item["net"] for item in record["items"])
+            values = (
+                _packing_list_identifier(record),
+                record["ritm"],
+                record["date"],
+                record["packing_list"],
+                record["driver_plate"],
+                str(len(record["items"])),
+                f"{gross_total:,}",
+                f"{tare_total:,}",
+                f"{net_total:,}",
+            )
+            for column, value in enumerate(values):
+                self.table.setItem(row, column, QTableWidgetItem(value))
+
+    def _clear_current_list(self) -> None:
+        self.packing_list_input.clear()
+        self.driver_plate_input.clear()
+        self.current_items.clear()
+        self.items_table.setRowCount(0)
+        self.gross_input.setValue(0)
+        self.tare_input.setValue(0)
+        self.description_input.setFocus()
+        self._update_totals()
+
+    def _set_processing_state(self, enabled: bool) -> None:
+        for widget in (
+            self.open_sheet_button,
+            self.import_sheet_button,
+            self.rename_files_button,
+            self.next_load_button,
+            self.manual_toggle_button,
+            self.date_input,
+            self.packing_list_input,
+            self.driver_plate_input,
+            self.description_input,
+            self.type_input,
+            self.gross_input,
+            self.tare_input,
+            self.add_item_button,
+            self.delete_item_button,
+            self.items_table,
+            self.scan_button,
+            self.export_folder_button,
+        ):
+            widget.setEnabled(enabled)
+
+    # ------------------------------------------------------------------
+    # Email matching / Outlook
+    # ------------------------------------------------------------------
+
+    def _merge_matched_emails(
+        self,
+        exact_matches: list[ExactMatch],
+        ritm_letters: dict[str, str],
+        packing_list: str,
+    ) -> None:
+        for match in exact_matches:
+            message_key = match.entry_id or "|".join(
+                (match.folder, match.subject, match.received)
+            )
+            email_ritms = match.subject_ritms or match.ritms
+            for ritm in email_ritms:
+                ritm_key = ritm.casefold()
+                letter = ritm_letters.get(ritm_key, "")
+                email_key = f"{message_key}|{ritm_key}|{packing_list.casefold()}|{letter}"
+                email = self.matched_emails_by_key.get(email_key)
+                if email is None:
+                    email = MatchedEmail(
+                        key=email_key,
+                        ritm=ritm,
+                        packing_list=packing_list,
+                        letter=letter,
+                        entry_id=match.entry_id,
+                        store_id=match.store_id,
+                        sender=match.sender,
+                        sender_email=match.sender_email,
+                        subject=match.subject,
+                        received=match.received,
+                        folder=match.folder,
+                    )
+                    self.matched_emails_by_key[email_key] = email
+                email.attachments.add(match.filename)
+                email.item_terms.add(match.term)
+
+        self.visible_email_matches = sorted(
+            self.matched_emails_by_key.values(),
+            key=lambda email: (
+                email.ritm.casefold(),
+                email.received,
+                email.subject.casefold(),
+                email.folder.casefold(),
+            ),
+            reverse=True,
+        )
+        self.email_table.setRowCount(0)
+        for email in self.visible_email_matches:
+            row = self.email_table.rowCount()
+            self.email_table.insertRow(row)
+            sender = email.sender
+            if email.sender_email and email.sender_email.casefold() not in sender.casefold():
+                sender = f"{sender} <{email.sender_email}>".strip()
+            values = (
+                email.ritm,
+                sender,
+                email.subject,
+                email.received,
+                email.folder,
+                ", ".join(sorted(email.attachments)),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, email.key)
+                self.email_table.setItem(row, column, item)
+        self._update_reply_button()
+
+    def _on_rescan_sources(self, payload) -> None:
+        """Slot for AddressBatchDialog.rescan_found_sources.
+
+        Attaches newly found sources to any matching record in self.records
+        (the "Applied + Finished before rescanning" case), and immediately
+        pushes the found emails into the reply email table so the user can
+        reply to them even before finishing the dialog.
+        """
+        try:
+            ritm, matches, packing_list = payload
+        except Exception:
+            return
+        if not matches:
+            return
+        ritm_key = (ritm or "").casefold()
+        packing_list_key = (packing_list or "").casefold()
+
+        # 1. Attach to any already-committed record for this RITM.
+        for record in self.records:
+            if record["packing_list"].casefold() != packing_list_key:
+                continue
+            if (record["ritm"] or "").casefold() != ritm_key:
+                continue
+            current = list(record.get("source_matches") or [])
+            seen = {(m.entry_id, m.filename, m.term) for m in current}
+            for match in matches:
+                key = (match.entry_id, match.filename, match.term)
+                if key in seen:
+                    continue
+                seen.add(key)
+                current.append(match)
+            record["source_matches"] = current
+            if not record.get("location_address"):
+                for match in matches:
+                    if match.location_address:
+                        record["location_address"] = match.location_address
+                        record["location"] = match.location
+                        break
+            identifier = _packing_list_identifier(record)
+            self.record_source_matches[identifier] = current
+
+        # 2. Push the found emails into the reply table.
+        ritm_letters = {ritm_key: ""}
+        for r in self.records:
+            if r["packing_list"].casefold() != packing_list_key:
+                continue
+            if (r["ritm"] or "").casefold() == ritm_key:
+                ritm_letters[ritm_key] = r["letter"]
+                break
+        self._merge_matched_emails(list(matches), ritm_letters, packing_list)
+
+    def _find_outlook_message(self, namespace, email: MatchedEmail):
+        if email.entry_id:
+            if email.store_id:
+                try:
+                    message = namespace.GetItemFromID(email.entry_id, email.store_id)
+                    if message is not None:
+                        return message
+                except Exception:
+                    pass
+            try:
+                message = namespace.GetItemFromID(email.entry_id)
+                if message is not None:
+                    return message
+            except Exception:
+                pass
+
+        try:
+            folders = [namespace.GetDefaultFolder(6)]
+        except Exception:
+            return None
+        while folders:
+            folder = folders.pop()
+            try:
+                if folder.Name.casefold() == email.folder.casefold():
+                    for message in folder.Items:
+                        try:
+                            if str(message.Subject or "") != email.subject:
+                                continue
+                            if email.sender_email and str(
+                                message.SenderEmailAddress or ""
+                            ).casefold() != email.sender_email.casefold():
+                                continue
+                            if not email.sender_email and email.sender and str(
+                                message.SenderName or ""
+                            ) != email.sender:
+                                continue
+                            if email.received and str(message.ReceivedTime) != email.received:
+                                continue
+                            return message
+                        except Exception:
+                            continue
+                folders.extend(folder.Folders)
+            except Exception:
+                continue
+        return None
+
+    def _update_reply_button(self) -> None:
+        row = self.email_table.currentRow()
+        if row < 0:
+            self.reply_button.setEnabled(False)
+            return
+        ritm_item = self.email_table.item(row, 0)
+        email_key = ritm_item.data(Qt.ItemDataRole.UserRole) if ritm_item else None
+        if not isinstance(email_key, str):
+            self.reply_button.setEnabled(False)
+            return
+        email = self.matched_emails_by_key.get(email_key)
+        self.reply_button.setEnabled(bool(
+            email and (email.entry_id or (email.subject and email.folder))
+        ))
+
+    def _reply_to_selected_email(self) -> None:
+        row = self.email_table.currentRow()
+        if row < 0:
+            return
+        ritm_item = self.email_table.item(row, 0)
+        email_key = ritm_item.data(Qt.ItemDataRole.UserRole) if ritm_item else None
+        if not isinstance(email_key, str):
+            return
+        email = self.matched_emails_by_key.get(email_key)
+        if email is None:
+            QMessageBox.warning(
+                self,
+                "Email cannot be opened",
+                "The selected email could not be matched to its Outlook record.",
+            )
+            return
+
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+        message = self._find_outlook_message(namespace, email)
+        if message is None:
+            QMessageBox.warning(
+                self,
+                "Email cannot be opened",
+                "Outlook could not find the selected email by its ID or its "
+                "subject, sender, date, and folder.",
+            )
+            return
+
+        # Gather every queue record on this load that shares the selected
+        # email's RITM — whether it was auto-matched or hand-typed.
+        ritm_key = email.ritm.casefold()
+        ritm_records = [
+            record for record in self.records
+            if (record["ritm"] or "").casefold() == ritm_key
+            and record["packing_list"].casefold() == email.packing_list.casefold()
+        ]
+        if ritm_records:
+            item_descriptions = list(dict.fromkeys(
+                item["description"]
+                for record in ritm_records
+                for item in record["items"]
+            ))
+        else:
+            item_descriptions = sorted(email.item_terms)
+
+        date_values = sorted({
+            parse_date(record["date"]).strftime("%m/%d/%Y")
+            for record in ritm_records
+        })
+        delivered_date = ", ".join(date_values) if date_values else ""
+
+        item_lines = "<br>".join(
+            html.escape(description) for description in item_descriptions
+        )
+        reply_body = (
+            f"<p>Delivered {html.escape(delivered_date)}</p>"
+            f"<p>{item_lines}</p>"
+            "<p>Thank you</p><br>"
+        )
+
+        try:
+            reply = message.ReplyAll()
+            reply.HTMLBody = reply_body + reply.HTMLBody
+            reply.Display()
+        except Exception as error:
+            QMessageBox.critical(self, "Could not prepare reply", str(error))
+
+    # ------------------------------------------------------------------
+    # Scan
+    # ------------------------------------------------------------------
+
+    def _start_scan(self) -> None:
+        if self.scan_worker is not None and self.scan_worker.isRunning():
+            return
+        record = self._build_current_record()
+        if record is None:
+            return
+        search_terms = list(dict.fromkeys(
+            item["description"] for item in record["items"] if item["description"].strip()
+        ))
+        if not search_terms:
+            QMessageBox.warning(
+                self, "No item descriptions",
+                "Enter at least one item description to scan.",
+            )
+            return
+        self.pending_record = record
+        self._set_processing_state(False)
+        self.status_label.setText(
+            f"Searching Outlook for {len(search_terms)} item description(s)..."
+        )
+        self.scan_results_label.setText("Scanning attachments for exact item matches...")
+        self.scan_worker = ScannerWorker(self.range_selector.currentData(), search_terms)
+        self.scan_worker.scan_complete.connect(self._scan_finished)
+        self.scan_worker.scan_failed.connect(self._scan_failed)
+        self.scan_worker.start()
+
+    def _confirm_near_matches(
+        self,
+        near_matches: list[NearMatch],
+    ) -> set[tuple[str, str, str]]:
+        accepted: set[tuple[str, str, str]] = set()
+
+        seen: set[tuple[str, str, str]] = set()
+        candidates: list[NearMatch] = []
+        for candidate in near_matches:
+            key = (
+                candidate.term.casefold(),
+                candidate.folder.casefold(),
+                candidate.filename.casefold(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(candidate)
+
+        if not candidates:
+            return accepted
+
+        total = len(candidates)
+        for index, candidate in enumerate(candidates, start=1):
+            dialog = NearMatchConfirmDialog(self, candidate, index, total)
+            dialog.exec()
+            if dialog.accepted:
+                accepted.add((
+                    candidate.term.casefold(),
+                    candidate.folder.casefold(),
+                    candidate.filename.casefold(),
+                ))
+        return accepted
+
+    @staticmethod
+    def _parse_received(text: str) -> datetime:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+            try:
+                return datetime.strptime(text, fmt)
+            except ValueError:
+                continue
+        return datetime.min
+
+    @staticmethod
+    def _email_key(match: ExactMatch) -> str:
+        return match.entry_id or f"{match.folder}|{match.subject}|{match.received}|{match.filename}"
+
+    def _resolve_resent_emails(
+        self,
+        subject_matches: list[ExactMatch],
+    ) -> tuple[list[ExactMatch], set[str]]:
+        groups: dict[tuple[str, str], list[ExactMatch]] = {}
+        for match in subject_matches:
+            for ritm in match.subject_ritms:
+                key = (match.subject.casefold(), ritm.casefold())
+                groups.setdefault(key, []).append(match)
+
+        skipped_ritms: set[str] = set()
+        keep_ids: set[str] = set()
+
+        for (subject_key, ritm_key), group in groups.items():
+            unique_sources: dict[str, list[ExactMatch]] = {}
+            for match in group:
+                unique_sources.setdefault(self._email_key(match), []).append(match)
+            if len(unique_sources) < 2:
+                continue
+
+            sorted_sources = sorted(
+                unique_sources.values(),
+                key=lambda ms: self._parse_received(ms[0].received),
+                reverse=True,
+            )
+            newer_email = sorted_sources[0][0]
+            older_email = sorted_sources[1][0]
+
+            dialog = ResendPickerDialog(
+                self, ritm_key.upper(), older_email, newer_email
+            )
+            dialog.exec()
+            if dialog.chosen is None:
+                skipped_ritms.add(ritm_key)
+            else:
+                keep_ids.add(self._email_key(dialog.chosen))
+
+        filtered: list[ExactMatch] = []
+        for match in subject_matches:
+            match_ritm_keys = [r.casefold() for r in match.subject_ritms]
+            if any(r in skipped_ritms for r in match_ritm_keys):
+                continue
+
+            kept = False
+            for ritm_key in match_ritm_keys:
+                group = groups.get((match.subject.casefold(), ritm_key), [])
+                unique_srcs = {self._email_key(m) for m in group}
+                if len(unique_srcs) < 2:
+                    kept = True
+                    break
+                if self._email_key(match) in keep_ids:
+                    kept = True
+                    break
+            if kept:
+                filtered.append(match)
+
+        return filtered, skipped_ritms
+
+    def _scan_finished(self, results: ScanResults) -> None:
+        record = self.pending_record
+        if record is None:
+            self._set_processing_state(True)
+            return
+
+        time_range = self.range_selector.currentData()
+        search_terms_for_rescan = list(dict.fromkeys(
+            item["description"] for item in record["items"] if item["description"].strip()
+        ))
+
+        subject_matches = [match for match in results.exact_matches if match.subject_ritms]
+        if not subject_matches:
+            dialog = AddressBatchDialog(
+                self,
+                record["items"],
+                [],
+                record,
+                subject_matches=[],
+                time_range=time_range,
+                search_terms=search_terms_for_rescan,
+            )
+            dialog.rescan_found_sources.connect(self._on_rescan_sources)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                self.pending_record = None
+                self.imported_record = None
+                self.imported_source_path = None
+                self._set_processing_state(True)
+                self.status_label.setText("Scan finished. Nothing queued.")
+                return
+            self._commit_dialog_state(record, dialog, [])
+            self.pending_record = None
+            self.imported_record = None
+            self.imported_source_path = None
+            self._set_processing_state(True)
+            return
+
+        accepted_near_keys = self._confirm_near_matches(results.near_matches)
+
+        subject_matches, skipped_ritms = self._resolve_resent_emails(subject_matches)
+        if not subject_matches:
+            self.pending_record = None
+            self.imported_record = None
+            self.imported_source_path = None
+            self._set_processing_state(True)
+            self.scan_results_label.setText(
+                "All matched RITMs were skipped. Nothing queued."
+            )
+            self.status_label.setText("Scan finished with no items queued.")
+            return
+
+        found_ritms = sorted({
+            ritm for match in subject_matches for ritm in match.subject_ritms
+            if ritm.casefold() not in skipped_ritms
+        })
+        exact_summary = sorted({
+            f"{match.term}: {match.folder} / {match.filename}"
+            for match in subject_matches
+        })
+
+        # ---- DB duplicate scan ----
+        # Runs before the AddressBatchDialog opens so the user sees duplicates
+        # up-front. Skipped entirely when Ignore DB is checked or DB unset.
+        if db_configured() and not self.ignore_db_checkbox.isChecked():
+            pending_for_dup_check: list[PackingListRecord] = []
+            for ritm in found_ritms:
+                ritm_matches = [
+                    m for m in subject_matches if ritm in m.subject_ritms
+                ]
+                ritm_terms = {m.term.casefold() for m in ritm_matches}
+                probe_items = [
+                    item for item in record["items"]
+                    if item["description"].casefold() in ritm_terms
+                ]
+                if not probe_items:
+                    continue
+                pending_for_dup_check.append({
+                    **record,
+                    "ritm": ritm,
+                    "letter": "",
+                    "items": probe_items,
+                })
+            dupes = record_db_duplicates(pending_for_dup_check)
+            if dupes:
+                lines = []
+                for ritm_value, desc, existing_frn in dupes:
+                    lines.append(
+                        f"  • {desc}  under  {ritm_value}"
+                        f"   (existing FRN: {existing_frn})"
+                    )
+                answer = QMessageBox.question(
+                    self,
+                    "Duplicate item/RITM combinations found",
+                    "These item + Request Item combinations already exist in "
+                    "the database under a different Packing List:\n\n"
+                    + "\n".join(lines)
+                    + "\n\nProceed anyway? (Rows will be skipped on insert "
+                    "unless Repeat load is checked.)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.pending_record = None
+                    self.imported_record = None
+                    self.imported_source_path = None
+                    self._set_processing_state(True)
+                    self.status_label.setText("Scan cancelled at DB check.")
+                    return
+        # ---- /DB duplicate scan ----
+
+        assigned_item_indexes: set[int] = set()
+        matched_email_count = len({
+            match.entry_id or (match.folder, match.subject, match.received)
+            for match in subject_matches
+        })
+        total_accepted_files = 0
+        staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]] = []
+        staged: list[PackingListRecord] = []
+
+        for ritm in found_ritms:
+            ritm_key = ritm.casefold()
+            ritm_matches = [
+                match for match in subject_matches
+                if ritm in match.subject_ritms
+            ]
+            if not ritm_matches:
+                continue
+
+            current_matched_terms = {match.term.casefold() for match in ritm_matches}
+            exact_files = {f"{match.folder} / {match.filename}" for match in ritm_matches}
+            accepted_files: set[str] = set()
+            accepted_terms = set()
+
+            for candidate in results.near_matches:
+                candidate_key = (
+                    candidate.term.casefold(),
+                    candidate.folder.casefold(),
+                    candidate.filename.casefold(),
+                )
+                if candidate_key not in accepted_near_keys:
+                    continue
+                if ritm not in candidate.subject_ritms:
+                    continue
+                accepted_files.add(
+                    f"{candidate.folder} / {candidate.filename} "
+                    f"(accepted near match: {candidate.guess} for {candidate.term})"
+                )
+                accepted_terms.add(candidate.term.casefold())
+                total_accepted_files += 1
+
+            group_terms = sorted({match.term for match in ritm_matches} | {
+                candidate.term for candidate in results.near_matches
+                if candidate.term.casefold() in accepted_terms
+            })
+            matched_item_indexes = [
+                index for index, item in enumerate(record["items"])
+                if index not in assigned_item_indexes
+                and (
+                    item["description"].casefold() in current_matched_terms
+                    or item["description"].casefold() in accepted_terms
+                )
+            ]
+            matched_items = [record["items"][index] for index in matched_item_indexes]
+            if not matched_items:
+                continue
+            assigned_item_indexes.update(matched_item_indexes)
+            group = ScannerGroup(
+                ritm_key,
+                f"{ritm.upper()} "
+                f"({len(exact_files)} exact, {len(accepted_files)} similar accepted)",
+                group_terms,
+                sorted(exact_files | accepted_files),
+                sorted(exact_files),
+                results.near_matches,
+            )
+            self.groups[group.key] = group
+
+            matched_location_address = next(
+                (m.location_address for m in ritm_matches if m.location_address),
+                "",
+            )
+            matched_location = next(
+                (m.location for m in ritm_matches if m.location),
+                "",
+            )
+
+            ritm_record: PackingListRecord = {
+                **record,
+                "ritm": ritm,
+                "letter": "",
+                "group": ritm_key,
+                "location": matched_location or record.get("location", ""),
+                "location_address": matched_location_address or record.get("location_address", ""),
+                "items": [
+                    {**item, "_ritm": ritm}
+                    for item in matched_items
+                ],
+                "source_matches": list(ritm_matches),
+            }
+            staged_ritm_records.append((ritm_record, ritm_matches))
+            staged.append(ritm_record)
+
+        unmatched_items = [
+            item for index, item in enumerate(record["items"])
+            if index not in assigned_item_indexes
+        ]
+
+        dialog = AddressBatchDialog(
+            self,
+            unmatched_items,
+            staged,
+            record,
+            subject_matches=subject_matches,
+            time_range=time_range,
+            search_terms=search_terms_for_rescan,
+        )
+        dialog.rescan_found_sources.connect(self._on_rescan_sources)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.pending_record = None
+            self.imported_record = None
+            self.imported_source_path = None
+            self._set_processing_state(True)
+            self.status_label.setText("Scan cancelled.")
+            return
+
+        self._commit_dialog_state(
+            record, dialog, staged_ritm_records
+        )
+
+        queued_packing_lists = [
+            _packing_list_identifier(r)
+            for r in self.records
+            if r["packing_list"].casefold() == record["packing_list"].casefold()
+        ]
+
+        self.pending_record = None
+        self.imported_record = None
+        self.imported_source_path = None
+        self._clear_current_list()
+        self.imported_info_label.setText("No input sheet imported yet.")
+        self._set_processing_state(True)
+
+        ritm_letters: dict[str, str] = {}
+        for r in self.records:
+            if r["packing_list"].casefold() == record["packing_list"].casefold():
+                if r["ritm"] and r["ritm"].casefold() != "no request item":
+                    ritm_letters[r["ritm"].casefold()] = r["letter"]
+
+        self._merge_matched_emails(
+            subject_matches,
+            ritm_letters,
+            record["packing_list"],
+        )
+
+        self.scan_results_label.setText(
+            f"Packing list IDs: {', '.join(queued_packing_lists)}\n"
+            f"Exact item matches across {matched_email_count} email(s):\n"
+            f"{chr(10).join(exact_summary)}\n"
+            f"Accepted near-match attachments: {total_accepted_files}. "
+            "Select an email below and choose Reply to open a draft. "
+            "Hand-typed RITMs work with Reply too."
+        )
+        self.status_label.setText(
+            f"Processed packing list IDs {', '.join(queued_packing_lists)}."
+        )
+
+    def _commit_dialog_state(
+        self,
+        template_record: PackingListRecord,
+        dialog: AddressBatchDialog,
+        staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]],
+    ) -> None:
+        input_identifiers = {
+            _packing_list_identifier(rec) for rec, _ in staged_ritm_records
+        }
+        output_identifiers = {
+            _packing_list_identifier(r) for r in dialog.staged_ritms
+        }
+        dropped_identifiers = input_identifiers - output_identifiers
+
+        if dropped_identifiers:
+            for record in list(self.records):
+                identifier = _packing_list_identifier(record)
+                if identifier not in dropped_identifiers:
+                    continue
+                if (record["packing_list"].casefold()
+                        != template_record["packing_list"].casefold()):
+                    continue
+                try:
+                    self.records.remove(record)
+                except ValueError:
+                    pass
+                self.record_source_matches.pop(identifier, None)
+                for dir_key in self.exported_record_ids_by_directory:
+                    self.exported_record_ids_by_directory[dir_key].discard(
+                        identifier.casefold()
+                    )
+
+        for ritm_record in dialog.staged_ritms:
+            items = ritm_record["items"]
+            if not items:
+                continue
+            packing_list_key = ritm_record["packing_list"].casefold()
+            ritm_key = (ritm_record["ritm"] or "").casefold()
+            existing = next(
+                (
+                    r for r in self.records
+                    if r["packing_list"].casefold() == packing_list_key
+                    and (r["ritm"] or "").casefold() == ritm_key
+                ),
+                None,
+            )
+            if existing is not None:
+                existing["items"].extend(items)
+                current = list(existing.get("source_matches") or [])
+                seen = {(m.entry_id, m.filename, m.term) for m in current}
+                for match in _record_source_matches(ritm_record):
+                    key = (match.entry_id, match.filename, match.term)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    current.append(match)
+                existing["source_matches"] = current
+            else:
+                self._append_record(ritm_record)
+
+        if dialog.unmatched_items:
+            self._build_unmatched_records(
+                template_record,
+                dialog.unmatched_items,
+                staged_ritm_records,
+            )
+
+        self._assign_letters_by_priority(template_record["packing_list"].casefold())
+        self._refresh_queue_table()
+
+    def _assign_letters_by_priority(self, packing_list_key: str) -> None:
+        this_list = [
+            r for r in self.records
+            if r["packing_list"].casefold() == packing_list_key
+        ]
+
+        if not this_list:
+            return
+
+        if len(this_list) == 1:
+            this_list[0]["letter"] = ""
+            return
+
+        def key(r: PackingListRecord):
+            has_ritm = bool(r["ritm"]) and r["ritm"].casefold() != "no request item"
+            has_loc = bool(r["location"].strip() or r["location_address"].strip())
+            if has_ritm and has_loc:
+                tier = 0
+            elif has_ritm:
+                tier = 1
+            elif has_loc:
+                tier = 2
+            else:
+                tier = 3
+            return (tier, -len(r["items"]), r["ritm"].casefold(), r["group"])
+
+        this_list.sort(key=key)
+
+        for i, r in enumerate(this_list):
+            number = i + 1
+            letters = ""
+            while number:
+                number, rem = divmod(number - 1, 26)
+                letters = chr(ord("A") + rem) + letters
+            r["letter"] = letters
+
+    def _scan_failed(self, error: str) -> None:
+        self.pending_record = None
+        self._set_processing_state(True)
+        self.status_label.setText("Scan did not complete")
+        self.scan_results_label.setText(
+            "The current packing list is still on the form and was not queued."
+        )
+        QMessageBox.critical(self, "Scanner failed", error)
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def _pick_source_match(
+        self,
+        identifier: str,
+        matches: list[ExactMatch],
+    ) -> ExactMatch | None:
+        if not matches:
+            return None
+
+        by_source: dict[tuple[str, str], list[ExactMatch]] = {}
+        for match in matches:
+            key = (match.entry_id, match.store_id)
+            by_source.setdefault(key, []).append(match)
+
+        if len(by_source) == 1:
+            return matches[0]
+
+        dialog = SourceMatchPickerDialog(self, identifier, matches)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.chosen is not None:
+            return dialog.chosen
+        return None
+
+    def _save_records(self) -> None:
+        _log_marker("=== EXPORT START ===")
+        if not self.records:
+            QMessageBox.information(
+                self, "Nothing to save",
+                "Add at least one list to the queue first.",
+            )
+            return
+
+        records_missing_separator = [
+            _packing_list_identifier(record)
+            for record in self.records
+            if record["driver_plate"].strip() and "/" not in record["driver_plate"]
+        ]
+        if records_missing_separator:
+            QMessageBox.warning(
+                self,
+                "Separate driver and plate",
+                "Enter Driver / Plate # with a slash between the two values "
+                f"(for example, Jane Doe / ABC123) before exporting these list(s): "
+                f"{', '.join(records_missing_separator)}.",
+            )
+            return
+
+        last_export_folder = (
+            self.app_config.get("last_export_folder")
+            or str(self.summaries_folder.parent
+                   if self.summaries_folder.parent.is_dir()
+                   else DEFAULT_SUMMARIES_DIR.parent)
+        )
+        if not Path(last_export_folder).is_dir():
+            last_export_folder = str(DEFAULT_SUMMARIES_DIR.parent)
+
+        _log_marker("EXPORT: before directory dialog")
+        selected_directory = QFileDialog.getExistingDirectory(
+            self,
+            "Choose where to save packing lists, per-load folders, and the "
+            "Reel Summary Report",
+            last_export_folder,
+        )
+        if not selected_directory:
+            _log_marker("EXPORT: user cancelled directory dialog")
+            return
+        _log_marker(f"EXPORT: directory chosen {selected_directory}")
+
+        self.app_config["last_export_folder"] = selected_directory
+        save_app_config(self.app_config)
+
+        destination_directory = Path(selected_directory)
+        directory_key = str(destination_directory.resolve()).casefold()
+        exported_record_ids = self.exported_record_ids_by_directory.get(directory_key, set())
+
+        self.summaries_folder = destination_directory / "Summaries"
+        self.summaries_folder.mkdir(parents=True, exist_ok=True)
+        self.summaries_label.setText(
+            f"{self.summaries_folder}  (auto-set from the Export Folder)"
+        )
+        self.app_config["summaries_folder"] = str(self.summaries_folder)
+        save_app_config(self.app_config)
+
+        records_to_export = [
+            record for record in self.records
+            if _packing_list_identifier(record).casefold() not in exported_record_ids
+        ]
+        _log_marker(f"EXPORT: {len(records_to_export)} record(s) to export")
+
+        packing_list_paths: list[Path] = []
+        per_load_folders: list[Path] = []
+        scrap_paths: list[Path] = []
+        for record in records_to_export:
+            identifier = _packing_list_identifier(record)
+            safe = re.sub(
+                r"[^A-Za-z0-9._-]+", "_", record["packing_list"]
+            ).strip("._-") or "PackingList"
+            if record["letter"]:
+                file_suffix = f"{safe}-{record['letter']}"
+            else:
+                file_suffix = safe
+            packing_list_paths.append(
+                destination_directory / f"Packing List {file_suffix}.xls"
+            )
+            load_folder = destination_directory / identifier
+            per_load_folders.append(load_folder)
+            scrap_paths.append(
+                load_folder / f"Scrap Pick Up Request for Load {identifier}.xls"
+            )
+
+        existing_destinations: list[Path] = []
+        for record, pl_path, sp_path in zip(records_to_export, packing_list_paths, scrap_paths):
+            if pl_path.exists():
+                existing_destinations.append(pl_path)
+            if sp_path.exists():
+                existing_destinations.append(sp_path)
+
+        for record, load_folder in zip(records_to_export, per_load_folders):
+            identifier = _packing_list_identifier(record)
+            req_pdf = load_folder / f"Request Item for Load {identifier}.pdf"
+            if req_pdf.exists():
+                existing_destinations.append(req_pdf)
+
+        if existing_destinations:
+            existing_names = "\n".join(path.name for path in existing_destinations)
+            answer = QMessageBox.question(
+                self,
+                "Replace existing files?",
+                f"These files already exist:\n{existing_names}\n\nReplace them?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                _log_marker("EXPORT: user declined overwrite")
+                return
+
+        _log_marker("EXPORT: building records_by_week")
+        records_by_week: dict[tuple[date, date], list[PackingListRecord]] = {}
+        frn_date_warnings: list[str] = []
+        for record in self.records:
+            frn_date, reason = _date_from_frn(record["packing_list"])
+            if frn_date is None:
+                frn_date_warnings.append(
+                    f"{_packing_list_identifier(record)}: "
+                    f"could not read a valid date from the FRN ({reason}); "
+                    f"using the typed date {record['date']} instead."
+                )
+                try:
+                    frn_date = parse_date(record["date"])
+                except Exception as error:
+                    QMessageBox.critical(
+                        self,
+                        "Could not read a record's date",
+                        f"{_packing_list_identifier(record)}: {error}",
+                    )
+                    return
+            try:
+                monday, friday = week_range(frn_date.isoformat())
+            except Exception as error:
+                QMessageBox.critical(
+                    self,
+                    "Could not read a record's date",
+                    f"{_packing_list_identifier(record)}: {error}",
+                )
+                return
+            records_by_week.setdefault((monday, friday), []).append(record)
+        _log_marker(f"EXPORT: {len(records_by_week)} week bucket(s)")
+
+        pdf_failures: list[str] = []
+        pdf_skipped_no_source: list[str] = []
+
+        shared_excel = None
+        try:
+            _log_marker("EXPORT: DispatchEx shared Excel")
+            shared_excel = win32com.client.DispatchEx("Excel.Application")
+            _tune_excel_for_batch(shared_excel)
+            _log_marker("EXPORT: shared Excel ready")
+
+            _log_marker("EXPORT: reel summary loop START")
+            _t_reel = _time.perf_counter()
+            for (monday, friday), week_records in records_by_week.items():
+                filename = summary_filename(monday, friday)
+                weekly_path = self.summaries_folder / filename
+                write_reel_summary_report(week_records, weekly_path, excel=shared_excel)
+            _log_marker(f"EXPORT: reel summary loop DONE {_time.perf_counter()-_t_reel:.2f}s")
+
+            _log_marker("EXPORT: per-record loop START")
+            _t_per = _time.perf_counter()
+            for record, pl_path, load_folder, sp_path in zip(
+                records_to_export, packing_list_paths, per_load_folders, scrap_paths
+            ):
+                identifier = _packing_list_identifier(record)
+                _log_marker(f"EXPORT: record {identifier}")
+
+                write_packing_list_template(record, pl_path, excel=shared_excel)
+
+                load_folder.mkdir(parents=True, exist_ok=True)
+                write_scrap_pickup_template(record, sp_path, excel=shared_excel)
+
+                matches = self.record_source_matches.get(identifier)
+                if matches is None:
+                    matches = _record_source_matches(record)
+                _log_marker(
+                    f"EXPORT: {identifier} source_matches={len(matches)}"
+                )
+                chosen = self._pick_source_match(identifier, matches)
+                if chosen is None:
+                    _log_marker(f"EXPORT: {identifier} no source match, skipping PDF")
+                    pdf_skipped_no_source.append(identifier)
+                    continue
+
+                _log_marker(f"EXPORT: {identifier} fetching PDF from Outlook")
+                pdf_bytes = fetch_attachment_bytes(
+                    chosen.entry_id, chosen.store_id, chosen.filename
+                )
+                if pdf_bytes is None:
+                    pdf_failures.append(
+                        f"{identifier}: could not re-open the source email"
+                    )
+                    continue
+
+                two_page_bytes = slice_first_pages(pdf_bytes, 2)
+                if two_page_bytes is None:
+                    pdf_failures.append(
+                        f"{identifier}: could not read the attachment as a PDF"
+                    )
+                    continue
+
+                annotated = annotate_pdf(two_page_bytes, f"Delivery {identifier}")
+                if annotated is None:
+                    pdf_failures.append(
+                        f"{identifier}: could not annotate the PDF"
+                    )
+                    continue
+
+                req_pdf_path = load_folder / f"Request Item for Load {identifier}.pdf"
+                req_pdf_path.write_bytes(annotated)
+            _log_marker(f"EXPORT: per-record loop DONE {_time.perf_counter()-_t_per:.2f}s")
+
+        except Exception as error:
+            _log_marker(f"EXPORT: EXCEPTION {error}")
+            QMessageBox.critical(self, "Could not save files", str(error))
+            return
+        finally:
+            _log_marker("EXPORT: releasing shared Excel")
+            _release_excel(shared_excel, None)
+            _log_marker("EXPORT: shared Excel released")
+
+        # ---- Database writes (sequence B: only after all files succeeded) ----
+        db_summary = ""
+        if not db_configured():
+            db_summary = "Database: skipped (no database configured)."
+        elif self.ignore_db_checkbox.isChecked():
+            db_summary = "Database: skipped (Ignore database checked)."
+        else:
+            if self.repeat_load_checkbox.isChecked():
+                deleted_total = 0
+                deleted_bases: set[str] = set()
+                for record in records_to_export:
+                    base = _base_frn(_packing_list_identifier(record))
+                    if base in deleted_bases:
+                        continue
+                    deleted_bases.add(base)
+                    deleted_total += delete_base_frn_from_db(
+                        _packing_list_identifier(record)
+                    )
+                _log_marker(
+                    f"DB: repeat-load wiped {deleted_total} master row(s) "
+                    f"across {len(deleted_bases)} base FRN(s)"
+                )
+
+            total_inserted = 0
+            total_skipped = 0
+            records_to_export.sort(key=lambda r: parse_date(r["date"]))
+            for record in records_to_export:
+                inserted, skipped = insert_record_to_db(record)
+                total_inserted += inserted
+                total_skipped += skipped
+            _log_marker(
+                f"DB: inserted {total_inserted} item row(s), "
+                f"skipped {total_skipped} duplicate(s)"
+            )
+            if self.repeat_load_checkbox.isChecked():
+                db_summary = (
+                    f"Database: replaced "
+                    f"{total_inserted} item row(s)"
+                    + (f", skipped {total_skipped} duplicate(s)."
+                       if total_skipped else ".")
+                )
+            else:
+                db_summary = (
+                    f"Database: inserted {total_inserted} item row(s)"
+                    + (f", skipped {total_skipped} duplicate(s)."
+                       if total_skipped else ".")
+                )
+        # ---- /Database writes ----
+
+        exported_record_ids.update(
+            _packing_list_identifier(record).casefold() for record in records_to_export
+        )
+        self.exported_record_ids_by_directory[directory_key] = exported_record_ids
+        count = len(records_to_export)
+        week_count = len(records_by_week)
+
+        self.status_label.setText(
+            f"Saved {count} packing-list workbook(s), "
+            f"{count} scrap-pickup workbook(s), "
+            f"{week_count} weekly Reel Summary Report(s), and "
+            f"per-load folders in {destination_directory}"
+        )
+
+        info_lines = [
+            f"Saved {count} packing-list workbook(s) (top-level)",
+            db_summary,
+            f"Created {count} per-load folder(s) with Scrap Pickup"
+            + (f" + {count - len(pdf_skipped_no_source)} Request Item PDF(s)" if pdf_skipped_no_source else " + Request Item PDF"),
+            f"Wrote {week_count} weekly Reel Summary Report(s) to "
+            f"{self.summaries_folder}",
+        ]
+        if frn_date_warnings:
+            info_lines.append("")
+            info_lines.append("FRN date warnings:")
+            info_lines.extend(f"  - {msg}" for msg in frn_date_warnings)
+        if pdf_skipped_no_source:
+            info_lines.append("")
+            info_lines.append(
+                "Request Item PDFs skipped (no source email on file — "
+                "use Rescan in the assignment dialog if you have an RITM "
+                "you know about):"
+            )
+            info_lines.extend(f"  - {msg}" for msg in pdf_skipped_no_source)
+        if pdf_failures:
+            info_lines.append("")
+            info_lines.append("PDF warnings:")
+            info_lines.extend(f"  - {msg}" for msg in pdf_failures)
+        _log_marker("=== EXPORT DONE ===")
+        QMessageBox.information(
+            self,
+            "Workbooks saved",
+            "\n".join(info_lines) + f"\n\nLocation:\n{destination_directory}",
+        )
+
+
+if __name__ == "__main__":
+    application = QApplication(sys.argv)
+    window = PackingListApp()
+    window.show()
+    sys.exit(application.exec())
