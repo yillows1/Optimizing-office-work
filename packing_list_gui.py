@@ -157,10 +157,22 @@ def parse_date(value: str) -> date:
 
 
 def normalize_item_type(value: str) -> str:
+    """Canonicalize item type strings.
+
+    Handles the FO variants the summary tab and P-tabs use interchangeably:
+    '99FO', '99fo', '99 FO', 'FO99', 'fo 99', 'FO 99', 'FO-99' all → '99 FO'.
+    Everything else passes through (upper-cased) as before.
+    """
     cleaned = " ".join(value.split())
+    folded = cleaned.casefold().replace("-", " ").replace("_", " ")
+    folded = " ".join(folded.split())
+
     common_types = {
         "99 fo": "99 FO",
         "99fo": "99 FO",
+        "fo99": "99 FO",
+        "fo 99": "99 FO",
+        "99 fo ": "99 FO",
         "23": "23",
         "type 23": "Type 23",
         "type23": "Type 23",
@@ -170,7 +182,7 @@ def normalize_item_type(value: str) -> str:
         "type4": "Type 4",
         "69s": "69S",
     }
-    return common_types.get(cleaned.casefold(), cleaned.upper())
+    return common_types.get(folded, cleaned.upper())
 
 
 def normalize_ritm(value: str) -> str:
@@ -290,6 +302,24 @@ CREATE INDEX IF NOT EXISTS idx_items_pl
 
 CREATE INDEX IF NOT EXISTS idx_master_ritm
     ON Reel_Load_Database (RITM_Number);
+
+CREATE INDEX IF NOT EXISTS idx_master_date
+    ON Reel_Load_Database (Receiving_Date);
+
+CREATE VIEW IF NOT EXISTS Reel_Load_By_Date AS
+SELECT Packing_List_Number, Receiving_Date, RITM_Number, Location,
+       Truck, Truck_Number,
+       Total_Gross_Weight, Total_Tare, Total_Net_Weight, Number_of_Reels
+FROM Reel_Load_Database
+ORDER BY Receiving_Date, Packing_List_Number;
+
+CREATE VIEW IF NOT EXISTS Reel_Items_By_Date AS
+SELECT m.Receiving_Date, i.Packing_List_Number, i.RITM_Number,
+       i.Item_Description, i.Item_Type, i.Gross, i.Tare, i.Net
+FROM Reel_Items i
+JOIN Reel_Load_Database m
+  ON m.Packing_List_Number = i.Packing_List_Number
+ORDER BY m.Receiving_Date, i.Packing_List_Number, i.Item_Description;
 """
 
 _SCHEMA_LOCK = threading.Lock()
@@ -503,7 +533,13 @@ def insert_record_to_db(record: PackingListRecord) -> tuple[int, int]:
     pl_number = _packing_list_identifier(record)
     ritm_value = _db_ritm_value(record.get("ritm", ""))
     items = list(record.get("items") or [])
+    _logging.info(
+        f"DB-INSERT {pl_number}: raw driver_plate={record.get('driver_plate', '')!r}"
+    )
     driver, plate = _split_driver_and_plate(record.get("driver_plate", ""))
+    _logging.info(
+        f"DB-INSERT {pl_number}: split driver={driver!r} plate={plate!r}"
+    )
     try:
         receiving_date = parse_date(record["date"]).isoformat()
     except Exception:
@@ -553,7 +589,7 @@ def insert_record_to_db(record: PackingListRecord) -> tuple[int, int]:
                             pl_number,
                             ritm_value,
                             desc,
-                            item.get("type") or "",
+                            normalize_item_type(item.get("type") or ""),
                             int(item.get("gross", 0) or 0),
                             int(item.get("tare", 0) or 0),
                             int(item.get("net", 0) or 0),
@@ -2186,7 +2222,12 @@ def parse_incoming_packing_list(path: str | Path) -> PackingListRecord:
 
         driver_plate = plate
         if cont:
-            driver_plate = f"{plate} / {cont}" if plate else cont
+            raw_driver_plate = f"{plate} / {cont}" if plate else cont
+            driver_value, plate_value = _split_driver_and_plate(raw_driver_plate)
+            if plate_value:
+                driver_plate = f"{driver_value} / {plate_value}"
+            else:
+                driver_plate = driver_value or raw_driver_plate
 
         return {
             "group": "",
@@ -2258,8 +2299,9 @@ def write_packing_list_template(
             if i >= num_rows:
                 break
             description = item["description"]
-            if item["type"]:
-                description = f"{description} ({item['type']})"
+            item_type = normalize_item_type(item["type"] or "")
+            if item_type:
+                description = f"{description} ({item_type})"
             grid[i][0] = description
             grid[i][6] = item["gross"]
             grid[i][7] = item["tare"]
@@ -2277,8 +2319,9 @@ def write_packing_list_template(
             for i, item in enumerate(record["items"]):
                 row = 13 + i
                 description = item["description"]
-                if item["type"]:
-                    description = f"{description} ({item['type']})"
+                item_type = normalize_item_type(item["type"] or "")
+                if item_type:
+                    description = f"{description} ({item_type})"
                 _safe_write(sheet, f"B{row}", description)
                 _safe_write(sheet, f"H{row}", item["gross"])
                 _safe_write(sheet, f"I{row}", item["tare"])
@@ -2375,13 +2418,87 @@ def _packing_list_identifier(record: PackingListRecord) -> str:
         return f"{record['packing_list']}-{letter}"
     return record["packing_list"]
 
+_PLATE_TOKEN_RE = re.compile(r"^[A-Z0-9-]{2,10}$", re.IGNORECASE)
+_NAME_TOKEN_RE = re.compile(r"[A-Za-z]{2,}", re.IGNORECASE)
+
+
+def _looks_like_plate(token: str) -> bool:
+    token = token.strip()
+    if not token or " " in token:
+        return False
+    if not _PLATE_TOKEN_RE.fullmatch(token):
+        return False
+    # Pure-digit plates (205396, 2460) and mixed alphanumerics (ABC123)
+    # are plates. Single-token all-letters like 'CEVA' or 'PD' are names.
+    if token.isalpha() and not any(ch.isdigit() for ch in token):
+        return False
+    return True
+
+
+def _looks_like_name(token: str) -> bool:
+    token = token.strip()
+    if not token:
+        return False
+    if " " in token:
+        return True
+    # A short all-letter token (CEVA, PD) is a company/driver name.
+    return bool(_NAME_TOKEN_RE.fullmatch(token)) and len(token) <= 20
+
 
 def _split_driver_and_plate(value: str) -> tuple[str, str]:
-    if "/" not in value:
-        return value.strip(), ""
-    driver, plate = value.split("/", 1)
-    return driver.strip(), plate.strip()
+    """Return (driver, plate) from any reasonable ordering.
 
+    Handles:
+      "CEVA / 205396"      -> ("CEVA", "205396")
+      "205396 / CEVA"      -> ("CEVA", "205396")
+      "Jane Doe / ABC123"  -> ("Jane Doe", "ABC123")
+      "ABC123 / Jane Doe"  -> ("Jane Doe", "ABC123")
+      "PD / 2460"          -> ("PD", "2460")
+      "2460 / PD"          -> ("PD", "2460")
+      "CEVA 205396"        -> ("CEVA", "205396")   (no slash, space split)
+      "205396 CEVA"        -> ("CEVA", "205396")
+    """
+    raw = value.strip()
+    if not raw:
+        return "", ""
+
+    parts: list[str]
+    if "/" in raw:
+        parts = [p.strip() for p in raw.split("/", 1)]
+    elif " " in raw and not any(seg.isdigit() for seg in raw.split()):
+        # No slash, no digits: split on last space and let the canonical
+        # heuristics decide. If neither side looks like a plate, treat the
+        # whole string as the driver.
+        head, _, tail = raw.rpartition(" ")
+        if _looks_like_plate(tail):
+            return head.strip(), tail.strip()
+        return raw, ""
+    elif " " in raw:
+        # No slash, mixed tokens: split on the LAST space so multi-word
+        # names like "Jane Doe ABC123" become ("Jane Doe", "ABC123").
+        head, _, tail = raw.rpartition(" ")
+        parts = [head.strip(), tail.strip()]
+    else:
+        return raw, ""
+
+    left, right = parts[0], parts[1] if len(parts) > 1 else ""
+
+    left_plate = _looks_like_plate(left)
+    right_plate = _looks_like_plate(right)
+    left_name = _looks_like_name(left)
+    right_name = _looks_like_name(right)
+
+    if left_plate and not right_plate:
+        return right, left
+    if right_plate and not left_plate:
+        return left, right
+    if left_name and right_plate:
+        return left, right
+    if right_name and left_plate:
+        return right, left
+
+    # Fallback: driver first, as typed.
+    return left, right
 
 def _split_reel_id(description: str) -> tuple[str, str]:
     cleaned = description.strip()
@@ -2449,9 +2566,14 @@ def _read_reel_summary_record(sheet) -> PackingListRecord | None:
             "tare": tare,
             "net": gross - tare,
         })
+    # Prefer M7/M8 (written by newer exports). Fall back to F8/F9 only
+    # when M7/M8 are both blank, so old workbooks still read correctly.
+    driver = str(sheet.Range("M7").Value or "").strip()
+    plate = str(sheet.Range("M8").Value or "").strip()
+    if not (driver or plate):
+        driver = str(sheet.Range("F8").Value or "").strip()
+        plate = str(sheet.Range("F9").Value or "").strip()
 
-    trucker = str(sheet.Range("F8").Value or "").strip()
-    trailer = str(sheet.Range("F9").Value or "").strip()
     return {
         "group": "",
         "ritm": str(sheet.Range("M5").Value or "").strip(),
@@ -2460,7 +2582,7 @@ def _read_reel_summary_record(sheet) -> PackingListRecord | None:
         "packing_list": packing_list,
         "location": str(sheet.Range("C7").Value or "").strip(),
         "location_address": "",
-        "driver_plate": f"{trucker} / {trailer}" if trucker or trailer else "",
+        "driver_plate": f"{driver} / {plate}" if (driver or plate) else "",
         "items": items,
     }
 
@@ -2507,7 +2629,7 @@ def _copy_template_reel_tabs(
         existing_names.add(f"__new_r_{n}".casefold())
         after_sheet = new_sheet
         created.append(new_sheet)
-        for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
+        for address in ("M2", "M4", "M5", "M7", "M8", "C7", "I7", "C8", "F8", "C9", "F9"):
             _safe_write(new_sheet, address, "")
         _clear_item_range(new_sheet, 12, 42, 4, 8)
 
@@ -2624,7 +2746,7 @@ def write_reel_summary_report(
 
             _log_marker("write_reel_summary: clearing old content (batched)")
             for sheet in reel_sheets:
-                for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
+                for address in ("M2", "M4", "M5", "M7", "M8", "C7", "I7", "C8", "F8", "C9", "F9"):
                     _safe_write(sheet, address, "")
                 _clear_item_range(sheet, 12, 42, 4, 8)
             _log_marker("write_reel_summary: clear done")
@@ -2645,6 +2767,11 @@ def write_reel_summary_report(
                 _safe_write(sheet, "F8", driver)
                 _safe_write(sheet, "C9", "N/A")
                 _safe_write(sheet, "F9", plate)
+                # Canonical driver/plate storage so the summary round-trip
+                # is order-independent (F8/F9 layout in older templates
+                # may be plate-first, which caused Truck/Truck_Number swaps).
+                _safe_write(sheet, "M7", driver)
+                _safe_write(sheet, "M8", plate)
 
                 block_rows = 31
                 block_cols = 5
@@ -2655,7 +2782,7 @@ def write_reel_summary_report(
                     reel_id, reel_size = _split_reel_id(item["description"])
                     grid[i][0] = reel_id
                     grid[i][1] = reel_size
-                    grid[i][2] = item["type"]
+                    grid[i][2] = normalize_item_type(item["type"] or "")
                     grid[i][3] = item["gross"]
                     grid[i][4] = item["tare"]
 
@@ -2673,7 +2800,7 @@ def write_reel_summary_report(
                         reel_id, reel_size = _split_reel_id(item["description"])
                         _safe_write(sheet, f"D{row}", reel_id)
                         _safe_write(sheet, f"E{row}", reel_size)
-                        _safe_write(sheet, f"F{row}", item["type"])
+                        _safe_write(sheet, f"F{row}", normalize_item_type(item["type"] or ""))
                         _safe_write(sheet, f"G{row}", item["gross"])
                         _safe_write(sheet, f"H{row}", item["tare"])
 
@@ -4622,17 +4749,21 @@ class PackingListApp(QMainWindow):
             )
             return
 
-        records_missing_separator = [
-            _packing_list_identifier(record)
-            for record in self.records
-            if record["driver_plate"].strip() and "/" not in record["driver_plate"]
-        ]
+        records_missing_separator = []
+        for record in self.records:
+            raw = record["driver_plate"].strip()
+            if not raw:
+                continue
+            driver, plate = _split_driver_and_plate(raw)
+            if not driver or not plate:
+                records_missing_separator.append(_packing_list_identifier(record))
         if records_missing_separator:
             QMessageBox.warning(
                 self,
-                "Separate driver and plate",
-                "Enter Driver / Plate # with a slash between the two values "
-                f"(for example, Jane Doe / ABC123) before exporting these list(s): "
+                "Driver and plate missing",
+                "Enter Driver / Plate # (e.g. 'Jane Doe / ABC123' or "
+                "'CEVA 205396') so both the driver and the plate can be "
+                f"read. Check these list(s): "
                 f"{', '.join(records_missing_separator)}.",
             )
             return

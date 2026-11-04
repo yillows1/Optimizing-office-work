@@ -158,6 +158,13 @@ ALIASES = {
     "FO99": "99FO",
 }
 
+# Display form for materials that fold together via ALIASES. Anything that
+# compares equal under `norm()` is also *written* in this canonical form, so
+# the spreadsheet never shows both "FO99" and "99 FO" for the same class.
+CANONICAL_DISPLAY = {
+    "99FO": "99 FO",
+}
+
 
 def norm(s: str) -> str:
     """Canonical key for comparing material names. Spaces and case are
@@ -175,13 +182,21 @@ def normalize_material(value) -> str:
     text = str(value).strip()
     if not text:
         return ""
+    # Numeric-looking materials ("53", "69.0", …) are kept as ints/floats.
     try:
         f = float(text)
         if f.is_integer():
-            return str(int(f))
-        return str(f)
+            numeric = str(int(f))
+        else:
+            numeric = str(f)
     except (ValueError, TypeError):
-        return text
+        numeric = text
+
+    # FO variants (99FO, FO99, 99 FO, fo-99, …) all fold to "99 FO" so the
+    # UI, the Split Material workbook, the P tabs, and the R tab all use
+    # one display form.
+    key = norm(numeric)
+    return CANONICAL_DISPLAY.get(key, numeric)
 
 
 def split_material_cell(value) -> list[str]:
