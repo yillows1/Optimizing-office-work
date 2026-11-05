@@ -14,8 +14,12 @@ Outputs:
   A) JC-merged   = JC file + our reels + our loose   (email this)
   B) Rahway-only = blank template + our reels + our loose  (print this)
 
-Reads/writes .xls and .xlsx via Excel COM. Skips protected cells silently.
+Reads/writes .xls and .xlsx via Excel COM. Logs and skips protected cells.
 JC keeps file order; reels and loose interleave by date.
+
+Class inputs are updated with additive Excel formulas so existing entries and
+new load contributions remain together. Protected formulas and totals are left
+untouched; Excel recalculates the linked report tabs before the file is saved.
 
 Audit trail:
   - Each FRN cell on a date tab gets a comment showing what was added.
@@ -88,9 +92,6 @@ def save_cfg(cfg: dict) -> None:
 # =============================================================================
 
 DATE_TAB_FMT = "%m_%d_%y"
-FIRST_CLASS_ROW = 14
-LAST_CLASS_ROW = 56
-TOTAL_ROW = 57
 
 FOR_C_FRNS = [f"B{r}" for r in range(7, 12)]
 VZ_FRNS = [f"D{r}" for r in range(7, 12)]
@@ -114,6 +115,7 @@ CLASS_ALIASES = {
     "KBD/MOUSE": "Keyboard/Mouse", "KBD": "Keyboard/Mouse",
     "MOUSE": "Keyboard/Mouse", "REMOTE": "Remote", "STB": "STB",
     "RETURN": "RETURN", "EMPTY REELS RETURN": "RETURN",
+    "OTHER": "RETURN",
     "99FO": "99 FO", "FO99": "99 FO",
 }
 
@@ -160,6 +162,8 @@ class LoadRow:
     tare: int = 0
     net: int = 0
     class_nets: dict = field(default_factory=dict)
+    class_gross: dict = field(default_factory=dict)
+    class_tare: dict = field(default_factory=dict)
     folder: str = ""
     note: str = ""
 
@@ -177,6 +181,9 @@ def _read_cell(ws, address: str):
 
 def _try_write(ws, address: str, value) -> bool:
     rng = ws.Range(address)
+    if ws.ProtectContents and rng.Locked:
+        log(f"SKIP protected: {ws.Name}!{address}")
+        return False
     try:
         rng.Value = value
         return True
@@ -186,6 +193,46 @@ def _try_write(ws, address: str, value) -> bool:
             log(f"SKIP protected: {ws.Name}!{address}")
             return False
         raise
+
+
+def _additive_formula(existing_formula, existing_value, additions: list[int]) -> str | None:
+    """Build a formula that adds contributions without discarding existing data."""
+    nz = [int(value) for value in additions if value]
+    if not nz:
+        return None
+
+    base = ""
+    if isinstance(existing_formula, str):
+        existing_formula = existing_formula.strip()
+        if existing_formula.startswith("="):
+            try:
+                float(existing_value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Cannot safely add to non-numeric cell value {existing_value!r}"
+                )
+            base = existing_formula[1:]
+        elif existing_formula:
+            try:
+                number = float(existing_formula)
+            except ValueError as e:
+                raise ValueError(
+                    f"Cannot safely add to cell contents {existing_formula!r}"
+                ) from e
+            if number:
+                base = existing_formula
+        elif existing_value not in (None, ""):
+            raise ValueError(
+                f"Cannot safely add to cell value {existing_value!r}"
+            )
+    elif existing_formula is None and existing_value not in (None, ""):
+        raise ValueError(f"Cannot safely add to cell value {existing_value!r}")
+    elif isinstance(existing_formula, (int, float)) and existing_formula:
+        base = (str(int(existing_formula)) if float(existing_formula).is_integer()
+                else str(existing_formula))
+
+    terms = ([f"({base})"] if base else []) + [str(value) for value in nz]
+    return "=" + "+".join(terms)
 
 
 class _ReadOnlyWorkbook:
@@ -588,12 +635,26 @@ def parse_loose_file(path: Path) -> dict:
                     "gross": total_gross, "tare": total_tare, "net": total_net,
                 })
 
+        # Per-class gross and tare sums from the line items. The sheet's
+        # C column uses these for loose loads: each class row gets the sum
+        # of every item's gross for that class, and D gets the sum of every
+        # item's tare for that class. This is what the reference file shows
+        # (e.g. class 53 = "=2092+3178" / "=320+650", not the load totals).
+        class_gross: dict[str, int] = {}
+        class_tare: dict[str, int] = {}
+        for it in items:
+            cls = normalize_class(it.get("type") or "L")
+            class_gross[cls] = class_gross.get(cls, 0) + int(it.get("gross", 0))
+            class_tare[cls] = class_tare.get(cls, 0) + int(it.get("tare", 0))
+
         return {
             "date": date_iso,
             "packing_list": packing_list,
             "ritm": ritm,
             "location": location,
             "items": items,
+            "class_gross": class_gross,
+            "class_tare": class_tare,
             "total_gross": total_gross,
             "total_tare": total_tare,
             "total_net": total_net,
@@ -657,10 +718,12 @@ def collect_from_loose_folders(root: Path, monday: date) -> list[LoadRow]:
                 tare=tare,
                 net=net,
                 class_nets=class_nets,
+                class_gross=dict(data.get("class_gross", {})),
+                class_tare=dict(data.get("class_tare", {})),
                 folder=str(path.parent),
             ))
         except Exception as e:
-            log(f"Loose parse failed for {path.name}: {e}")
+            log(f"Loose parse failed for {frn}: {e}")
     return loads
 
 
@@ -668,11 +731,14 @@ def collect_from_loose_folders(root: Path, monday: date) -> list[LoadRow]:
 # Write into the workbook
 # =============================================================================
 
-_AUDIT_PATH: Path | None = None  # CHANGED: set in fill_payment_statement
+_AUDIT_PATH: Path | None = None
 
 
 def _rename_date_tabs(wb, monday: date) -> dict[str, str]:
     mapping = {}
+    if wb.ProtectStructure:
+        log("SKIP protected workbook structure: date tabs not renamed")
+        return mapping
     existing = [s.Name for s in wb.Worksheets if re.fullmatch(r"\d{2}_\d{2}_\d{2}", s.Name)]
     wanted = [monday + timedelta(days=i) for i in range(5)]
     ed = []
@@ -708,45 +774,7 @@ def _append_frn(ws, frn, ritm) -> int | None:
     return None
 
 
-def _add_class_weight(ws, class_key, net_weight,
-                     gross_weight=0, tare_weight=0,
-                     *, is_first_class_for_load=False):
-    """Add weight to a class row. Returns (gross_delta, tare_delta, net_delta)
-    actually written, so the caller can log the per-load contribution.
-
-    Gross/Tare are only written on the *first* class row for a load so the
-    column totals reconcile to one gross/tare per scale ticket.
-    """
-    row = CLASS_TO_ROW.get(class_key) or CLASS_TO_ROW["99X"]
-
-    def bump(col, amount):
-        if amount == 0:
-            return 0
-        addr = f"{col}{row}"
-        cur = _read_cell(ws, addr)
-        try: cur = int(float(cur or 0))
-        except Exception: cur = 0
-        _try_write(ws, addr, cur + int(amount))
-        return int(amount)
-
-    net_d = bump("E", net_weight)
-    gross_d = bump("C", gross_weight) if is_first_class_for_load else 0
-    tare_d = bump("D", tare_weight) if is_first_class_for_load else 0
-    return gross_d, tare_d, net_d
-
-
-def _recompute_total(ws):
-    for col in ("C", "D", "E"):
-        total = 0
-        for r in range(FIRST_CLASS_ROW, LAST_CLASS_ROW + 1):
-            v = _read_cell(ws, f"{col}{r}")
-            try: total += int(float(v or 0))
-            except Exception: pass
-        _try_write(ws, f"{col}{TOTAL_ROW}", total)
-
-
 def _find_frn_addr(ws, frn: str) -> str | None:
-    """Locate which of B7:B11 / D7:D11 holds this FRN."""
     for addr in FOR_C_FRNS + VZ_FRNS:
         v = _read_cell(ws, addr)
         if v is not None and str(v).strip() == frn:
@@ -756,17 +784,13 @@ def _find_frn_addr(ws, frn: str) -> str | None:
 
 def _audit_comment(ws, target: str, lr: LoadRow, class_nets: dict,
                    gross: int, tare: int, net: int):
-    """Drop a cell comment on the FRN cell showing what was added."""
-    parts = []
-    if gross: parts.append(f"Gross {gross}")
-    if tare: parts.append(f"Tare {tare}")
-    if net: parts.append(f"Net {net}")
-    detail = " + ".join(f"{cls}:{w}" for cls, w in class_nets.items() if w)
-    comment = f"{lr.frn}  ({lr.date})"
+    parts = " + ".join(f"{cls}:{w}" for cls, w in class_nets.items() if w)
+    lines = [f"{lr.frn}  ({lr.date})"]
     if parts:
-        comment += "\n" + " | ".join(parts)
-    if detail:
-        comment += f"\nclasses: {detail}"
+        lines.append(parts)
+    if gross or tare or net:
+        lines.append(f"gross {gross} | tare {tare} | net {net}")
+    comment = "\n".join(lines)
     try:
         rng = ws.Range(target)
         try:
@@ -781,7 +805,6 @@ def _audit_comment(ws, target: str, lr: LoadRow, class_nets: dict,
 
 def _audit_log_line(lr: LoadRow, gross: int, tare: int, net: int,
                     class_nets: dict):
-    """Append one tab-separated line to the sidecar log (if configured)."""
     if _AUDIT_PATH is None:
         return
     visible = {k: v for k, v in class_nets.items() if v}
@@ -809,7 +832,14 @@ def _update_statistic_tab(wb, loads):
         if _try_write(ws, f"B{r}", load.frn): wrote = True
         if _try_write(ws, f"C{r}", load.ritm or "No Request Item"): wrote = True
         if _try_write(ws, f"G{r}", load.net): wrote = True
-        landfill_wt = int((load.class_nets or {}).get("99X", 0) or 0)
+        # H is the LANDFILL-only weight: 99X + wood + plastic + kbd/mouse +
+        # remote. Fiber Optic (99 FO) and CDBD are NOT landfill; they belong
+        # to the non-metallic recyclable stream and are counted on the 99X
+        # tab's "Non-Metalic Recyc" line, not here.
+        landfill_wt = 0
+        cn = load.class_nets or {}
+        for cls in ("99X", "WOOD", "Loose Plastic", "Keyboard/Mouse", "Remote"):
+            landfill_wt += int(cn.get(cls, 0) or 0)
         if _try_write(ws, f"H{r}", landfill_wt): wrote = True
         loc = (load.origin or "").strip().upper() or "NO LOCATION"
         if _try_write(ws, f"K{r}", loc): wrote = True
@@ -817,6 +847,7 @@ def _update_statistic_tab(wb, loads):
 
 
 def _fill_b5_per_date_tab(wb, monday: date) -> None:
+    epoch = date(1904, 1, 1) if wb.Date1904 else date(1899, 12, 30)
     tab_dates = [monday + timedelta(days=i) for i in range(5)]
     for d in tab_dates:
         tab_name = d.strftime(DATE_TAB_FMT)
@@ -825,17 +856,12 @@ def _fill_b5_per_date_tab(wb, monday: date) -> None:
         except Exception:
             continue
         try:
-            _try_write(
-                ws, "B5",
-                datetime.combine(d, datetime.min.time()),
-            )
-            ws.Range("B5").NumberFormat = "mm/dd/yyyy"
+            _try_write(ws, "B5", (d - epoch).days)
         except Exception as e:
             log(f"B5 write failed on {tab_name}: {e}")
 
 
 def _verify_audit_totals():
-    """Read the sidecar log and log its grand totals for cross-checking."""
     if _AUDIT_PATH is None or not _AUDIT_PATH.exists():
         return
     totals = {"gross": 0, "tare": 0, "net": 0}
@@ -857,7 +883,7 @@ def fill_payment_statement(source_template, loads, out_path, *, monday,
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _AUDIT_PATH = out_path.with_name(out_path.stem + "_loads.log")
     try:
-        _AUDIT_PATH.write_text("", encoding="utf-8")  # truncate per run
+        _AUDIT_PATH.write_text("", encoding="utf-8")
     except Exception as e:
         log(f"could not create audit log {_AUDIT_PATH}: {e}")
         _AUDIT_PATH = None
@@ -867,49 +893,114 @@ def fill_payment_statement(source_template, loads, out_path, *, monday,
     excel = _ExcelHandle()
     try:
         wb = excel.open(tmp)
+
+        # Class net cells and total-row cells are template formulas; do not
+        # write to column E or row 57.
         _rename_date_tabs(wb, monday)
         _fill_b5_per_date_tab(wb, monday)
+
         by_date: dict[str, list[LoadRow]] = {}
-        for lr in loads: by_date.setdefault(lr.date, []).append(lr)
+        for lr in loads:
+            by_date.setdefault(lr.date, []).append(lr)
+
         for iso, day in by_date.items():
-            try: d = datetime.strptime(iso, "%Y-%m-%d").date()
+            try:
+                d = datetime.strptime(iso, "%Y-%m-%d").date()
             except Exception:
-                log(f"Skipping load with bad date {iso}"); continue
-            try: ws = wb.Worksheets(d.strftime(DATE_TAB_FMT))
+                log(f"Skipping load with bad date {iso}")
+                continue
+            try:
+                ws = wb.Worksheets(d.strftime(DATE_TAB_FMT))
             except Exception:
-                log(f"Date tab {d.strftime(DATE_TAB_FMT)} missing — skipping {iso}"); continue
+                log(f"Date tab {d.strftime(DATE_TAB_FMT)} missing — skipping {iso}")
+                continue
+
+            # Per-class C and D. Do NOT touch E — it is locked and already
+            # computes =C-D on every class row.
+            #
+            # Reels: C{row} += class_nets[cls]   (the class's own net from
+            #        the Reel Summary), D stays 0.
+            # Loose: C{row} += class_gross[cls]  (sum of that class's item
+            #        grosses), D{row} += class_tare[cls] (sum of that
+            #        class's item tares).
+            # RETURN: C{row} += load.tare, D{row} += load.tare.
+            #
+            # Both accumulate into per-class lists, written as additive
+            # formulas so the formula bar shows every load's contribution.
+            day_c: dict[str, list[int]] = {}
+            day_d: dict[str, list[int]] = {}
+            return_tare_total = 0
+
+            for lr in day:
+                class_nets = dict(lr.class_nets or {})
+                if not class_nets and lr.net:
+                    class_nets = {"99X": lr.net}
+
+                if "RETURN" in class_nets:
+                    return_tare_total += lr.tare
+
+                real_classes = [c for c in class_nets if c != "RETURN"]
+                if not real_classes:
+                    continue
+
+                if lr.source == "loose" and (lr.class_gross or lr.class_tare):
+                    for cls in real_classes:
+                        g = int((lr.class_gross or {}).get(cls, 0) or 0)
+                        t = int((lr.class_tare or {}).get(cls, 0) or 0)
+                        if g:
+                            day_c.setdefault(cls, []).append(g)
+                        if t:
+                            day_d.setdefault(cls, []).append(t)
+                else:
+                    # Reels (and any loose load whose per-class gross/tare
+                    # weren't parsed): use the class net as the gross.
+                    for cls in real_classes:
+                        n = int(class_nets.get(cls, 0) or 0)
+                        if n:
+                            day_c.setdefault(cls, []).append(n)
+
+            # 1) Write FRNs + RITMs to the two FRN blocks.
             for lr in day:
                 row = _append_frn(ws, lr.frn, lr.ritm)
                 if row is None:
                     log(f"{d.strftime(DATE_TAB_FMT)}: FRN slots full; {lr.frn} skipped")
-                    continue
 
-                class_nets = lr.class_nets or {}
+            # 2) Per class: add contributions to the unlocked C/D inputs.
+            # Never write the locked E formulas.
+            for cls, vals in day_c.items():
+                row = CLASS_TO_ROW.get(cls) or CLASS_TO_ROW["99X"]
+                address = f"C{row}"
+                rng = ws.Range(address)
+                formula = _additive_formula(rng.Formula, rng.Value, vals)
+                if formula is not None:
+                    _try_write(ws, address, formula)
+
+            for cls, vals in day_d.items():
+                row = CLASS_TO_ROW.get(cls) or CLASS_TO_ROW["99X"]
+                address = f"D{row}"
+                rng = ws.Range(address)
+                formula = _additive_formula(rng.Formula, rng.Value, vals)
+                if formula is not None:
+                    _try_write(ws, address, formula)
+
+            # 3) RETURN row: C and D both get the tare total.
+            ret_row = CLASS_TO_ROW["RETURN"]
+            if return_tare_total:
+                _try_write(ws, f"C{ret_row}", f"={return_tare_total}")
+                _try_write(ws, f"D{ret_row}", f"={return_tare_total}")
+
+            # 4) Leave all locked total formulas untouched.
+
+            # 5) Comments + sidecar audit log per load.
+            for lr in day:
+                frn_addr = _find_frn_addr(ws, lr.frn)
+                class_nets = dict(lr.class_nets or {})
                 if not class_nets and lr.net:
                     class_nets = {"99X": lr.net}
-
-                # CHANGED: accumulate what this load actually wrote, and
-                # record it on the FRN cell + sidecar log.
-                load_gross = load_tare = load_net = 0
-                first = True
-                for cls, w in class_nets.items():
-                    g, t, n = _add_class_weight(
-                        ws, cls, w,
-                        gross_weight=lr.gross if first else 0,
-                        tare_weight=lr.tare if first else 0,
-                        is_first_class_for_load=first,
-                    )
-                    load_gross += g
-                    load_tare += t
-                    load_net += n
-                    first = False
-
-                frn_addr = _find_frn_addr(ws, lr.frn)
                 if frn_addr:
                     _audit_comment(ws, frn_addr, lr, class_nets,
-                                   load_gross, load_tare, load_net)
-                _audit_log_line(lr, load_gross, load_tare, load_net, class_nets)
-            _recompute_total(ws)
+                                   lr.gross, lr.tare, lr.net)
+                _audit_log_line(lr, lr.gross, lr.tare, lr.net, class_nets)
 
         _update_statistic_tab(wb, loads)
 
@@ -923,6 +1014,8 @@ def fill_payment_statement(source_template, loads, out_path, *, monday,
             except Exception as e:
                 log(f"Price copy failed: {e}")
 
+        excel.excel.Calculation = -4105
+        excel.excel.CalculateFullRebuild()
         excel.close()
         if tmp.exists(): tmp.replace(out_path)
         _verify_audit_totals()
