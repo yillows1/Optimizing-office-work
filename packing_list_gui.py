@@ -189,6 +189,25 @@ def normalize_ritm(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", value).upper()
 
 
+def normalize_manual_ritm(value: str) -> str:
+    normalized = normalize_ritm(value)
+    if normalized.isdigit():
+        normalized = f"RITM{normalized}"
+    return normalized if re.fullmatch(r"RITM\d+", normalized) else ""
+
+
+def _match_mentions_ritm(match: "ExactMatch", ritm: str) -> bool:
+    ritm_key = normalize_ritm(ritm)
+    return (
+        any(normalize_ritm(value) == ritm_key for value in match.ritms)
+        or any(
+            normalize_ritm(value) == ritm_key
+            for value in match.subject_ritms
+        )
+        or normalize_ritm(match.term) == ritm_key
+    )
+
+
 # ---------------------------------------------------------------------------
 # Database helpers (Access via ODBC)
 # ---------------------------------------------------------------------------
@@ -1475,24 +1494,43 @@ class AddressBatchDialog(QDialog):
         if mode == "apply_location":
             location = self.location_input.text().strip()
         elif mode == "apply_ritm":
-            ritm = self.ritm_input.text().strip()
-            if not ritm:
+            ritm_text = self.ritm_input.text().strip()
+            ritm = normalize_manual_ritm(ritm_text)
+            if not ritm_text:
                 QMessageBox.information(
                     self, "No RITM entered",
                     "Type a Request Item number before applying.",
                 )
                 return
+            if not ritm:
+                QMessageBox.warning(
+                    self, "Invalid RITM",
+                    "Enter a Request Item in the format RITM followed by "
+                    "its number, or enter the number alone.",
+                )
+                return
+            self.ritm_input.setText(ritm)
         elif mode == "apply_both":
             location = self.both_location_input.text().strip()
-            ritm = self.both_ritm_input.text().strip()
+            ritm_text = self.both_ritm_input.text().strip()
+            ritm = normalize_manual_ritm(ritm_text)
+            if ritm_text and not ritm:
+                QMessageBox.warning(
+                    self, "Invalid RITM",
+                    "Enter a Request Item in the format RITM followed by "
+                    "its number, or enter the number alone.",
+                )
+                return
             if not location and not ritm:
                 QMessageBox.information(
                     self, "Nothing to apply",
                     "Enter a location and/or a Request Item before applying.",
                 )
                 return
+            if ritm:
+                self.both_ritm_input.setText(ritm)
 
-        if location and not ritm:
+        if not ritm:
             # Items with only a location need to be staged so they aren't lost.
             for item in items:
                 item["_address"] = location
@@ -1529,17 +1567,10 @@ class AddressBatchDialog(QDialog):
 
         elif location and ritm:
             # Both location and RITM
-            for item in items:
-                item["_ritm"] = ritm
             self._move_items_to_ritm(items, ritm, location)
             
         elif ritm:
             # RITM only
-            for item in items:
-                item["_ritm"] = ritm
-            self._move_items_to_ritm(items, ritm, "")
-            for item in items:
-                item["_ritm"] = ritm
             self._move_items_to_ritm(items, ritm, location)
 
         # Only clear the LOCATION inputs. Keep the RITM text so a
@@ -1614,7 +1645,7 @@ class AddressBatchDialog(QDialog):
             if location:
                 item["_address"] = location
         target["items"].extend(items)
-        if location and not target["location_address"]:
+        if location:
             target["location_address"] = location
             target["location"] = self._location_from_address(location)
 
@@ -1624,11 +1655,11 @@ class AddressBatchDialog(QDialog):
         ritm_key = ritm.casefold()
         matches = [
             match for match in self._subject_matches
-            if any(r.casefold() == ritm_key for r in match.subject_ritms)
+            if _match_mentions_ritm(match, ritm_key)
         ]
         matches.extend(
             match for match in self._last_rescan_matches
-            if any(r.casefold() == ritm_key for r in match.subject_ritms)
+            if _match_mentions_ritm(match, ritm_key)
         )
         return _dedupe_matches(matches)
 
@@ -1646,12 +1677,20 @@ class AddressBatchDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _do_rescan(self, ritm: str) -> None:
-        ritm = (ritm or "").strip()
-        if not ritm:
+        ritm_text = (ritm or "").strip()
+        ritm = normalize_manual_ritm(ritm_text)
+        if not ritm_text:
             QMessageBox.information(
                 self, "No RITM entered",
                 "Type a Request Item number in the field above before "
                 "rescanning.",
+            )
+            return
+        if not ritm:
+            QMessageBox.warning(
+                self, "Invalid RITM",
+                "Enter a Request Item in the format RITM followed by "
+                "its number, or enter the number alone.",
             )
             return
 
@@ -1737,11 +1776,7 @@ class AddressBatchDialog(QDialog):
         # one of the search terms that matched.
         hits = _dedupe_matches([
             match for match in new_matches
-            if (
-                any(r.casefold() == ritm_key for r in match.subject_ritms)
-                or any(r.casefold() == ritm_key for r in match.ritms)
-                or match.term.casefold() == ritm_key
-            )
+            if _match_mentions_ritm(match, ritm)
         ])
 
         if not hits:
@@ -1835,7 +1870,7 @@ class AddressBatchDialog(QDialog):
     def _location_from_address(address: str) -> str:
         parts = [p.strip() for p in address.split(",")]
         if len(parts) < 2:
-            return ""
+            return address.strip()
         city_state = ", ".join(parts[1:])
         city_state = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", city_state).strip()
         return city_state.replace(",", "")
@@ -2608,13 +2643,8 @@ def _read_reel_summary_record(sheet) -> PackingListRecord | None:
             "tare": tare,
             "net": gross - tare,
         })
-    # Prefer M7/M8 (written by newer exports). Fall back to F8/F9 only
-    # when M7/M8 are both blank, so old workbooks still read correctly.
-    driver = str(sheet.Range("M7").Value or "").strip()
-    plate = str(sheet.Range("M8").Value or "").strip()
-    if not (driver or plate):
-        driver = str(sheet.Range("F8").Value or "").strip()
-        plate = str(sheet.Range("F9").Value or "").strip()
+    driver = str(sheet.Range("F8").Value or "").strip()
+    plate = str(sheet.Range("F9").Value or "").strip()
 
     return {
         "group": "",
@@ -2671,7 +2701,7 @@ def _copy_template_reel_tabs(
         existing_names.add(f"__new_r_{n}".casefold())
         after_sheet = new_sheet
         created.append(new_sheet)
-        for address in ("M2", "M4", "M5", "M7", "M8", "C7", "I7", "C8", "F8", "C9", "F9"):
+        for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
             _safe_write(new_sheet, address, "")
         _clear_item_range(new_sheet, 12, 42, 4, 8)
 
@@ -2788,7 +2818,7 @@ def write_reel_summary_report(
 
             _log_marker("write_reel_summary: clearing old content (batched)")
             for sheet in reel_sheets:
-                for address in ("M2", "M4", "M5", "M7", "M8", "C7", "I7", "C8", "F8", "C9", "F9"):
+                for address in ("M2", "M4", "M5", "C7", "I7", "C8", "F8", "C9", "F9"):
                     _safe_write(sheet, address, "")
                 _clear_item_range(sheet, 12, 42, 4, 8)
             _log_marker("write_reel_summary: clear done")
@@ -2809,11 +2839,6 @@ def write_reel_summary_report(
                 _safe_write(sheet, "F8", driver)
                 _safe_write(sheet, "C9", "N/A")
                 _safe_write(sheet, "F9", plate)
-                # Canonical driver/plate storage so the summary round-trip
-                # is order-independent (F8/F9 layout in older templates
-                # may be plate-first, which caused Truck/Truck_Number swaps).
-                _safe_write(sheet, "M7", driver)
-                _safe_write(sheet, "M8", plate)
 
                 block_rows = 31
                 block_cols = 5
@@ -3783,7 +3808,7 @@ class PackingListApp(QMainWindow):
     def _location_from_address(self, address: str) -> str:
         parts = [p.strip() for p in address.split(",")]
         if len(parts) < 2:
-            return ""
+            return address.strip()
         city_state = ", ".join(parts[1:])
         city_state = re.sub(r"\s+\d{5}(?:-\d{4})?\s*$", "", city_state).strip()
         return city_state.replace(",", "")
@@ -4000,12 +4025,14 @@ class PackingListApp(QMainWindow):
         exact_matches: list[ExactMatch],
         ritm_letters: dict[str, str],
         packing_list: str,
+        forced_ritms: set[str] | None = None,
     ) -> None:
         for match in exact_matches:
             message_key = match.entry_id or "|".join(
                 (match.folder, match.subject, match.received)
             )
-            email_ritms = match.subject_ritms or match.ritms
+            email_ritms = set(match.subject_ritms or match.ritms)
+            email_ritms.update(forced_ritms or set())
             for ritm in email_ritms:
                 ritm_key = ritm.casefold()
                 letter = ritm_letters.get(ritm_key, "")
@@ -4110,7 +4137,12 @@ class PackingListApp(QMainWindow):
             if (r["ritm"] or "").casefold() == ritm_key:
                 ritm_letters[ritm_key] = r["letter"]
                 break
-        self._merge_matched_emails(list(matches), ritm_letters, packing_list)
+        self._merge_matched_emails(
+            list(matches),
+            ritm_letters,
+            packing_list,
+            forced_ritms={ritm},
+        )
 
     def _find_outlook_message(self, namespace, email: MatchedEmail):
         if email.entry_id:
@@ -4697,6 +4729,11 @@ class PackingListApp(QMainWindow):
             )
             if existing is not None:
                 existing["items"].extend(items)
+                if ritm_record.get("location_address"):
+                    existing["location_address"] = ritm_record["location_address"]
+                    existing["location"] = ritm_record.get("location", "")
+                elif ritm_record.get("location") and not existing.get("location"):
+                    existing["location"] = ritm_record["location"]
                 current = list(existing.get("source_matches") or [])
                 seen = {(m.entry_id, m.filename, m.term) for m in current}
                 for match in _record_source_matches(ritm_record):

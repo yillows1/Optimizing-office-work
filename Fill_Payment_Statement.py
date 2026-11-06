@@ -5,26 +5,15 @@ Statement.
 
 Inputs:
   1. JC Payment Statement            (.xls)  — received from Jersey City
-  2. Reel Summary Report             (.xls)  — our reel loads
-  3. Receiving root folder           — contains loose .xls files named
-                                       like "1012-FRN261012-5L.xls"
+  2. Receiving root (summaries)      (dir)   — contains YYYY/"Month YYYY"/Reel Summary/
+  3. Receiving root (loose)          (dir)   — contains YYYY/"Month YYYY"/<loose files>
   4. Blank template                  (.xls)  — for the Rahway-only statement
+  5. Scrap Pickup root               (dir)   — contains Scrap Pick Up Request files
+  6. Week Ending output root         (dir)   — outputs go under YYYY/"Month YYYY"/
 
 Outputs:
   A) JC-merged   = JC file + our reels + our loose   (email this)
   B) Rahway-only = blank template + our reels + our loose  (print this)
-
-Reads/writes .xls and .xlsx via Excel COM. Logs and skips protected cells.
-JC keeps file order; reels and loose interleave by date.
-
-Class inputs are updated with additive Excel formulas so existing entries and
-new load contributions remain together. Protected formulas and totals are left
-untouched; Excel recalculates the linked report tabs before the file is saved.
-
-Audit trail:
-  - Each FRN cell on a date tab gets a comment showing what was added.
-  - A sidecar "<output>_loads.log" records one line per load.
-  - The final totals are checked against the audit sum in fill_statement.log.
 """
 
 from __future__ import annotations
@@ -143,6 +132,28 @@ _MATERIAL_TOKENS = sorted(
     key=len,
     reverse=True,
 )
+
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def month_folder_name(d: date) -> str:
+    return f"{_MONTH_NAMES[d.month - 1]} {d.year}"
+
+
+def month_folders_for_week(monday: date) -> list[tuple[int, int]]:
+    """Return (year, month) pairs touched by Mon..Sat of this week."""
+    saturday = monday + timedelta(days=5)
+    out: list[tuple[int, int]] = []
+    cur = monday
+    while cur <= saturday:
+        key = (cur.year, cur.month)
+        if key not in out:
+            out.append(key)
+        cur = (cur.replace(day=1) + timedelta(days=32)).replace(day=1)
+    return out
 
 
 # =============================================================================
@@ -303,6 +314,7 @@ def week_monday(d: date) -> date:
 
 
 def week_from_range_str(label: str) -> tuple[date, date] | None:
+    """Parse 'WE MM-DD-YYYY' from a filename and return (monday, friday)."""
     m = re.search(r"(\d{2})-(\d{2})-(\d{4})", label)
     if not m:
         return None
@@ -323,16 +335,42 @@ def _frn_date(frn: str) -> str:
         return ""
 
 
+def find_reel_summary(summary_root: Path, monday: date) -> Path | None:
+    """Locate the Reel Summary for this week under <root>/YYYY/Month YYYY/Reel Summary."""
+    for (y, m) in month_folders_for_week(monday):
+        folder = summary_root / str(y) / month_folder_name(date(y, m, 1)) / "Reel Summary"
+        if not folder.exists():
+            continue
+        candidates = [
+            p for p in folder.glob("*.xls*")
+            if not p.name.startswith("~$")
+        ]
+        if not candidates:
+            continue
+        m_str = f"{monday.month}.{monday.day}.{monday.strftime('%y')}"
+        for p in candidates:
+            if m_str in p.name:
+                return p
+        for p in candidates:
+            if f"{monday.month:02d}" in p.name and monday.strftime("%y") in p.name:
+                return p
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+    return None
+
+
 # =============================================================================
 # Collectors
 # =============================================================================
 
 def collect_from_reel_summary(path: Path) -> list[LoadRow]:
-    """Read the 'Summary' tab of a Reel Summary Report."""
+    """Read the 'Summary' tab of a Reel Summary Report. Tare comes from the
+    per-FRN tab (e.g. FRN261020-1R-AR)."""
     rw = _ReadOnlyWorkbook(path)
     try:
         if "Summary" not in rw.sheets():
             raise ValueError("Reel Summary has no 'Summary' tab.")
+        all_sheets = set(rw.sheets())
+        log(f"REEL summary tabs: {len(all_sheets)}")
         ws = rw.sheet("Summary")
         max_row = ws.UsedRange.Rows.Count
 
@@ -364,6 +402,27 @@ def collect_from_reel_summary(path: Path) -> list[LoadRow]:
                 except (TypeError, ValueError):
                     pass
             return numeric_hits >= 2
+
+        def find_label_value_in_sheet(sheet, want_upper: str) -> int | None:
+            def fcell(r, c):
+                try: return sheet.Cells(r, c).Value
+                except Exception: return None
+            for rr in range(1, 20):
+                for cc in range(1, 20):
+                    lbl = fcell(rr, cc)
+                    if not isinstance(lbl, str):
+                        continue
+                    if want_upper not in lbl.upper():
+                        continue
+                    for off in range(1, 6):
+                        v = fcell(rr, cc + off)
+                        if v in (None, ""):
+                            continue
+                        try:
+                            return int(float(v))
+                        except Exception:
+                            continue
+            return None
 
         loads: list[LoadRow] = []
         r = 1
@@ -418,16 +477,24 @@ def collect_from_reel_summary(path: Path) -> list[LoadRow]:
                 if gv is not None and not gross:
                     try: gross = int(float(gv))
                     except Exception: pass
-                tv = cell(scan, 21)
-                if tv is not None and not tare:
-                    try: tare = int(float(tv))
-                    except Exception: pass
                 scan += 1
 
             if class_header_row is None:
                 log(f"Summary: no class header near row {r} for {frn_str}; skipping")
                 r += 1
                 continue
+
+            # Tare/gross live on the per-FRN tab (FRN + "R").
+            frn_tab_name = frn_str + "R"
+            if frn_tab_name in all_sheets:
+                fws = rw.sheet(frn_tab_name)
+                if not tare:
+                    tare = find_label_value_in_sheet(fws, "TOTAL TARE") or 0
+                if not gross:
+                    gross = find_label_value_in_sheet(fws, "TOTAL GROSS") or 0
+                log(f"Per-FRN {frn_tab_name}: gross={gross} tare={tare}")
+            else:
+                log(f"Per-FRN tab {frn_tab_name} not found; tare stays 0")
 
             class_values_row = class_header_row + 1
             if not is_class_values_row(class_values_row, class_header_row):
@@ -542,11 +609,13 @@ def _materials_in_squashed_block(text: str) -> list[str]:
     return found
 
 
-def parse_loose_file(path: Path) -> dict:
-    excel = win32com.client.DispatchEx("Excel.Application")
-    excel.ScreenUpdating = False
-    excel.DisplayAlerts = False
-    excel.EnableEvents = False
+def parse_loose_file(path: Path, excel=None) -> dict:
+    own_excel = excel is None
+    if own_excel:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.ScreenUpdating = False
+        excel.DisplayAlerts = False
+        excel.EnableEvents = False
     wb = excel.Workbooks.Open(str(path), UpdateLinks=0, ReadOnly=True)
     try:
         ws = wb.Worksheets(1)
@@ -635,11 +704,6 @@ def parse_loose_file(path: Path) -> dict:
                     "gross": total_gross, "tare": total_tare, "net": total_net,
                 })
 
-        # Per-class gross and tare sums from the line items. The sheet's
-        # C column uses these for loose loads: each class row gets the sum
-        # of every item's gross for that class, and D gets the sum of every
-        # item's tare for that class. This is what the reference file shows
-        # (e.g. class 53 = "=2092+3178" / "=320+650", not the load totals).
         class_gross: dict[str, int] = {}
         class_tare: dict[str, int] = {}
         for it in items:
@@ -662,69 +726,228 @@ def parse_loose_file(path: Path) -> dict:
     finally:
         try: wb.Close(SaveChanges=False)
         except Exception: pass
-        try: excel.Quit()
-        except Exception: pass
-        try:
-            import pythoncom
-            pythoncom.CoFreeUnusedLibraries()
-        except Exception: pass
+        if own_excel:
+            try: excel.Quit()
+            except Exception: pass
+            try:
+                import pythoncom
+                pythoncom.CoFreeUnusedLibraries()
+            except Exception: pass
 
 
 _LOOSE_FILE_FRN_RE = re.compile(r"FRN\d{6}-\d+L(?:-[A-Za-z]+)?", re.IGNORECASE)
 _REEL_FILE_FRN_RE = re.compile(r"FRN\d{6}-\d+R(?:-[A-Za-z]+)*", re.IGNORECASE)
 
 
-def collect_from_loose_folders(root: Path, monday: date) -> list[LoadRow]:
+def collect_from_loose_folders(loose_root: Path, monday: date, excel=None) -> list[LoadRow]:
     week_prefixes = {
         f"FRN{(monday + timedelta(days=i)).strftime('%y%m%d')}-" for i in range(5)
     }
     loads: list[LoadRow] = []
-    if not root.exists():
+    folders = [
+        loose_root / str(y) / month_folder_name(date(y, m, 1))
+        for (y, m) in month_folders_for_week(monday)
+    ]
+    folders = [f for f in folders if f.exists()]
+    if not folders:
+        log(f"Loose: no month folder found under {loose_root} for week of {monday}")
         return loads
-    for path in root.rglob("*"):
-        if not path.is_file(): continue
-        if path.suffix.lower() not in (".xls", ".xlsx", ".xlsm"): continue
-        if path.name.startswith("~$"): continue
-        if _REEL_FILE_FRN_RE.search(path.name):
-            log(f"Loose scan: skipping reel file {path.name}")
-            continue
-        m = _LOOSE_FILE_FRN_RE.search(path.name)
-        if not m:
-            log(f"Loose scan: skipping non-load file {path.name}")
-            continue
-        frn = m.group(0).upper()
-        if not any(frn.startswith(p) for p in week_prefixes):
-            log(f"Loose scan: skipping out-of-week file {path.name}")
-            continue
-        try:
-            data = parse_loose_file(path)
-            class_nets: dict[str, int] = {}
-            for it in data.get("items", []):
-                cls = normalize_class(it.get("type") or "L")
-                class_nets[cls] = class_nets.get(cls, 0) + int(it.get("net", 0))
-            date_iso = data.get("date", "") or _frn_date(frn)
-            raw_origin = (data.get("location") or "").strip().upper()
-            if not raw_origin:
-                raw_origin = "NO LOCATION"
-            net = sum(class_nets.values())
-            gross = data.get("total_gross", 0) or (net + data.get("total_tare", 0))
-            tare = data.get("total_tare", 0)
-            loads.append(LoadRow(
-                source="loose", frn=frn,
-                ritm=data.get("ritm", ""),
-                origin=raw_origin,
-                date=date_iso,
-                gross=gross,
-                tare=tare,
-                net=net,
-                class_nets=class_nets,
-                class_gross=dict(data.get("class_gross", {})),
-                class_tare=dict(data.get("class_tare", {})),
-                folder=str(path.parent),
-            ))
-        except Exception as e:
-            log(f"Loose parse failed for {frn}: {e}")
+    own_excel = excel is None
+    if own_excel:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.ScreenUpdating = False
+        excel.DisplayAlerts = False
+        excel.EnableEvents = False
+    try:
+        all_paths: list[Path] = []
+        for folder in folders:
+            all_paths.extend(folder.glob("*"))
+        for path in all_paths:
+            if not path.is_file(): continue
+            if path.suffix.lower() not in (".xls", ".xlsx", ".xlsm"): continue
+            if path.name.startswith("~$"): continue
+            if _REEL_FILE_FRN_RE.search(path.name):
+                log(f"Loose scan: skipping reel file {path.name}")
+                continue
+            m = _LOOSE_FILE_FRN_RE.search(path.name)
+            if not m:
+                log(f"Loose scan: skipping non-load file {path.name}")
+                continue
+            frn = m.group(0).upper()
+            if not any(frn.startswith(p) for p in week_prefixes):
+                log(f"Loose scan: skipping out-of-week file {path.name}")
+                continue
+            try:
+                data = parse_loose_file(path, excel=excel)
+                class_nets: dict[str, int] = {}
+                for it in data.get("items", []):
+                    cls = normalize_class(it.get("type") or "L")
+                    class_nets[cls] = class_nets.get(cls, 0) + int(it.get("net", 0))
+                date_iso = data.get("date", "") or _frn_date(frn)
+                raw_origin = (data.get("location") or "").strip().upper()
+                if not raw_origin:
+                    raw_origin = "NO LOCATION"
+                net = sum(class_nets.values())
+                gross = data.get("total_gross", 0) or (net + data.get("total_tare", 0))
+                tare = data.get("total_tare", 0)
+                loads.append(LoadRow(
+                    source="loose", frn=frn,
+                    ritm=data.get("ritm", ""),
+                    origin=raw_origin,
+                    date=date_iso,
+                    gross=gross,
+                    tare=tare,
+                    net=net,
+                    class_nets=class_nets,
+                    class_gross=dict(data.get("class_gross", {})),
+                    class_tare=dict(data.get("class_tare", {})),
+                    folder=str(path.parent),
+                ))
+            except Exception as e:
+                log(f"Loose parse failed for {frn}: {e}")
+    finally:
+        if own_excel:
+            try: excel.Quit()
+            except Exception: pass
+            try:
+                import pythoncom
+                pythoncom.CoFreeUnusedLibraries()
+            except Exception: pass
     return loads
+
+
+_SCRAP_PICKUP_FRN_RE = re.compile(r"FRN\d{6}-\d+R(?:-[A-Za-z]+)*", re.IGNORECASE)
+
+
+def parse_scrap_pickup_file(path: Path, excel=None) -> dict:
+    """Read the location + request-item status from a Scrap Pick Up Request .xls."""
+    own_excel = excel is None
+    if own_excel:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.ScreenUpdating = False
+        excel.DisplayAlerts = False
+        excel.EnableEvents = False
+    wb = excel.Workbooks.Open(str(path), UpdateLinks=0, ReadOnly=True)
+    try:
+        ws = wb.Worksheets(1)
+
+        def cell(row: int, col: int):
+            try: return ws.Cells(row, col).Value
+            except Exception: return None
+
+        def as_str(v) -> str:
+            if v is None: return ""
+            if isinstance(v, (datetime, date)): return v.strftime("%Y-%m-%d")
+            return str(v).strip()
+
+        frn = ""
+        for r in range(1, 60):
+            if as_str(cell(r, 1)).upper().startswith("LOAD #"):
+                frn = as_str(cell(r, 4)).upper()
+                break
+
+        street = city = ""
+        for r in range(1, 60):
+            label = as_str(cell(r, 1)).strip().upper().rstrip(":")
+            if label == "STREET" and not street:
+                street = as_str(cell(r, 4))
+            elif label == "CITY" and not city:
+                city = as_str(cell(r, 4))
+            if street and city:
+                break
+
+        log(f"Scrap pickup {path.name}: frn={frn!r} street={street!r} city={city!r}")
+
+        parts = []
+        for v in (street, city):
+            if v and v.upper() != "NO LOCATION":
+                parts.append(v.rstrip(", ").strip())
+        location = ", ".join(parts).strip().upper()
+        if not location:
+            location = "NO LOCATION"
+
+        ritm = ""
+        req_label = as_str(cell(12, 6)).upper()
+        no_req = as_str(cell(12, 7)).upper()
+        x_in_f = as_str(cell(11, 6)).upper() == "X"
+        x_in_e = as_str(cell(11, 5)).upper() == "X"
+        if req_label.startswith("REQUEST ITEM") and x_in_f:
+            ritm = "Request Item"
+        elif no_req.startswith("NO REQUEST") and x_in_e:
+            ritm = "No Request Item"
+
+        return {"frn": frn, "location": location, "ritm": ritm}
+    finally:
+        try: wb.Close(SaveChanges=False)
+        except Exception: pass
+        if own_excel:
+            try: excel.Quit()
+            except Exception: pass
+            try:
+                import pythoncom
+                pythoncom.CoFreeUnusedLibraries()
+            except Exception: pass
+
+
+def collect_scrap_pickup_locations(root: Path, monday: date, excel=None) -> dict[str, dict]:
+    """Scan the week's month folders for Scrap Pick Up Request files."""
+    out: dict[str, dict] = {}
+    if not root.exists():
+        log(f"Scrap pickup folder does not exist: {root}")
+        return out
+    own_excel = excel is None
+    if own_excel:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.ScreenUpdating = False
+        excel.DisplayAlerts = False
+        excel.EnableEvents = False
+    try:
+        # Only scan the 1 or 2 month folders the week touches.
+        month_dirs = [
+            root / str(y) / month_folder_name(date(y, m, 1))
+            for (y, m) in month_folders_for_week(monday)
+        ]
+        month_dirs = [d for d in month_dirs if d.exists()]
+        if not month_dirs:
+            log(f"Scrap pickup: no month folders found under {root} for week of {monday}")
+            return out
+
+        candidates: list[Path] = []
+        for folder in month_dirs:
+            candidates.extend(folder.rglob("*"))
+
+        log(f"Scrap pickup scan: {len(month_dirs)} month folder(s), {len(candidates)} entries")
+        for path in candidates:
+            if not path.is_file(): continue
+            if path.suffix.lower() not in (".xls", ".xlsx", ".xlsm"): continue
+            if path.name.startswith("~$"): continue
+            # Name filter: only Scrap Pick Up Request files hold the address.
+            if "scrap pick up request" not in path.name.lower():
+                continue
+            log(f"Scrap pickup: parsing {path.name}")
+            try:
+                data = parse_scrap_pickup_file(path, excel=excel)
+            except Exception as e:
+                log(f"Scrap pickup parse failed for {path.name}: {e}")
+                continue
+            frn = (data.get("frn") or "").strip().upper()
+            if not frn:
+                m = _SCRAP_PICKUP_FRN_RE.search(path.name)
+                if m: frn = m.group(0).upper()
+            if not frn:
+                log(f"Scrap pickup: no FRN in {path.name}; skipping")
+                continue
+            out[frn] = {"location": data.get("location", "NO LOCATION"),
+                        "ritm": data.get("ritm", "")}
+    finally:
+        if own_excel:
+            try: excel.Quit()
+            except Exception: pass
+            try:
+                import pythoncom
+                pythoncom.CoFreeUnusedLibraries()
+            except Exception: pass
+    return out
 
 
 # =============================================================================
@@ -740,14 +963,17 @@ def _rename_date_tabs(wb, monday: date) -> dict[str, str]:
         log("SKIP protected workbook structure: date tabs not renamed")
         return mapping
     existing = [s.Name for s in wb.Worksheets if re.fullmatch(r"\d{2}_\d{2}_\d{2}", s.Name)]
-    wanted = [monday + timedelta(days=i) for i in range(5)]
     ed = []
     for name in existing:
         try: ed.append((datetime.strptime(name, DATE_TAB_FMT).date(), name))
         except Exception: continue
     ed.sort()
+
     wk = [(d, n) for d, n in ed if d.weekday() < 5]
-    for (_, old), new_d in zip(wk, wanted):
+    we = [(d, n) for d, n in ed if d.weekday() >= 5]
+
+    wanted_wk = [monday + timedelta(days=i) for i in range(5)]
+    for (_, old), new_d in zip(wk, wanted_wk):
         new_name = new_d.strftime(DATE_TAB_FMT)
         if old != new_name:
             try:
@@ -755,6 +981,22 @@ def _rename_date_tabs(wb, monday: date) -> dict[str, str]:
                 mapping[old] = new_name
             except Exception as e:
                 log(f"Rename failed {old}→{new_name}: {e}")
+
+    # Saturday tab closes the prior week.
+    saturday = monday - timedelta(days=2)
+    if we:
+        _, old = we[-1]
+        new_name = saturday.strftime(DATE_TAB_FMT)
+        if old != new_name:
+            try:
+                wb.Worksheets(old).Name = new_name
+                mapping[old] = new_name
+                log(f"Renamed Saturday tab {old}→{new_name}")
+            except Exception as e:
+                log(f"Rename failed {old}→{new_name}: {e}")
+    else:
+        log("No Saturday tab found to rename")
+
     return mapping
 
 
@@ -830,12 +1072,8 @@ def _update_statistic_tab(wb, loads):
         wrote = False
         if _try_write(ws, f"A{r}", load.date): wrote = True
         if _try_write(ws, f"B{r}", load.frn): wrote = True
-        if _try_write(ws, f"C{r}", load.ritm or "No Request Item"): wrote = True
+        if _try_write(ws, f"C{r}", load.ritm or "DELIVERY"): wrote = True
         if _try_write(ws, f"G{r}", load.net): wrote = True
-        # H is the LANDFILL-only weight: 99X + wood + plastic + kbd/mouse +
-        # remote. Fiber Optic (99 FO) and CDBD are NOT landfill; they belong
-        # to the non-metallic recyclable stream and are counted on the 99X
-        # tab's "Non-Metalic Recyc" line, not here.
         landfill_wt = 0
         cn = load.class_nets or {}
         for cls in ("99X", "WOOD", "Loose Plastic", "Keyboard/Mouse", "Remote"):
@@ -846,19 +1084,19 @@ def _update_statistic_tab(wb, loads):
         if wrote: r += 1
 
 
-def _fill_b5_per_date_tab(wb, monday: date) -> None:
+def _fill_b5_first_tab_only(wb, monday: date) -> None:
+    """Write B5 on the Monday tab only; every other tab's B5 chains from it."""
     epoch = date(1904, 1, 1) if wb.Date1904 else date(1899, 12, 30)
-    tab_dates = [monday + timedelta(days=i) for i in range(5)]
-    for d in tab_dates:
-        tab_name = d.strftime(DATE_TAB_FMT)
-        try:
-            ws = wb.Worksheets(tab_name)
-        except Exception:
-            continue
-        try:
-            _try_write(ws, "B5", (d - epoch).days)
-        except Exception as e:
-            log(f"B5 write failed on {tab_name}: {e}")
+    tab_name = monday.strftime(DATE_TAB_FMT)
+    try:
+        ws = wb.Worksheets(tab_name)
+    except Exception:
+        log(f"B5: Monday tab {tab_name} not found")
+        return
+    try:
+        _try_write(ws, "B5", (monday - epoch).days)
+    except Exception as e:
+        log(f"B5 write failed on {tab_name}: {e}")
 
 
 def _verify_audit_totals():
@@ -894,10 +1132,8 @@ def fill_payment_statement(source_template, loads, out_path, *, monday,
     try:
         wb = excel.open(tmp)
 
-        # Class net cells and total-row cells are template formulas; do not
-        # write to column E or row 57.
         _rename_date_tabs(wb, monday)
-        _fill_b5_per_date_tab(wb, monday)
+        _fill_b5_first_tab_only(wb, monday)
 
         by_date: dict[str, list[LoadRow]] = {}
         for lr in loads:
@@ -915,29 +1151,19 @@ def fill_payment_statement(source_template, loads, out_path, *, monday,
                 log(f"Date tab {d.strftime(DATE_TAB_FMT)} missing — skipping {iso}")
                 continue
 
-            # Per-class C and D. Do NOT touch E — it is locked and already
-            # computes =C-D on every class row.
-            #
-            # Reels: C{row} += class_nets[cls]   (the class's own net from
-            #        the Reel Summary), D stays 0.
-            # Loose: C{row} += class_gross[cls]  (sum of that class's item
-            #        grosses), D{row} += class_tare[cls] (sum of that
-            #        class's item tares).
-            # RETURN: C{row} += load.tare, D{row} += load.tare.
-            #
-            # Both accumulate into per-class lists, written as additive
-            # formulas so the formula bar shows every load's contribution.
             day_c: dict[str, list[int]] = {}
             day_d: dict[str, list[int]] = {}
-            return_tare_total = 0
+            return_tare_vals: list[int] = []
 
             for lr in day:
                 class_nets = dict(lr.class_nets or {})
                 if not class_nets and lr.net:
                     class_nets = {"99X": lr.net}
 
-                if "RETURN" in class_nets:
-                    return_tare_total += lr.tare
+                # Reel loads carry a per-reel tare from the per-FRN tab.
+                # Accumulate for the RETURN row's Gross column (C53).
+                if lr.source == "reel" and lr.tare:
+                    return_tare_vals.append(int(lr.tare))
 
                 real_classes = [c for c in class_nets if c != "RETURN"]
                 if not real_classes:
@@ -952,21 +1178,18 @@ def fill_payment_statement(source_template, loads, out_path, *, monday,
                         if t:
                             day_d.setdefault(cls, []).append(t)
                 else:
-                    # Reels (and any loose load whose per-class gross/tare
-                    # weren't parsed): use the class net as the gross.
                     for cls in real_classes:
                         n = int(class_nets.get(cls, 0) or 0)
                         if n:
                             day_c.setdefault(cls, []).append(n)
 
-            # 1) Write FRNs + RITMs to the two FRN blocks.
+            # 1) Write FRNs + RITMs.
             for lr in day:
                 row = _append_frn(ws, lr.frn, lr.ritm)
                 if row is None:
                     log(f"{d.strftime(DATE_TAB_FMT)}: FRN slots full; {lr.frn} skipped")
 
-            # 2) Per class: add contributions to the unlocked C/D inputs.
-            # Never write the locked E formulas.
+            # 2) Per-class C/D.
             for cls, vals in day_c.items():
                 row = CLASS_TO_ROW.get(cls) or CLASS_TO_ROW["99X"]
                 address = f"C{row}"
@@ -983,15 +1206,16 @@ def fill_payment_statement(source_template, loads, out_path, *, monday,
                 if formula is not None:
                     _try_write(ws, address, formula)
 
-            # 3) RETURN row: C and D both get the tare total.
+            # 3) RETURN row: only C (Gross) gets reel tare, additive.
             ret_row = CLASS_TO_ROW["RETURN"]
-            if return_tare_total:
-                _try_write(ws, f"C{ret_row}", f"={return_tare_total}")
-                _try_write(ws, f"D{ret_row}", f"={return_tare_total}")
+            log(f"RETURN for {d.strftime(DATE_TAB_FMT)}: tares={return_tare_vals}")
+            if return_tare_vals:
+                rng = ws.Range(f"C{ret_row}")
+                formula = _additive_formula(rng.Formula, rng.Value, return_tare_vals)
+                if formula is not None:
+                    _try_write(ws, f"C{ret_row}", formula)
 
-            # 4) Leave all locked total formulas untouched.
-
-            # 5) Comments + sidecar audit log per load.
+            # 4) Comments + sidecar audit.
             for lr in day:
                 frn_addr = _find_frn_addr(ws, lr.frn)
                 class_nets = dict(lr.class_nets or {})
@@ -1039,26 +1263,46 @@ class _DragDropTable(QTableWidget):
 
     def __init__(self, rows: int, cols: int, parent=None):
         super().__init__(rows, cols, parent)
+        self._drag_source_row = -1
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDragDropOverwriteMode(False)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # Reordering is handled by SortDialog's LoadRow list. Returning a
+        # MoveAction makes Qt also remove the original table row afterward.
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+
+    def startDrag(self, supported_actions):
+        self._drag_source_row = self.currentRow()
+        try:
+            super().startDrag(supported_actions)
+        finally:
+            self._drag_source_row = -1
 
     def dropEvent(self, event):
-        src = self.currentRow()
+        src = self._drag_source_row
         if src < 0:
-            event.ignore(); return
+            event.ignore()
+            return
+
         pos = event.position().toPoint()
-        dst = self.rowAt(pos.y())
-        if dst < 0:
-            dst = self.rowCount() - 1
-        if dst == src:
-            event.ignore(); return
-        self.rowDropped.emit(src, dst)
+        row = self.rowAt(pos.y())
+        if row < 0:
+            insertion = self.rowCount()
+        else:
+            row_rect = self.visualRect(self.model().index(row, 0))
+            insertion = row if pos.y() < row_rect.center().y() else row + 1
+
+        destination = insertion - (1 if insertion > src else 0)
+        if destination == src:
+            event.ignore()
+            return
+
+        self.rowDropped.emit(src, destination)
+        event.setDropAction(Qt.DropAction.CopyAction)
         event.accept()
 
 
@@ -1145,8 +1389,6 @@ class SortDialog(QDialog):
             return
         self._capture_date_edits()
         row = self.loads.pop(src)
-        if dst > src:
-            dst -= 1
         self.loads.insert(dst, row)
         self._refresh()
         self.table.selectRow(dst)
@@ -1195,7 +1437,7 @@ class FillWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Fill Verizon Payment Statement")
-        self.resize(900, 480)
+        self.resize(1000, 640)
         self.setStyleSheet(
             "QMainWindow, QWidget { background: #f2f5f3; color: #20332e; }"
             "QLabel { font-size: 10pt; }"
@@ -1207,32 +1449,60 @@ class FillWindow(QMainWindow):
         central = QWidget(); self.setCentralWidget(central)
         v = QVBoxLayout(central)
 
-        v.addWidget(QLabel("1. JC Payment Statement (received):"))
+        # 1. JC file
+        v.addWidget(QLabel("1. JC Payment Statement (its filename's 'WE MM-DD-YYYY' drives everything):"))
         row = QHBoxLayout()
         self.jc_input = QLineEdit(cfg.get("jc_file", "")); self.jc_input.setReadOnly(True)
         row.addWidget(self.jc_input, 1)
         b = QPushButton("Browse…"); b.clicked.connect(self._browse_jc); row.addWidget(b)
         v.addLayout(row)
 
-        v.addWidget(QLabel("2. Reel Summary Report (our reels):"))
+        # 2. Summary root
+        v.addWidget(QLabel("2. Receiving root for Reel Summaries (expects YYYY/Month YYYY/Reel Summary/):"))
         row = QHBoxLayout()
-        self.rr_input = QLineEdit(cfg.get("rr_file", "")); self.rr_input.setReadOnly(True)
-        row.addWidget(self.rr_input, 1)
-        b = QPushButton("Browse…"); b.clicked.connect(self._browse_rr); row.addWidget(b)
+        self.summary_input = QLineEdit(cfg.get("summary_root", "")); self.summary_input.setReadOnly(True)
+        row.addWidget(self.summary_input, 1)
+        b = QPushButton("Browse…"); b.clicked.connect(self._browse_summary); row.addWidget(b)
         v.addLayout(row)
 
-        v.addWidget(QLabel("3. Loose folder (contains 1012-FRN261012-5L.xls style files):"))
+        # 3. Loose root
+        v.addWidget(QLabel("3. Receiving root for loose files (expects YYYY/Month YYYY/):"))
         row = QHBoxLayout()
         self.loose_input = QLineEdit(cfg.get("loose_root", "")); self.loose_input.setReadOnly(True)
         row.addWidget(self.loose_input, 1)
         b = QPushButton("Browse…"); b.clicked.connect(self._browse_loose); row.addWidget(b)
         v.addLayout(row)
 
+        # 4. Blank template
         v.addWidget(QLabel("4. Blank template (for the Rahway-only statement):"))
         row = QHBoxLayout()
         self.template_input = QLineEdit(cfg.get("blank_template", "")); self.template_input.setReadOnly(True)
         row.addWidget(self.template_input, 1)
         b = QPushButton("Browse…"); b.clicked.connect(self._browse_template); row.addWidget(b)
+        v.addLayout(row)
+
+        # 5. Scrap pickup root
+        v.addWidget(QLabel("5. Scrap Pickup root (contains Scrap Pick Up Request files):"))
+        row = QHBoxLayout()
+        self.pickup_input = QLineEdit(cfg.get("pickup_root", "")); self.pickup_input.setReadOnly(True)
+        row.addWidget(self.pickup_input, 1)
+        b = QPushButton("Browse…"); b.clicked.connect(self._browse_pickup); row.addWidget(b)
+        v.addLayout(row)
+
+        # 6. Output root (Merged)
+        v.addWidget(QLabel("6. Export folder for MERGED file:"))
+        row = QHBoxLayout()
+        self.output_input = QLineEdit(cfg.get("output_root", "")); self.output_input.setReadOnly(True)
+        row.addWidget(self.output_input, 1)
+        b = QPushButton("Browse…"); b.clicked.connect(self._browse_output); row.addWidget(b)
+        v.addLayout(row)
+
+        # 7. Output root (Just Us / Rahway)
+        v.addWidget(QLabel("7. Export folder for RAHWAY-ONLY file:"))
+        row = QHBoxLayout()
+        self.output_rahway_input = QLineEdit(cfg.get("output_rahway", "")); self.output_rahway_input.setReadOnly(True)
+        row.addWidget(self.output_rahway_input, 1)
+        b = QPushButton("Browse…"); b.clicked.connect(self._browse_output_rahway); row.addWidget(b)
         v.addLayout(row)
 
         self.go_button = QPushButton("Collect & sort…")
@@ -1252,34 +1522,114 @@ class FillWindow(QMainWindow):
         f, _ = QFileDialog.getOpenFileName(self, "JC Payment Statement", "", "Excel (*.xls *.xlsx *.xlsm)")
         if f: self.jc_input.setText(f); cfg = load_cfg(); cfg["jc_file"] = f; save_cfg(cfg)
 
-    def _browse_rr(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Reel Summary Report", "", "Excel (*.xls *.xlsx *.xlsm)")
-        if f: self.rr_input.setText(f); cfg = load_cfg(); cfg["rr_file"] = f; save_cfg(cfg)
+    def _browse_summary(self):
+        f = QFileDialog.getExistingDirectory(self, "Receiving root (summaries)")
+        if f: self.summary_input.setText(f); cfg = load_cfg(); cfg["summary_root"] = f; save_cfg(cfg)
 
     def _browse_loose(self):
-        f = QFileDialog.getExistingDirectory(self, "Loose folder")
+        f = QFileDialog.getExistingDirectory(self, "Receiving root (loose)")
         if f: self.loose_input.setText(f); cfg = load_cfg(); cfg["loose_root"] = f; save_cfg(cfg)
 
     def _browse_template(self):
         f, _ = QFileDialog.getOpenFileName(self, "Blank template", "", "Excel (*.xls *.xlsx *.xlsm)")
         if f: self.template_input.setText(f); cfg = load_cfg(); cfg["blank_template"] = f; save_cfg(cfg)
 
+    def _browse_pickup(self):
+        f = QFileDialog.getExistingDirectory(self, "Scrap Pickup root")
+        if f: self.pickup_input.setText(f); cfg = load_cfg(); cfg["pickup_root"] = f; save_cfg(cfg)
+
+    def _browse_output(self):
+        f = QFileDialog.getExistingDirectory(self, "Export folder for MERGED file")
+        if f: self.output_input.setText(f); cfg = load_cfg(); cfg["output_root"] = f; save_cfg(cfg)
+
+    def _browse_output_rahway(self):
+        f = QFileDialog.getExistingDirectory(self, "Export folder for RAHWAY file")
+        if f: self.output_rahway_input.setText(f); cfg = load_cfg(); cfg["output_rahway"] = f; save_cfg(cfg)
+
     def _go(self):
-        jc = Path(self.jc_input.text()); rr = Path(self.rr_input.text())
-        root = Path(self.loose_input.text()); tpl = Path(self.template_input.text())
-        if not (jc.exists() and rr.exists() and root.exists() and tpl.exists()):
-            QMessageBox.warning(self, "Missing files", "Fill in all four paths."); return
+        jc = Path(self.jc_input.text())
+        tpl = Path(self.template_input.text())
+        summary_root = Path(self.summary_input.text()) if self.summary_input.text() else None
+        loose_root = Path(self.loose_input.text()) if self.loose_input.text() else None
+        output_root = Path(self.output_input.text()) if self.output_input.text() else None
+        output_rahway = Path(self.output_rahway_input.text()) if self.output_rahway_input.text() else None
+        pickup_root = Path(self.pickup_input.text()) if self.pickup_input.text() else None
+
+        if not (jc.exists() and tpl.exists()):
+            QMessageBox.warning(self, "Missing files", "Pick the JC file and blank template."); return
+        if summary_root is None or not summary_root.exists():
+            QMessageBox.warning(self, "Missing folder", "Pick the Receiving root for Reel Summaries."); return
+        if loose_root is None or not loose_root.exists():
+            QMessageBox.warning(self, "Missing folder", "Pick the Receiving root for loose files."); return
+        if output_root is None or not output_root.exists():
+            QMessageBox.warning(self, "Missing folder", "Pick the export folder for the Merged file."); return
+        if output_rahway is None or not output_rahway.exists():
+            QMessageBox.warning(self, "Missing folder", "Pick the export folder for the Rahway-only file."); return
+
+        week = week_from_range_str(jc.name)
+        if week is None:
+            QMessageBox.warning(self, "Bad file name",
+                "JC file name must contain WE MM-DD-YYYY."); return
+        monday, friday = week
+
+        rr = find_reel_summary(summary_root, monday)
+        if rr is None:
+            QMessageBox.warning(self, "Reel Summary not found",
+                f"No Reel Summary found under {summary_root} for week of {monday:%m/%d/%Y}."); return
+        log(f"Derived Reel Summary: {rr}")
+
         try:
-            week = week_from_range_str(jc.name)
-            if week is None:
-                QMessageBox.warning(self, "Bad file name",
-                    "JC file name must contain WE MM-DD-YYYY."); return
-            monday, friday = week
-            jc_loads = collect_from_jc_payment_statement(jc)
-            reel_loads = collect_from_reel_summary(rr)
-            loose_loads = collect_from_loose_folders(root, monday)
+            shared = win32com.client.DispatchEx("Excel.Application")
+            shared.ScreenUpdating = False
+            shared.DisplayAlerts = False
+            shared.EnableEvents = False
+            import time
+            try:
+                t0 = time.perf_counter()
+                jc_loads = collect_from_jc_payment_statement(jc)
+                log(f"TIMING jc: {time.perf_counter()-t0:.2f}s")
+                t0 = time.perf_counter()
+                reel_loads = collect_from_reel_summary(rr)
+                log(f"TIMING reel: {time.perf_counter()-t0:.2f}s")
+                t0 = time.perf_counter()
+                loose_loads = collect_from_loose_folders(loose_root, monday, excel=shared)
+                log(f"TIMING loose: {time.perf_counter()-t0:.2f}s")
+            finally:
+                try: shared.Quit()
+                except Exception: pass
+                try:
+                    import pythoncom
+                    pythoncom.CoFreeUnusedLibraries()
+                except Exception: pass
         except Exception as e:
             QMessageBox.critical(self, "Collect failed", str(e)); return
+
+        pickup_map: dict[str, dict] = {}
+        if pickup_root is not None and pickup_root.exists():
+            shared = win32com.client.DispatchEx("Excel.Application")
+            shared.ScreenUpdating = False
+            shared.DisplayAlerts = False
+            shared.EnableEvents = False
+            try:
+                pickup_map = collect_scrap_pickup_locations(pickup_root, monday, excel=shared)
+            finally:
+                try: shared.Quit()
+                except Exception: pass
+                try:
+                    import pythoncom
+                    pythoncom.CoFreeUnusedLibraries()
+                except Exception: pass
+
+        for lr in reel_loads + loose_loads:
+            info = pickup_map.get(lr.frn.strip().upper())
+            if info:
+                pickup_location = (info.get("location") or "").strip().upper()
+                if pickup_location and pickup_location != "NO LOCATION":
+                    lr.origin = pickup_location
+                if info.get("ritm"):
+                    lr.ritm = info["ritm"]
+            elif not lr.origin:
+                lr.origin = "NO LOCATION"
 
         def _date_key(lr: LoadRow):
             return (lr.date or _frn_date(lr.frn) or "9999-12-31", lr.source, lr.frn)
@@ -1298,11 +1648,16 @@ class FillWindow(QMainWindow):
         ours_only = [l for l in ordered if l.source != "jc"]
 
         try:
-            out_a = jc.with_name(f"Verizon BAU Payment Statement WE {friday:%m-%d-%Y} (merged).xls")
-            out_b = jc.with_name(f"Verizon BAU NJ Payment Statement WE {friday:%m-%d-%Y}.xls")
+            # Write directly to the chosen folders; no date subfolders created.
+            out_a = output_root / f"Verizon BAU Payment Statement WE {friday:%m-%d-%Y} (merged).xls"
+            out_b = output_rahway / f"Verizon BAU NJ Payment Statement WE {friday:%m-%d-%Y}.xls"
+            
             jc_prices = read_jc_prices(jc)
+            
+            # Write Merged
             fill_payment_statement(jc, ours_only, out_a, monday=monday,
                                    add_to_existing=True)
+            # Write Rahway-only
             fill_payment_statement(tpl, ours_only, out_b, monday=monday,
                                    add_to_existing=False, jc_prices=jc_prices)
         except Exception as e:
@@ -1310,7 +1665,8 @@ class FillWindow(QMainWindow):
         self.status.setText(
             f"Wrote merged ({len(ordered)} loads, includes JC): {out_a.name}\n"
             f"Wrote Rahway-only ({len(ours_only)} loads, excludes JC): {out_b.name}\n"
-            f"Audit logs: {out_a.stem}_loads.log, {out_b.stem}_loads.log"
+            f"Merged folder: {output_root}\n"
+            f"Rahway folder: {output_rahway}"
         )
         QMessageBox.information(self, "Done",
             f"Merged (JC + ours, {len(ordered)} loads):\n  {out_a}\n\n"
