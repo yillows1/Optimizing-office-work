@@ -1492,10 +1492,52 @@ class AddressBatchDialog(QDialog):
                 )
                 return
 
-        if location:
+        if location and not ritm:
+            # Items with only a location need to be staged so they aren't lost.
             for item in items:
                 item["_address"] = location
-        if ritm:
+            
+            # Find or create a staged record for this location-only group
+            target = None
+            for r in self.staged_ritms:
+                if not r["ritm"] and r.get("location_address") == location:
+                    target = r
+                    break
+            
+            if target is None:
+                target = {
+                    "group": "no request item",
+                    "ritm": "",
+                    "letter": "",
+                    "date": self._template["date"],
+                    "packing_list": self._template["packing_list"],
+                    "location": self._location_from_address(location),
+                    "location_address": location,
+                    "driver_plate": self._template["driver_plate"],
+                    "items": [],
+                    "source_matches": [],
+                }
+                self.staged_ritms.append(target)
+            
+            target["items"].extend(items)
+            moved_ids = {id(item) for item in items}
+            self.unmatched_items = [
+                item for item in self.unmatched_items if id(item) not in moved_ids
+            ]
+            self._refresh_all_assignment_lists()
+            self._rebuild_remove_tab()
+
+        elif location and ritm:
+            # Both location and RITM
+            for item in items:
+                item["_ritm"] = ritm
+            self._move_items_to_ritm(items, ritm, location)
+            
+        elif ritm:
+            # RITM only
+            for item in items:
+                item["_ritm"] = ritm
+            self._move_items_to_ritm(items, ritm, "")
             for item in items:
                 item["_ritm"] = ritm
             self._move_items_to_ritm(items, ritm, location)
@@ -1569,7 +1611,7 @@ class AddressBatchDialog(QDialog):
 
         for item in items:
             item["_ritm"] = ritm
-            if location and not item.get("_address"):
+            if location:
                 item["_address"] = location
         target["items"].extend(items)
         if location and not target["location_address"]:
@@ -4638,11 +4680,18 @@ class PackingListApp(QMainWindow):
                 continue
             packing_list_key = ritm_record["packing_list"].casefold()
             ritm_key = (ritm_record["ritm"] or "").casefold()
+            
+            # Find an existing record. If it's a "No Request Item" load,
+            # we must also match the location so we don't merge different locations.
             existing = next(
                 (
                     r for r in self.records
                     if r["packing_list"].casefold() == packing_list_key
                     and (r["ritm"] or "").casefold() == ritm_key
+                    and (
+                        ritm_key != "" 
+                        or r.get("location_address", "").strip() == ritm_record.get("location_address", "").strip()
+                    )
                 ),
                 None,
             )
