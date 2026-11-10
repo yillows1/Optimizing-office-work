@@ -2158,6 +2158,47 @@ class SourceMatchPickerDialog(QDialog):
         self.accept()
 
 
+class ItemRitmPickerDialog(QDialog):
+    def __init__(
+        self,
+        parent,
+        description: str,
+        ritms: list[str],
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Choose Request Item")
+        self.setMinimumWidth(420)
+        self.chosen: str | None = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f'"{description}" matched multiple Request Items. Choose one:'
+        ))
+
+        self.radios: list[QRadioButton] = []
+        for index, ritm in enumerate(ritms):
+            radio = QRadioButton(ritm)
+            if index == 0:
+                radio.setChecked(True)
+            layout.addWidget(radio)
+            self.radios.append(radio)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._on_ok)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_ok(self) -> None:
+        for index, radio in enumerate(self.radios):
+            if radio.isChecked():
+                self.chosen = radio.text()
+                break
+        self.accept()
+
+
 # ---------------------------------------------------------------------------
 # Input-sheet parsing / template handling
 # ---------------------------------------------------------------------------
@@ -4414,16 +4455,19 @@ class PackingListApp(QMainWindow):
             self._set_processing_state(True)
             return
 
+        record_items = record.get("items") or []
         time_range = self.range_selector.currentData()
         search_terms_for_rescan = list(dict.fromkeys(
-            item["description"] for item in record["items"] if item["description"].strip()
+            item.get("description", "")
+            for item in record_items
+            if item.get("description", "").strip()
         ))
 
         subject_matches = [match for match in results.exact_matches if match.subject_ritms]
         if not subject_matches:
             dialog = AddressBatchDialog(
                 self,
-                record["items"],
+                record_items,
                 [],
                 record,
                 subject_matches=[],
@@ -4468,19 +4512,44 @@ class PackingListApp(QMainWindow):
             for match in subject_matches
         })
 
+        item_ritm_candidates: dict[int, set[str]] = {}
+        found_ritms_by_key = {ritm.casefold(): ritm for ritm in found_ritms}
+        for index, item in enumerate(record_items):
+            description_key = item.get("description", "").casefold()
+            candidates = {
+                ritm
+                for match in subject_matches
+                if match.term.casefold() == description_key
+                for ritm in match.subject_ritms
+            }
+            candidates.update(
+                ritm
+                for candidate in results.near_matches
+                if candidate.term.casefold() == description_key
+                and (
+                    candidate.term.casefold(),
+                    candidate.folder.casefold(),
+                    candidate.filename.casefold(),
+                ) in accepted_near_keys
+                for ritm in candidate.subject_ritms
+            )
+            item_ritm_candidates[index] = {
+                found_ritms_by_key[ritm.casefold()]
+                for ritm in candidates
+                if ritm.casefold() not in skipped_ritms
+                and ritm.casefold() in found_ritms_by_key
+            }
+
+        duplicate_pairs: set[tuple[str, str]] = set()
         # ---- DB duplicate scan ----
-        # Runs before the AddressBatchDialog opens so the user sees duplicates
-        # up-front. Skipped entirely when Ignore DB is checked or DB unset.
+        # Existing item/RITM pairs are removed before choosing an item's RITM.
         if db_configured() and not self.ignore_db_checkbox.isChecked():
             pending_for_dup_check: list[PackingListRecord] = []
             for ritm in found_ritms:
-                ritm_matches = [
-                    m for m in subject_matches if ritm in m.subject_ritms
-                ]
-                ritm_terms = {m.term.casefold() for m in ritm_matches}
                 probe_items = [
-                    item for item in record["items"]
-                    if item["description"].casefold() in ritm_terms
+                    item
+                    for index, item in enumerate(record_items)
+                    if ritm in item_ritm_candidates[index]
                 ]
                 if not probe_items:
                     continue
@@ -4491,32 +4560,48 @@ class PackingListApp(QMainWindow):
                     "items": probe_items,
                 })
             dupes = record_db_duplicates(pending_for_dup_check)
-            if dupes:
-                lines = []
-                for ritm_value, desc, existing_frn in dupes:
-                    lines.append(
-                        f"  • {desc}  under  {ritm_value}"
-                        f"   (existing FRN: {existing_frn})"
-                    )
-                answer = QMessageBox.question(
-                    self,
-                    "Duplicate item/RITM combinations found",
-                    "These item + Request Item combinations already exist in "
-                    "the database under a different Packing List:\n\n"
-                    + "\n".join(lines)
-                    + "\n\nProceed anyway? (Rows will be skipped on insert "
-                    "unless Repeat load is checked.)",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes,
-                )
-                if answer != QMessageBox.StandardButton.Yes:
-                    self.pending_record = None
-                    self.imported_record = None
-                    self.imported_source_path = None
-                    self._set_processing_state(True)
-                    self.status_label.setText("Scan cancelled at DB check.")
-                    return
+            current_base = _base_frn(_packing_list_identifier(record)).casefold()
+            for ritm, description, existing_frn in dupes:
+                if (
+                    self.repeat_load_checkbox.isChecked()
+                    and _base_frn(existing_frn).casefold() == current_base
+                ):
+                    continue
+                duplicate_pairs.add((ritm.casefold(), description.casefold()))
         # ---- /DB duplicate scan ----
+
+        item_ritm_assignment: dict[int, str] = {}
+        skipped_item_indexes: set[int] = set()
+        for index, item in enumerate(record_items):
+            candidates = sorted(
+                (
+                    ritm
+                    for ritm in item_ritm_candidates[index]
+                    if (
+                        ritm.casefold(),
+                        item.get("description", "").casefold(),
+                    ) not in duplicate_pairs
+                ),
+                key=str.casefold,
+            )
+            if not candidates:
+                if item_ritm_candidates[index]:
+                    skipped_item_indexes.add(index)
+                continue
+            if len(candidates) == 1:
+                item_ritm_assignment[index] = candidates[0]
+                continue
+
+            picker = ItemRitmPickerDialog(
+                self, item.get("description", ""), candidates
+            )
+            if (
+                picker.exec() == QDialog.DialogCode.Accepted
+                and picker.chosen is not None
+            ):
+                item_ritm_assignment[index] = picker.chosen
+            else:
+                skipped_item_indexes.add(index)
 
         assigned_item_indexes: set[int] = set()
         matched_email_count = len({
@@ -4563,14 +4648,16 @@ class PackingListApp(QMainWindow):
                 if candidate.term.casefold() in accepted_terms
             })
             matched_item_indexes = [
-                index for index, item in enumerate(record["items"])
-                if index not in assigned_item_indexes
+                index for index, item in enumerate(record_items)
+                if item_ritm_assignment.get(index) == ritm
+                and index not in assigned_item_indexes
                 and (
-                    item["description"].casefold() in current_matched_terms
-                    or item["description"].casefold() in accepted_terms
+                    item.get("description", "").casefold()
+                    in current_matched_terms
+                    or item.get("description", "").casefold() in accepted_terms
                 )
             ]
-            matched_items = [record["items"][index] for index in matched_item_indexes]
+            matched_items = [record_items[index] for index in matched_item_indexes]
             if not matched_items:
                 continue
             assigned_item_indexes.update(matched_item_indexes)
@@ -4611,8 +4698,9 @@ class PackingListApp(QMainWindow):
             staged.append(ritm_record)
 
         unmatched_items = [
-            item for index, item in enumerate(record["items"])
+            item for index, item in enumerate(record_items)
             if index not in assigned_item_indexes
+            and index not in skipped_item_indexes
         ]
 
         dialog = AddressBatchDialog(
@@ -4666,7 +4754,13 @@ class PackingListApp(QMainWindow):
             f"Packing list IDs: {', '.join(queued_packing_lists)}\n"
             f"Exact item matches across {matched_email_count} email(s):\n"
             f"{chr(10).join(exact_summary)}\n"
-            f"Accepted near-match attachments: {total_accepted_files}. "
+            + (
+                f"Skipped {len(skipped_item_indexes)} item(s) "
+                "because their available RITM matches were already in the "
+                "database or no RITM was selected.\n"
+                if skipped_item_indexes else ""
+            )
+            + f"Accepted near-match attachments: {total_accepted_files}. "
             "Select an email below and choose Reply to open a draft. "
             "Hand-typed RITMs work with Reply too."
         )
