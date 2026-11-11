@@ -22,7 +22,6 @@ import json
 import re
 import sys
 import shutil
-import logging as _logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -37,6 +36,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
 )
 
+from app_logging import configure_app_logging
+
 
 # =============================================================================
 # Config / paths
@@ -47,17 +48,17 @@ def get_user_dir() -> Path:
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
+try:
+    from version import VERSION
+except Exception:
+    VERSION = "dev"
 
 CONFIG_PATH = get_user_dir() / "scanner_config.json"
-_LOG = get_user_dir() / "fill_statement.log"
-_logging.basicConfig(
-    filename=str(_LOG), level=_logging.INFO,
-    format="%(asctime)s %(message)s", datefmt="%H:%M:%S",
-)
+_LOGGER = configure_app_logging("Fill Payment Statement")
 
 
-def log(msg: str) -> None:
-    _logging.info(msg)
+def log(msg: str, *args: object) -> None:
+    _LOGGER.info(msg, *args)
 
 
 def load_cfg() -> dict:
@@ -492,7 +493,7 @@ def collect_from_reel_summary(path: Path) -> list[LoadRow]:
                     tare = find_label_value_in_sheet(fws, "TOTAL TARE") or 0
                 if not gross:
                     gross = find_label_value_in_sheet(fws, "TOTAL GROSS") or 0
-                log(f"Per-FRN {frn_tab_name}: gross={gross} tare={tare}")
+                log(f"Per-FRN {frn_tab_name}: found total weight fields.")
             else:
                 log(f"Per-FRN tab {frn_tab_name} not found; tare stays 0")
 
@@ -514,7 +515,10 @@ def collect_from_reel_summary(path: Path) -> list[LoadRow]:
                     if w:
                         k = normalize_class(str(lbl))
                         if k == "99X" and "99" not in str(lbl) and "X" not in str(lbl).upper():
-                            log(f"Unknown class label {lbl!r} on {frn_str}, mapped to 99X")
+                            log(
+                                f"Unknown class label on {frn_str}; "
+                                "mapped to 99X."
+                            )
                         class_nets[k] = class_nets.get(k, 0) + w
 
             net = sum(class_nets.values())
@@ -803,8 +807,8 @@ def collect_from_loose_folders(loose_root: Path, monday: date, excel=None) -> li
                     class_tare=dict(data.get("class_tare", {})),
                     folder=str(path.parent),
                 ))
-            except Exception as e:
-                log(f"Loose parse failed for {frn}: {e}")
+            except Exception:
+                _LOGGER.exception("Loose-file parse failed for FRN %s.", frn)
     finally:
         if own_excel:
             try: excel.Quit()
@@ -856,7 +860,12 @@ def parse_scrap_pickup_file(path: Path, excel=None) -> dict:
             if street and city:
                 break
 
-        log(f"Scrap pickup {path.name}: frn={frn!r} street={street!r} city={city!r}")
+        log(
+            "Read Scrap Pickup file %s: FRN=%s location_present=%s",
+            path.name,
+            frn or "(none)",
+            bool(street or city),
+        )
 
         parts = []
         for v in (street, city):
@@ -927,8 +936,8 @@ def collect_scrap_pickup_locations(root: Path, monday: date, excel=None) -> dict
             log(f"Scrap pickup: parsing {path.name}")
             try:
                 data = parse_scrap_pickup_file(path, excel=excel)
-            except Exception as e:
-                log(f"Scrap pickup parse failed for {path.name}: {e}")
+            except Exception:
+                _LOGGER.exception("Scrap pickup parse failed for %s.", path.name)
                 continue
             frn = (data.get("frn") or "").strip().upper()
             if not frn:
@@ -1058,8 +1067,8 @@ def _audit_log_line(lr: LoadRow, gross: int, tare: int, net: int,
     try:
         with open(_AUDIT_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except Exception as e:
-        log(f"audit log write failed: {e}")
+    except Exception:
+        _LOGGER.exception("Could not write payment statement audit sidecar.")
 
 
 def _update_statistic_tab(wb, loads):
@@ -1109,8 +1118,8 @@ def _verify_audit_totals():
                 m = re.search(rf"{k}\+=(\d+)", line)
                 if m:
                     totals[k] += int(m.group(1))
-    except Exception as e:
-        log(f"audit verify read failed: {e}")
+    except Exception:
+        _LOGGER.exception("Could not verify payment statement audit sidecar.")
         return
     log(f"AUDIT totals: {totals}")
 
@@ -1436,7 +1445,7 @@ class SortDialog(QDialog):
 class FillWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Fill Verizon Payment Statement")
+        self.setWindowTitle(f"Fill Verizon Payment Statement  (v{VERSION})")
         self.resize(1000, 640)
         self.setStyleSheet(
             "QMainWindow, QWidget { background: #f2f5f3; color: #20332e; }"
@@ -1554,26 +1563,40 @@ class FillWindow(QMainWindow):
         output_root = Path(self.output_input.text()) if self.output_input.text() else None
         output_rahway = Path(self.output_rahway_input.text()) if self.output_rahway_input.text() else None
         pickup_root = Path(self.pickup_input.text()) if self.pickup_input.text() else None
+        log(
+            "Collect requested: "
+            f"jc={jc}; template={tpl}; summaries={summary_root}; "
+            f"loose={loose_root}; pickup={pickup_root}; "
+            f"merged_output={output_root}; rahway_output={output_rahway}"
+        )
 
         if not (jc.exists() and tpl.exists()):
+            log("Input validation failed: JC file or blank template missing.")
             QMessageBox.warning(self, "Missing files", "Pick the JC file and blank template."); return
         if summary_root is None or not summary_root.exists():
+            log("Input validation failed: Reel Summary folder missing.")
             QMessageBox.warning(self, "Missing folder", "Pick the Receiving root for Reel Summaries."); return
         if loose_root is None or not loose_root.exists():
+            log("Input validation failed: loose-file folder missing.")
             QMessageBox.warning(self, "Missing folder", "Pick the Receiving root for loose files."); return
         if output_root is None or not output_root.exists():
+            log("Input validation failed: merged output folder missing.")
             QMessageBox.warning(self, "Missing folder", "Pick the export folder for the Merged file."); return
         if output_rahway is None or not output_rahway.exists():
+            log("Input validation failed: Rahway output folder missing.")
             QMessageBox.warning(self, "Missing folder", "Pick the export folder for the Rahway-only file."); return
 
         week = week_from_range_str(jc.name)
         if week is None:
+            log("Input validation failed: JC filename has no valid WE date: %s", jc.name)
             QMessageBox.warning(self, "Bad file name",
                 "JC file name must contain WE MM-DD-YYYY."); return
         monday, friday = week
+        log("Derived payment-statement week: %s through %s", monday, friday)
 
         rr = find_reel_summary(summary_root, monday)
         if rr is None:
+            log("Reel Summary not found for %s under %s", monday, summary_root)
             QMessageBox.warning(self, "Reel Summary not found",
                 f"No Reel Summary found under {summary_root} for week of {monday:%m/%d/%Y}."); return
         log(f"Derived Reel Summary: {rr}")
@@ -1602,19 +1625,28 @@ class FillWindow(QMainWindow):
                     pythoncom.CoFreeUnusedLibraries()
                 except Exception: pass
         except Exception as e:
+            _LOGGER.exception("Payment statement collection failed.")
             QMessageBox.critical(self, "Collect failed", str(e)); return
 
         pickup_map: dict[str, dict] = {}
         if pickup_root is not None and pickup_root.exists():
-            shared = win32com.client.DispatchEx("Excel.Application")
-            shared.ScreenUpdating = False
-            shared.DisplayAlerts = False
-            shared.EnableEvents = False
+            pickup_excel = None
             try:
-                pickup_map = collect_scrap_pickup_locations(pickup_root, monday, excel=shared)
+                pickup_excel = win32com.client.DispatchEx("Excel.Application")
+                pickup_excel.ScreenUpdating = False
+                pickup_excel.DisplayAlerts = False
+                pickup_excel.EnableEvents = False
+                pickup_map = collect_scrap_pickup_locations(
+                    pickup_root, monday, excel=pickup_excel
+                )
+            except Exception as e:
+                _LOGGER.exception("Scrap pickup collection failed from %s", pickup_root)
+                QMessageBox.critical(self, "Scrap pickup collection failed", str(e))
+                return
             finally:
-                try: shared.Quit()
-                except Exception: pass
+                if pickup_excel is not None:
+                    try: pickup_excel.Quit()
+                    except Exception: pass
                 try:
                     import pythoncom
                     pythoncom.CoFreeUnusedLibraries()
@@ -1635,6 +1667,10 @@ class FillWindow(QMainWindow):
             return (lr.date or _frn_date(lr.frn) or "9999-12-31", lr.source, lr.frn)
         ours_loads = sorted(reel_loads + loose_loads, key=_date_key)
         all_loads = jc_loads + ours_loads
+        log(
+            "Collected loads: jc=%d, reel=%d, loose=%d, pickup_records=%d",
+            len(jc_loads), len(reel_loads), len(loose_loads), len(pickup_map),
+        )
 
         self.status.setText(
             f"Collected: {len(jc_loads)} JC (file order), "
@@ -1643,8 +1679,13 @@ class FillWindow(QMainWindow):
         )
         dlg = SortDialog(all_loads, self)
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            log("User cancelled load ordering.")
             self.status.setText("Cancelled."); return
         ordered = dlg.ordered()
+        log(
+            "User load order: %s",
+            [(load.frn, load.source, load.date) for load in ordered],
+        )
         ours_only = [l for l in ordered if l.source != "jc"]
 
         try:
@@ -1661,7 +1702,9 @@ class FillWindow(QMainWindow):
             fill_payment_statement(tpl, ours_only, out_b, monday=monday,
                                    add_to_existing=False, jc_prices=jc_prices)
         except Exception as e:
+            _LOGGER.exception("Payment statement workbook writing failed.")
             QMessageBox.critical(self, "Write failed", str(e)); return
+        log("Payment statements written: merged=%s; rahway=%s", out_a, out_b)
         self.status.setText(
             f"Wrote merged ({len(ordered)} loads, includes JC): {out_a.name}\n"
             f"Wrote Rahway-only ({len(ours_only)} loads, excludes JC): {out_b.name}\n"

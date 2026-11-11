@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QTextCursor
 
 import win32com.client
+from app_logging import configure_app_logging
 
 import sys as _sys
 from pathlib import Path as _Path
@@ -68,11 +69,18 @@ def get_user_dir() -> _Path:
 # Config / paths
 # ---------------------------------------------------------------------------
 
+try:
+    from version import VERSION
+except Exception:
+    VERSION = "dev"
+
 CONFIG_PATH = get_user_dir() / "splitter_config.json"
 EXCEL_BASES = get_resource_path("Excel Bases")
 SPLIT_MATERIAL_TEMPLATE = EXCEL_BASES / "Split Material Weighted.xls"
 DEFAULT_SUMMARIES_DIR = get_user_dir() / "Summaries"
 DEFAULT_SPLIT_DIR = get_user_dir() / "Split Material"
+
+log = configure_app_logging("Split Material")
 
 
 def load_config() -> dict:
@@ -958,6 +966,7 @@ class SolverWorker(QThread):
             MIN_WEIGHT = old
             self.done.emit(result, "")
         except Exception as e:
+            log.exception("Split Material solver worker failed.")
             self.done.emit(None, str(e))
 
     def _do_solve(self):
@@ -1167,7 +1176,7 @@ class LoadItemsWidget(QWidget):
 class SplitMaterialWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Split Material Weights")
+        self.setWindowTitle(f"Split Material Weights  (v{VERSION})")
         self.resize(1150, 900)
 
         self.config = load_config()
@@ -1302,6 +1311,7 @@ class SplitMaterialWindow(QMainWindow):
         )
         if not chosen:
             return
+        log.info("Summary folder selected: %s", chosen)
         self.config["summary_folder"] = chosen
         save_config(self.config)
         self.folder_label.setText(chosen)
@@ -1331,6 +1341,7 @@ class SplitMaterialWindow(QMainWindow):
             if not self.config.get("split_folder"):
                 self.split_same_checkbox.setChecked(True)
             return
+        log.info("Split Material output folder selected: %s", chosen)
         self.config["split_folder"] = chosen
         save_config(self.config)
         self.split_folder_label.setText(chosen)
@@ -1370,11 +1381,18 @@ class SplitMaterialWindow(QMainWindow):
 
     def _load_family(self) -> None:
         frn = self.frn_input.text().strip()
+        log.info(
+            "Load family requested: frn=%s; summary_folder=%s",
+            frn,
+            self.config.get("summary_folder") or DEFAULT_SUMMARIES_DIR,
+        )
         if not frn:
+            log.warning("Load family rejected: FRN was empty.")
             QMessageBox.warning(self, "Missing FRN", "Type the FRN first.")
             return
         path = self._resolve_summary(frn)
         if path is None:
+            log.warning("Summary not found for FRN %s.", frn)
             QMessageBox.warning(
                 self, "Summary not found",
                 f"Could not find:\n{summary_filename_for_frn(frn)}\n\n"
@@ -1385,6 +1403,7 @@ class SplitMaterialWindow(QMainWindow):
         try:
             loads = read_family_r_loads(path, frn)
         except Exception as e:
+            log.exception("Could not read family FRN=%s from %s.", frn, path)
             QMessageBox.critical(self, "Read failed", str(e))
             return
 
@@ -1398,10 +1417,15 @@ class SplitMaterialWindow(QMainWindow):
                 try:
                     loads = read_family_r_loads(path, frn)
                 except Exception as e:
+                    log.exception(
+                        "Could not read inferred family FRN=%s from %s.",
+                        frn, path,
+                    )
                     QMessageBox.critical(self, "Read failed", str(e))
                     return
 
         if not loads:
+            log.warning("No loads found for FRN %s in %s.", frn, path)
             QMessageBox.warning(
                 self, "No loads found",
                 f"No R tabs for '{frn}' were found in:\n{path}\n\n"
@@ -1413,7 +1437,7 @@ class SplitMaterialWindow(QMainWindow):
         self.loads = loads
         self._rebuild_tabs()
         self._rebuild_materials_from_loads()
-        self._log(f"Loaded {len(loads)} load(s) from {path.name}.")
+        log.info("Loaded %d load(s) for FRN %s from %s.", len(loads), frn, path)
         for ld in loads:
             if not ld.driver and not ld.plate:
                 self._log(
@@ -1505,9 +1529,17 @@ class SplitMaterialWindow(QMainWindow):
             return
 
         frn = self.frn_input.text().strip()
+        log.info(
+            "Split requested: frn=%s; summary=%s; step=%s; min_weight=%s",
+            frn,
+            self.summary_path,
+            self.step_combo.currentText(),
+            self.min_weight_spin.value(),
+        )
         try:
             load_date = parse_frn_date(frn)
         except ValueError as e:
+            log.error("Invalid FRN entered for split: %s (%s)", frn, e)
             QMessageBox.critical(self, "Bad FRN", str(e))
             return
 
@@ -1531,6 +1563,7 @@ class SplitMaterialWindow(QMainWindow):
         totals: dict[str, int] = {}
         known_materials: set[str] = set()
         rows_to_keep: list[tuple[str, str]] = []
+        entered_materials: list[tuple[str, str]] = []
         for r in range(self.mats_table.rowCount()):
             name_item = self.mats_table.item(r, 0)
             weight_item = self.mats_table.item(r, 1)
@@ -1540,6 +1573,7 @@ class SplitMaterialWindow(QMainWindow):
             if not name:
                 continue
             weight_text = (weight_item.text().strip() if weight_item else "")
+            entered_materials.append((name, weight_text))
 
             if not weight_text:
                 known_materials.add(norm(name))
@@ -1547,10 +1581,17 @@ class SplitMaterialWindow(QMainWindow):
             try:
                 w_val = int(weight_text)
             except ValueError:
+                log.error(
+                    "Invalid material weight in row %d: material=%r value=%r",
+                    r + 1,
+                    name,
+                    weight_text,
+                )
                 QMessageBox.critical(self, "Bad material weight",
                                      f"Material row {r+1}: '{weight_text}' is not an integer.")
                 return
             if w_val < 0:
+                log.error("Invalid negative material weight in row %d: %s", r + 1, w_val)
                 QMessageBox.critical(self, "Bad material weight",
                                      f"Material row {r+1}: weight cannot be negative.")
                 return
@@ -1560,12 +1601,14 @@ class SplitMaterialWindow(QMainWindow):
             if w_val > 0:
                 totals[key] = w_val
                 rows_to_keep.append((name, weight_text))
+        log.info("User-entered material totals: %s", entered_materials)
 
         self.mats_table.setRowCount(0)
         for name, weight_text in rows_to_keep:
             self._add_material_row(name, weight_text)
 
         if not known_materials:
+            log.warning("Split rejected: no materials were entered.")
             QMessageBox.warning(self, "No materials", "Add at least one material.")
             return
 
@@ -1593,6 +1636,12 @@ class SplitMaterialWindow(QMainWindow):
                         mats.append(m)
             for it in mats:
                 if it not in known_materials:
+                    log.error(
+                        "Solver input references material %r on %s without "
+                        "a user-entered total.",
+                        it,
+                        ld.identifier,
+                    )
                     QMessageBox.critical(
                         self, "Unknown material",
                         f"Load {ld.identifier} uses material '{it}' "
@@ -1605,6 +1654,7 @@ class SplitMaterialWindow(QMainWindow):
             raw_bundles.append((ld.identifier, billable, ld.bundle_total))
 
         if not raw_bundles:
+            log.warning("Split rejected: no load has a positive material total.")
             QMessageBox.warning(
                 self, "Nothing to split",
                 "No load has any material with a positive total weight."
@@ -1612,7 +1662,14 @@ class SplitMaterialWindow(QMainWindow):
             return
 
         self.run_button.setEnabled(False)
-        self._log(f"Running solver on {len(raw_bundles)} load(s)…")
+        log.info(
+            "Solver run: frn=%s load_count=%d step=%s min=%d totals=%s",
+            self.frn_input.text().strip(),
+            len(raw_bundles),
+            self.step_combo.currentText(),
+            self.min_weight_spin.value(),
+            totals,
+        )
         self.worker = SolverWorker(
             totals, raw_bundles,
             int(self.step_combo.currentText()),
@@ -1624,6 +1681,7 @@ class SplitMaterialWindow(QMainWindow):
     def _solver_done(self, per_load, error: str) -> None:
         self.run_button.setEnabled(True)
         if error:
+            log.error("Solver failed for FRN %s: %s", self.frn_input.text().strip(), error)
             self._log(f"ERROR: {error}")
             QMessageBox.critical(self, "Solver failed", error)
             return
@@ -1650,6 +1708,7 @@ class SplitMaterialWindow(QMainWindow):
                 else:
                     self._log("No R tab Class cells needed updating.")
             except Exception as e:
+                log.exception("R-tab write-back failed for %s.", self.summary_path)
                 self._log(f"R tab write-back failed: {e}")
 
         self._log("")
@@ -1691,10 +1750,12 @@ class SplitMaterialWindow(QMainWindow):
         try:
             self._write_outputs(per_load)
         except Exception as e:
+            log.exception("Split Material output writing failed.")
             self._log(f"\nWRITE ERROR: {e}")
             QMessageBox.critical(self, "Write failed", str(e))
             return
         self._log("\nAll files written.")
+        log.info("Split completed successfully for FRN %s.", frn)
 
     def _write_outputs(self, per_load: dict[str, dict[str, int]]) -> None:
         frn = self.frn_input.text().strip()
@@ -1749,7 +1810,7 @@ class SplitMaterialWindow(QMainWindow):
                 weights=per_letter[letter],
                 destination=dest,
             )
-            self._log(f"Wrote {dest.name}")
+            log.info(f"Wrote {dest}")
 
         fill_p_tabs(summary_path, frn, per_letter, self.loads, load_date)
         self._log(f"Updated P tabs in {summary_path.name}")

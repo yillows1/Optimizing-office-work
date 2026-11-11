@@ -54,6 +54,7 @@ import win32com.client
 
 from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
+from app_logging import configure_app_logging
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +77,12 @@ def get_user_dir() -> _Path:
     return _Path(__file__).resolve().parent
 
 
-_TIMING_LOG = get_user_dir() / "packing_timing.log"
+try:
+    from version import VERSION
+except Exception:
+    VERSION = "dev"
 
-_logging.basicConfig(
-    filename=str(_TIMING_LOG),
-    level=_logging.INFO,
-    format="%(asctime)s %(message)s",
-    datefmt="%H:%M:%S",
-)
+_APP_LOGGER = configure_app_logging("Packing List")
 
 def _timed(fn):
     @_functools.wraps(fn)
@@ -93,12 +92,12 @@ def _timed(fn):
             return fn(*args, **kwargs)
         finally:
             elapsed = _time.perf_counter() - start
-            _logging.info(f"{fn.__name__}: {elapsed:.2f}s")
+            _APP_LOGGER.info("%s: %.2fs", fn.__name__, elapsed)
     return wrapper
 
 
 def _log_marker(text: str) -> None:
-    _logging.info(f"--- {text} ---")
+    _APP_LOGGER.info("--- %s ---", text)
 
 
 CONFIG_PATH = get_user_dir() / "scanner_config.json"
@@ -194,6 +193,27 @@ def normalize_manual_ritm(value: str) -> str:
     if normalized.isdigit():
         normalized = f"RITM{normalized}"
     return normalized if re.fullmatch(r"RITM\d+", normalized) else ""
+
+
+NO_REQUEST_ITEM = "No Request Item"
+
+
+def _is_no_request_item(value: str | None) -> bool:
+    return (
+        not value
+        or not value.strip()
+        or value.strip().casefold() == NO_REQUEST_ITEM.casefold()
+    )
+
+
+def _normalize_optional_ritm(value: str | None) -> str:
+    if _is_no_request_item(value):
+        return NO_REQUEST_ITEM
+    return str(value).strip()
+
+
+def _ritm_group_key(value: str | None) -> str:
+    return "" if _is_no_request_item(value) else str(value).strip().casefold()
 
 
 def _match_mentions_ritm(match: "ExactMatch", ritm: str) -> bool:
@@ -402,11 +422,9 @@ def with_db_retry(fn, attempts: int = 6, base_delay: float = 0.4):
 
 def _db_ritm_value(ritm: str | None) -> str | None:
     """Normalize the RITM for storage: NULL for missing / 'No Request Item'."""
-    if not ritm:
+    if _is_no_request_item(ritm):
         return None
-    if ritm.strip().casefold() == "no request item":
-        return None
-    return ritm.strip()
+    return str(ritm).strip()
 
 
 def ritm_item_exists_in_db(ritm: str, item_descriptions: list[str]) -> bool:
@@ -436,8 +454,8 @@ def ritm_item_exists_in_db(ritm: str, item_descriptions: list[str]) -> bool:
 
     try:
         return with_db_retry(_query)
-    except Exception as e:
-        _logging.info(f"DB duplicate check failed for {ritm}: {e}")
+    except Exception:
+        _APP_LOGGER.exception("DB duplicate check failed for RITM %s.", ritm)
         return False
 
 
@@ -485,8 +503,8 @@ def record_db_duplicates(
 
     try:
         return with_db_retry(_query)
-    except Exception as e:
-        _logging.info(f"DB duplicate scan failed: {e}")
+    except Exception:
+        _APP_LOGGER.exception("DB duplicate scan failed.")
         return []
 
 
@@ -535,8 +553,8 @@ def delete_base_frn_from_db(packing_list_identifier: str) -> int:
 
     try:
         return with_db_retry(_delete)
-    except Exception as e:
-        _logging.info(f"DB delete failed for base FRN {base}: {e}")
+    except Exception:
+        _APP_LOGGER.exception("DB delete failed for base FRN %s.", base)
         return 0
 
 
@@ -632,8 +650,8 @@ def insert_record_to_db(record: PackingListRecord) -> tuple[int, int]:
 
     try:
         return with_db_retry(_insert)
-    except Exception as e:
-        _logging.info(f"DB insert failed for {pl_number}: {e}")
+    except Exception:
+        _APP_LOGGER.exception("DB insert failed for %s.", pl_number)
         return (0, len(items))
 
 
@@ -1441,7 +1459,11 @@ class AddressBatchDialog(QDialog):
         self._remove_checkboxes: list[tuple[PackingListRecord, list[QCheckBox]]] = []
 
         for record in self.staged_ritms:
-            ritm_label = record["ritm"] or "(no request item)"
+            ritm_label = (
+                "(no request item)"
+                if _is_no_request_item(record.get("ritm"))
+                else record["ritm"]
+            )
             group = QGroupBox(
                 f"RITM {ritm_label} — "
                 f"{len(record['items'])} item(s)"
@@ -1538,14 +1560,17 @@ class AddressBatchDialog(QDialog):
             # Find or create a staged record for this location-only group
             target = None
             for r in self.staged_ritms:
-                if not r["ritm"] and r.get("location_address") == location:
+                if (
+                    _is_no_request_item(r.get("ritm"))
+                    and r.get("location_address") == location
+                ):
                     target = r
                     break
             
             if target is None:
                 target = {
                     "group": "no request item",
-                    "ritm": "",
+                    "ritm": NO_REQUEST_ITEM,
                     "letter": "",
                     "date": self._template["date"],
                     "packing_list": self._template["packing_list"],
@@ -1728,6 +1753,13 @@ class AddressBatchDialog(QDialog):
             )
             return
 
+        _APP_LOGGER.info(
+            "Manual RITM rescan requested: ritm=%s item_count=%d "
+            "time_range=%s",
+            ritm,
+            len(term_set),
+            self._time_range,
+        )
         self.status_label.setText(
             f"Rescanning Outlook for {len(term_set)} item description(s) "
             f"matching {ritm}..."
@@ -1747,6 +1779,7 @@ class AddressBatchDialog(QDialog):
                 )
                 results = json.loads(results_path.read_text(encoding="utf-8"))
         except Exception as error:
+            _APP_LOGGER.exception("Manual Outlook rescan failed for %s.", ritm)
             QMessageBox.critical(self, "Rescan failed", str(error))
             self.status_label.setText("Rescan failed.")
             return
@@ -1778,6 +1811,11 @@ class AddressBatchDialog(QDialog):
             match for match in new_matches
             if _match_mentions_ritm(match, ritm)
         ])
+        _APP_LOGGER.info(
+            "Manual Outlook rescan completed: ritm=%s matched_sources=%d",
+            ritm,
+            len(hits),
+        )
 
         if not hits:
             self.status_label.setText(
@@ -2506,7 +2544,7 @@ def write_scrap_pickup_template(
             street = "No Location"
             city = ""
 
-        _safe_write(sheet, "F16", record["ritm"] or "No Request Item")
+        _safe_write(sheet, "F16", _normalize_optional_ritm(record.get("ritm")))
         _safe_write(sheet, "D19", street)
         _safe_write(sheet, "D20", city)
         _safe_write(sheet, "D34", _packing_list_identifier(record))
@@ -2689,7 +2727,9 @@ def _read_reel_summary_record(sheet) -> PackingListRecord | None:
 
     return {
         "group": "",
-        "ritm": str(sheet.Range("M5").Value or "").strip(),
+        "ritm": _normalize_optional_ritm(
+            str(sheet.Range("M5").Value or "")
+        ),
         "letter": letter,
         "date": normalized_date,
         "packing_list": packing_list,
@@ -2873,7 +2913,9 @@ def write_reel_summary_report(
                     datetime.combine(parse_date(record["date"]), datetime.min.time()),
                 )
                 sheet.Range("M4").NumberFormat = "mm/dd/yyyy"
-                _safe_write(sheet, "M5", record["ritm"])
+                _safe_write(
+                    sheet, "M5", _normalize_optional_ritm(record.get("ritm"))
+                )
                 _safe_write(sheet, "C7", record["location"].strip() or "No Location")
                 _safe_write(sheet, "I7", sum(item["gross"] for item in record["items"]))
                 _safe_write(sheet, "C8", "N/A")
@@ -3034,6 +3076,7 @@ class ScannerWorker(QThread):
                 ))
                 self.scan_complete.emit(ScanResults(exact_matches, near_list))
         except Exception as error:
+            _APP_LOGGER.exception("Outlook scanner worker failed.")
             self.scan_failed.emit(str(error))
 
 
@@ -3044,7 +3087,7 @@ class ScannerWorker(QThread):
 class PackingListApp(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Scanner Packing Lists")
+        self.setWindowTitle(f"Scanner Packing Lists  (v{VERSION})")
         self.resize(1180, 900)
         self.setMinimumSize(920, 720)
 
@@ -3408,6 +3451,7 @@ class PackingListApp(QMainWindow):
         )
         if not chosen:
             return
+        _APP_LOGGER.info("Packing-list database selected: %s", chosen)
         self.app_config["database_path"] = chosen
         save_app_config(self.app_config)
         self._update_db_toggle_state()
@@ -3444,6 +3488,7 @@ class PackingListApp(QMainWindow):
         try:
             working = copy_template_to_working(preferred_dir=preferred_dir)
         except Exception as error:
+            _APP_LOGGER.exception("Could not create a packing-list input sheet.")
             QMessageBox.critical(self, "Could not open input sheet", str(error))
             return
 
@@ -3466,6 +3511,7 @@ class PackingListApp(QMainWindow):
             f"Working file: {working}\n"
             "Edit in Excel, save, close, then click Import Input Sheet."
         )
+        _APP_LOGGER.info("Created/opened input sheet: %s", working)
 
     def _import_input_sheet(self) -> None:
         last_import_folder = (
@@ -3488,6 +3534,7 @@ class PackingListApp(QMainWindow):
         if not chosen:
             return
         chosen_path = Path(chosen)
+        _APP_LOGGER.info("Packing-list import requested: %s", chosen_path)
 
         self.app_config["last_import_folder"] = str(chosen_path.parent)
         save_app_config(self.app_config)
@@ -3496,6 +3543,7 @@ class PackingListApp(QMainWindow):
         try:
             record = parse_incoming_packing_list(chosen_path)
         except Exception as error:
+            _APP_LOGGER.exception("Could not parse input sheet %s.", chosen_path)
             QMessageBox.critical(self, "Could not read input sheet", str(error))
             return
         _log_marker("GUI: Import parse returned")
@@ -3521,6 +3569,16 @@ class PackingListApp(QMainWindow):
         gross_total = sum(item["gross"] for item in record["items"])
         tare_total = sum(item["tare"] for item in record["items"])
         net_total = sum(item["net"] for item in record["items"])
+        _APP_LOGGER.info(
+            "Packing-list input parsed: packing_list=%s date=%s items=%d "
+            "gross=%d tare=%d net=%d",
+            record["packing_list"],
+            record["date"],
+            len(record["items"]),
+            gross_total,
+            tare_total,
+            net_total,
+        )
         self.imported_info_label.setText(
             f"Imported: {chosen_path.name}\n"
             f"Packing List: {record['packing_list']}\n"
@@ -3566,6 +3624,7 @@ class PackingListApp(QMainWindow):
         try:
             plans = plan_file_renames(folder)
         except Exception as error:
+            _APP_LOGGER.exception("Could not scan rename folder %s.", folder)
             QMessageBox.critical(self, "Could not scan folder", str(error))
             self.status_label.setText("Rename cancelled.")
             return
@@ -3588,6 +3647,11 @@ class PackingListApp(QMainWindow):
             self.status_label.setText("No files selected for renaming.")
             return
 
+        _APP_LOGGER.info(
+            "File rename selections: folder=%s plans=%s",
+            folder,
+            [(plan["old_name"], plan["new_name"]) for plan in selected],
+        )
         renamed = 0
         failures: list[str] = []
         for plan in selected:
@@ -3602,8 +3666,15 @@ class PackingListApp(QMainWindow):
                 src.rename(dst)
                 renamed += 1
             except OSError as error:
+                _APP_LOGGER.exception("Could not rename %s to %s.", src, dst)
                 failures.append(f"{src.name}: {error}")
 
+        _APP_LOGGER.info(
+            "File rename completed: renamed=%d failures=%d folder=%s",
+            renamed,
+            len(failures),
+            folder,
+        )
         message_lines = [f"Renamed {renamed} file(s)."]
         if failures:
             message_lines.append("")
@@ -3696,6 +3767,10 @@ class PackingListApp(QMainWindow):
         item_type = normalize_item_type(self.type_input.text())
         gross = self.gross_input.value()
         tare = self.tare_input.value()
+        _APP_LOGGER.info(
+            "Manual item input: description=%r type=%r gross=%d tare=%d",
+            description, item_type, gross, tare,
+        )
         if not description or not item_type:
             QMessageBox.warning(
                 self, "Missing item details", "Enter an item description and type."
@@ -3747,6 +3822,12 @@ class PackingListApp(QMainWindow):
             self.status_label.setText("Select one or more current items to remove")
             return
         for index in indexes:
+            removed = self.current_items[index]
+            _APP_LOGGER.info(
+                "Manual item removed: description=%r type=%r",
+                removed.get("description", ""),
+                removed.get("type", ""),
+            )
             self.current_items.pop(index)
             self.items_table.removeRow(index)
         self._update_totals()
@@ -3780,6 +3861,7 @@ class PackingListApp(QMainWindow):
         try:
             normalized_date = parse_date(raw_date).isoformat()
         except ValueError as error:
+            _APP_LOGGER.error("Invalid manual record date %r: %s", raw_date, error)
             QMessageBox.warning(self, "Check the date", str(error))
             self.date_input.setFocus()
             return None
@@ -3801,6 +3883,14 @@ class PackingListApp(QMainWindow):
             "driver_plate": self.driver_plate_input.text().strip(),
             "items": self.current_items.copy(),
         }
+        _APP_LOGGER.info(
+            "Manual packing-list form submitted: date=%s packing_list=%s "
+            "driver_plate=%r item_count=%d",
+            normalized_date,
+            packing_list,
+            record["driver_plate"],
+            len(record["items"]),
+        )
         return record
 
     # ------------------------------------------------------------------
@@ -3881,8 +3971,7 @@ class PackingListApp(QMainWindow):
                 rec["ritm"].casefold(): rec
                 for rec in self.records
                 if rec["packing_list"].casefold() == packing_list_key
-                and rec["ritm"]
-                and rec["ritm"].casefold() != "no request item"
+                and not _is_no_request_item(rec.get("ritm"))
             }
 
         def matches_for_ritm(ritm_value: str) -> list[ExactMatch]:
@@ -3970,8 +4059,7 @@ class PackingListApp(QMainWindow):
             rec["ritm"]: rec["ritm"]
             for rec in self.records
             if rec["packing_list"].casefold() == packing_list_key
-            and rec["ritm"]
-            and rec["ritm"].casefold() != "no request item"
+            and not _is_no_request_item(rec.get("ritm"))
         }
         if not known:
             return typed_ritm
@@ -4311,7 +4399,15 @@ class PackingListApp(QMainWindow):
             reply = message.ReplyAll()
             reply.HTMLBody = reply_body + reply.HTMLBody
             reply.Display()
+            _APP_LOGGER.info(
+                "Outlook reply draft opened: ritm=%s packing_list=%s "
+                "item_count=%d",
+                email.ritm,
+                email.packing_list,
+                len(item_descriptions),
+            )
         except Exception as error:
+            _APP_LOGGER.exception("Could not create Outlook reply for %s.", email.ritm)
             QMessageBox.critical(self, "Could not prepare reply", str(error))
 
     # ------------------------------------------------------------------
@@ -4333,6 +4429,15 @@ class PackingListApp(QMainWindow):
                 "Enter at least one item description to scan.",
             )
             return
+        _APP_LOGGER.info(
+            "Outlook scan requested: packing_list=%s date=%s item_count=%d "
+            "time_range=%s database_ignored=%s",
+            record.get("packing_list", ""),
+            record.get("date", ""),
+            len(record.get("items") or []),
+            self.range_selector.currentData(),
+            self.ignore_db_checkbox.isChecked(),
+        )
         self.pending_record = record
         self._set_processing_state(False)
         self.status_label.setText(
@@ -4454,6 +4559,13 @@ class PackingListApp(QMainWindow):
         if record is None:
             self._set_processing_state(True)
             return
+        _APP_LOGGER.info(
+            "Outlook scan finished: packing_list=%s exact_matches=%d "
+            "near_matches=%d",
+            record.get("packing_list", ""),
+            len(results.exact_matches),
+            len(results.near_matches),
+        )
 
         record_items = record.get("items") or []
         time_range = self.range_selector.currentData()
@@ -4476,6 +4588,10 @@ class PackingListApp(QMainWindow):
             )
             dialog.rescan_found_sources.connect(self._on_rescan_sources)
             if dialog.exec() != QDialog.DialogCode.Accepted:
+                _APP_LOGGER.info(
+                    "Assignment cancelled for packing_list=%s.",
+                    record.get("packing_list", ""),
+                )
                 self.pending_record = None
                 self.imported_record = None
                 self.imported_source_path = None
@@ -4560,6 +4676,11 @@ class PackingListApp(QMainWindow):
                     "items": probe_items,
                 })
             dupes = record_db_duplicates(pending_for_dup_check)
+            _APP_LOGGER.info(
+                "Database duplicate matches for packing_list=%s: %s",
+                record.get("packing_list", ""),
+                dupes,
+            )
             current_base = _base_frn(_packing_list_identifier(record)).casefold()
             for ritm, description, existing_frn in dupes:
                 if (
@@ -4592,6 +4713,11 @@ class PackingListApp(QMainWindow):
                 item_ritm_assignment[index] = candidates[0]
                 continue
 
+            _APP_LOGGER.info(
+                "Multiple RITM choices for item %r: %s",
+                item.get("description", ""),
+                candidates,
+            )
             picker = ItemRitmPickerDialog(
                 self, item.get("description", ""), candidates
             )
@@ -4600,8 +4726,17 @@ class PackingListApp(QMainWindow):
                 and picker.chosen is not None
             ):
                 item_ritm_assignment[index] = picker.chosen
+                _APP_LOGGER.info(
+                    "Selected RITM %s for item %r.",
+                    picker.chosen,
+                    item.get("description", ""),
+                )
             else:
                 skipped_item_indexes.add(index)
+                _APP_LOGGER.info(
+                    "Skipped item %r after no RITM was selected.",
+                    item.get("description", ""),
+                )
 
         assigned_item_indexes: set[int] = set()
         matched_email_count = len({
@@ -4741,7 +4876,7 @@ class PackingListApp(QMainWindow):
         ritm_letters: dict[str, str] = {}
         for r in self.records:
             if r["packing_list"].casefold() == record["packing_list"].casefold():
-                if r["ritm"] and r["ritm"].casefold() != "no request item":
+                if not _is_no_request_item(r.get("ritm")):
                     ritm_letters[r["ritm"].casefold()] = r["letter"]
 
         self._merge_matched_emails(
@@ -4767,6 +4902,13 @@ class PackingListApp(QMainWindow):
         self.status_label.setText(
             f"Processed packing list IDs {', '.join(queued_packing_lists)}."
         )
+        _APP_LOGGER.info(
+            "Scan assignment completed: packing_list=%s queued=%s "
+            "skipped_items=%d",
+            record.get("packing_list", ""),
+            queued_packing_lists,
+            len(skipped_item_indexes),
+        )
 
     def _commit_dialog_state(
         self,
@@ -4774,6 +4916,19 @@ class PackingListApp(QMainWindow):
         dialog: AddressBatchDialog,
         staged_ritm_records: list[tuple[PackingListRecord, list[ExactMatch]]],
     ) -> None:
+        _APP_LOGGER.info(
+            "User assignment results: packing_list=%s staged=%s unmatched=%d",
+            template_record.get("packing_list", ""),
+            [
+                (
+                    rec.get("ritm", ""),
+                    rec.get("location", ""),
+                    len(rec.get("items") or []),
+                )
+                for rec in dialog.staged_ritms
+            ],
+            len(dialog.unmatched_items),
+        )
         input_identifiers = {
             _packing_list_identifier(rec) for rec, _ in staged_ritm_records
         }
@@ -4805,7 +4960,7 @@ class PackingListApp(QMainWindow):
             if not items:
                 continue
             packing_list_key = ritm_record["packing_list"].casefold()
-            ritm_key = (ritm_record["ritm"] or "").casefold()
+            ritm_key = _ritm_group_key(ritm_record.get("ritm"))
             
             # Find an existing record. If it's a "No Request Item" load,
             # we must also match the location so we don't merge different locations.
@@ -4813,9 +4968,9 @@ class PackingListApp(QMainWindow):
                 (
                     r for r in self.records
                     if r["packing_list"].casefold() == packing_list_key
-                    and (r["ritm"] or "").casefold() == ritm_key
+                    and _ritm_group_key(r.get("ritm")) == ritm_key
                     and (
-                        ritm_key != "" 
+                        ritm_key != ""
                         or r.get("location_address", "").strip() == ritm_record.get("location_address", "").strip()
                     )
                 ),
@@ -4864,7 +5019,7 @@ class PackingListApp(QMainWindow):
             return
 
         def key(r: PackingListRecord):
-            has_ritm = bool(r["ritm"]) and r["ritm"].casefold() != "no request item"
+            has_ritm = not _is_no_request_item(r.get("ritm"))
             has_loc = bool(r["location"].strip() or r["location_address"].strip())
             if has_ritm and has_loc:
                 tier = 0
@@ -4887,6 +5042,7 @@ class PackingListApp(QMainWindow):
             r["letter"] = letters
 
     def _scan_failed(self, error: str) -> None:
+        _APP_LOGGER.error("Outlook scan failed: %s", error)
         self.pending_record = None
         self._set_processing_state(True)
         self.status_label.setText("Scan did not complete")
@@ -4922,6 +5078,14 @@ class PackingListApp(QMainWindow):
 
     def _save_records(self) -> None:
         _log_marker("=== EXPORT START ===")
+        _APP_LOGGER.info(
+            "Export requested: records=%d database_configured=%s "
+            "ignore_database=%s repeat_load=%s",
+            len(self.records),
+            db_configured(),
+            self.ignore_db_checkbox.isChecked(),
+            self.repeat_load_checkbox.isChecked(),
+        )
         if not self.records:
             QMessageBox.information(
                 self, "Nothing to save",
@@ -4968,6 +5132,7 @@ class PackingListApp(QMainWindow):
             _log_marker("EXPORT: user cancelled directory dialog")
             return
         _log_marker(f"EXPORT: directory chosen {selected_directory}")
+        _APP_LOGGER.info("Export destination selected: %s", selected_directory)
 
         self.app_config["last_export_folder"] = selected_directory
         save_app_config(self.app_config)
@@ -4989,6 +5154,17 @@ class PackingListApp(QMainWindow):
             if _packing_list_identifier(record).casefold() not in exported_record_ids
         ]
         _log_marker(f"EXPORT: {len(records_to_export)} record(s) to export")
+        _APP_LOGGER.info(
+            "Records selected for export: %s",
+            [
+                (
+                    _packing_list_identifier(record),
+                    record.get("date", ""),
+                    len(record.get("items") or []),
+                )
+                for record in records_to_export
+            ],
+        )
 
         packing_list_paths: list[Path] = []
         per_load_folders: list[Path] = []
@@ -5051,6 +5227,10 @@ class PackingListApp(QMainWindow):
                 try:
                     frn_date = parse_date(record["date"])
                 except Exception as error:
+                    _APP_LOGGER.exception(
+                        "Could not read typed date for packing list %s.",
+                        _packing_list_identifier(record),
+                    )
                     QMessageBox.critical(
                         self,
                         "Could not read a record's date",
@@ -5060,6 +5240,10 @@ class PackingListApp(QMainWindow):
             try:
                 monday, friday = week_range(frn_date.isoformat())
             except Exception as error:
+                _APP_LOGGER.exception(
+                    "Could not derive week for packing list %s.",
+                    _packing_list_identifier(record),
+                )
                 QMessageBox.critical(
                     self,
                     "Could not read a record's date",
@@ -5142,6 +5326,7 @@ class PackingListApp(QMainWindow):
 
         except Exception as error:
             _log_marker(f"EXPORT: EXCEPTION {error}")
+            _APP_LOGGER.exception("Packing-list export failed.")
             QMessageBox.critical(self, "Could not save files", str(error))
             return
         finally:
