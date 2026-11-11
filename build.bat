@@ -20,7 +20,7 @@ if exist *.spec del /q *.spec
 
 echo [1/5] Building SplitMaterial ...
 python -m PyInstaller ^
-  --onedir --windowed --name SplitMaterial ^
+  --onedir --windowed --noupx --name SplitMaterial ^
   --hidden-import win32com --hidden-import win32com.client ^
   --hidden-import win32timezone --hidden-import pythoncom ^
   --hidden-import pywintypes --hidden-import ortools ^
@@ -34,7 +34,7 @@ if errorlevel 1 goto :fail
 echo.
 echo [2/5] Building PackingList ...
 python -m PyInstaller ^
-  --onedir --windowed --name PackingList ^
+  --onedir --windowed --noupx --name PackingList ^
   --hidden-import win32com --hidden-import win32com.client ^
   --hidden-import win32timezone --hidden-import pythoncom ^
   --hidden-import pywintypes --hidden-import improvedScanner ^
@@ -49,7 +49,7 @@ if errorlevel 1 goto :fail
 echo.
 echo [3/5] Building FillPaymentStatement ...
 python -m PyInstaller ^
-  --onedir --windowed --name FillPaymentStatement ^
+  --onedir --windowed --noupx --name FillPaymentStatement ^
   --hidden-import win32com --hidden-import win32com.client ^
   --hidden-import win32timezone --hidden-import pythoncom ^
   --hidden-import pywintypes ^
@@ -61,7 +61,7 @@ if errorlevel 1 goto :fail
 echo.
 echo [4/5] Building PDFMerge ...
 python -m PyInstaller ^
-  --onedir --windowed --name PDFMerge ^
+  --onedir --windowed --noupx --name PDFMerge ^
   --hidden-import pypdf ^
   --paths . ^
   pdfMergeTool.py
@@ -70,7 +70,7 @@ if errorlevel 1 goto :fail
 echo.
 echo [5/5] Building VerizonPackingTools (launcher) ...
 python -m PyInstaller ^
-  --onedir --windowed --name VerizonPackingTools ^
+  --onedir --windowed --noupx --name VerizonPackingTools ^
   --paths . ^
   launcher.py
 if errorlevel 1 goto :fail
@@ -82,7 +82,6 @@ echo ============================================================
 set OUT=dist\VerizonPackingTools
 
 if not exist "%OUT%\logs" mkdir "%OUT%\logs"
-xcopy /E /I /Y "dist\VerizonPackingTools\*"  "%OUT%\" >nul
 xcopy /E /I /Y "dist\SplitMaterial\*"        "%OUT%\SplitMaterial\" >nul
 xcopy /E /I /Y "dist\PackingList\*"          "%OUT%\PackingList\" >nul
 xcopy /E /I /Y "dist\FillPaymentStatement\*" "%OUT%\FillPaymentStatement\" >nul
