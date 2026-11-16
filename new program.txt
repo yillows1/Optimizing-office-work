@@ -1,0 +1,141 @@
+
+
+Create a scanner for specifically different things
+
+Rename everything to be more friendly? for other people
+always put a description under like everything
+
+
+
+hmm lets talk about the database
+idea dumping::
+2 databases -> email database that will mark when an email is used, and a database for the inputted stuff the person put in (replacing the excel sheet system i initially had)
+Thoughts: if done with these 2 databases, the database with the inputted stuff will be edited to have the ritm, and recalling that data might have its own issues
+
+maybe have 3 databases?  the 3 being Scans/Email, Input data to recall or just store in general, The full disclosure of data similar to how the website transactions list looks like
+I think i will probably need to do this.  Lets consider the way this will run and/or the columns it will need
+
+First things first, what are things that are guaranteed
+- date 
+- Packing List Number or at least SOME SORT OF IDENTIFICATION (can be something like djsaio00001 maybe?  will prolly not overlap otherwise wtf)
+- Trucker plate and trucker
+
+Not guaranteed but may need to have it on all of them anyways
+- Gross 
+- Tare
+
+
+Whats the thought process behind having a database for Deliveries, and Pickups since reels are deliveries and i think loose fall under deliveries?
+
+But the process behind loose is so different it might end up being a different program or something but even then its kind of mid the only use is to make the 
+Scrap Pickup page which for some odd reason Pickup doesn't need the Scrap Pickup Excel sheet... Confusing naming from the getgo
+I will be naming it as John requested though, with it being "Pickup" "Deliveries" and "Reel Delivery"
+I think having the first or last column saying Delivery Pickup Reel Delivery is the easiest to read?
+Maybe have a program that shows the database though.  "Check Database" but which does it check?  Maybe have 3 databases so we can differentiate them.
+"Email Database"
+"Input Database"
+"Export Database"
+
+They can only read the Export Database but realistically input database is like expendable if it gets lost its just more of a safegaurd in case you wanna redo stuff i guess
+Make sure the redo buttons work though since this might be only something I give a sht about but the whole scanning system is a little messed up since if you redo things it should skip over,
+but if you're repeating just to fix something or whatever, then it might get messed up because after the first time the program will probably see the ritm and or location is mixed in with whatever
+so this will cause problems
+
+Also apparently I should make near misses for Location?  I think?  But i definitely will NOT make near misses on the RITM number since if you are MISTYPING THE RITM NUMBER it might already be screwed
+I guess when looking for location it should use all 3 (maybe 2 maybe 1 but the location can be the same i guess) locations on the ritm pages.  
+Lets make it so when scanning it either scans for location OR RITM.  NEVER BOTH because if RITM isnt there the location can repeat so it would be wrong to search location I think
+
+
+
+
+find by keyword --> dropdown for address / city / ritm / reel id
+find by packinglist (from reel id)
+
+Things idk if i can hardcode anymore:
+FRN numbers might just be different so let someone else just put it in themselves, and go off that
+They NEED to input a date there will be a lot of issues without it i think
+
+
+for scanning and finding the scans:
+have the near misses have more options in case instead of "same not same"
+show more information when finding matched request items / reel ids
+make sure thr database stops certain repeats if it happens
+
+have a separate internal fake email program that takes in the email
+
+
+title the box Search Result
+"User action needed"
+2 sections:
+found (matching)
+not matching
+more description for the 
+found from "email info"
+
+Create a mock email?  Like figure out how searching emails work, how databasing the emails works, and make it so you can "mark" emails through the database since if it sees the database is marked then the 
+email(s) will be marked as whatever the options were (make the options a dropdown menu on the gui, which is like the 3 options that will be on the Database)
+create the database to basically be the emails in a way, so the very first time you scan its god awful but after that it should be very quick I think since its only looking for ritms right?
+decide what the emails are storing though
+Email stores:
+sender(s)
+Subject
+PDF file name
+date
+Location?  this will make the program take a long long time for the first time running it.  Maybe separate and just make an email setup thing since it would stop it from updating it but for ease of use maybe not?
+
+
+
+
+"Reel ID"
+fix the gui to look nicer : basically u still can use the way that Manual Input works, though make it a popup gui instead of being on the same gui... 
+might find a better solution though since the app is already quite popup based already
+
+# of messgaes found
+
+
+say what it is like how the email is the middle sections
+Move to unmatch?
+change "request item" to "request number"
+right click to reply instead of the fat green button (make sure to give a description)
+
+
+near match has option with "none of them"
+lower the percentile so it can catch more
+
+Assign location page
+how to show near misses with the ritm so that its easier to put it in through that too
+
+confirmation?
+complete 
+pending
+cancel
+
+3 types of requests
+Reel Delivery (has reel ids) - > needs Reel summary Report, and the scanned docs    [Search through either Reel ID, Or the whole Excel File that I already do]
+Truck Delivery (no reel delivery... only needs Request Item and Scrap Pickup Request)   [RITM number OR Address]
+Pickup (needs request pdf file, nothing else)  [Address or RITM number]
+
+Prolly make boxes for 
+
+Reel Summary Report Helper
+
+
+Make the scans look for "Delivery to..." and use those for Reels Delivery
+
+
+
+
+
+
+
+
+
+Current view of things:
+
+Setup app -->  Any time any folder needs to be mentioned or anything to do with setting everything up or reading/writing files should be from here (most likely just all the databases)
+May need to separate the folders better tbh
+
+PackingListGUI --> Needs to be renamed, but thats a later problem. Right now, its using the "improvedScanner.py" But the scanner should be this py file probably and remove the other sections of this 
+and transfer to a different code?  But idk maybe making the scanner is good enough?
+
+Filling apps could be split material app
