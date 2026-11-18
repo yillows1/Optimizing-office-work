@@ -87,6 +87,173 @@ _NET_RE = re.compile(r"Net(?:Weight)?:\s*(\d+)", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
+# Helper text detection — skip "More information", table separators, etc.
+# ---------------------------------------------------------------------------
+_HELPER_TEXT_PATTERNS = [
+    r"^more information$",
+    r"^please specify",
+    r"^does this",
+    r"^alternate",
+    r"^site type",
+    r"^is valid",
+    r"^pick.up instructions?",
+    r"^contact",
+    r"^preferred",
+    r"^employee number",
+    r"^configuration item",
+    r"^watch list",
+    r"^approval",
+    r"^assignment group",
+    r"^assigned to",
+    r"^due date",
+    r"^integration task",
+    r"^follow up",
+    r"^kpi relief",
+    r"^short description",
+    r"^description:",
+    r"^relevant article",
+    r"^variables$",
+    r"^requester",
+    r"^project information",
+    r"^project name",
+    r"^disposal reason",
+    r"^security case",
+    r"^hazardous material",
+    r"^project number",
+    r"^po number",
+    r"^equipment location",
+    r"^general information",
+    r"^line of business",
+    r"^service requested",
+    r"^other$",
+    r"^asset class",
+    r"^data upload",
+    r"^adr equipment",
+    r"^line item count",
+    r"^financial location",
+    r"^shipping and transport",
+    r"^packaging acknowledgement",
+    r"^additional information",
+    r"^comments$",
+    r"^upload attachment",
+    r"^vendor$",
+    r"^cod required",
+    r"^activities$",
+    r"^additional comments",
+    r"^work notes",
+    r"^activity$",
+    r"^task =",
+    r"^appointment",
+    r"^approvers$",
+    r"^group approvals",
+    r"^parent =",
+    r"^task slas",
+    r"^affected user",
+    r"^catalog item",
+    r"^related attachments",
+    r"^table name",
+    r"^table sys id",
+    r"^file name",
+    r"^content type",
+    r"^no records to display",
+    r"^this may be due to security",
+    r"^attachment",
+    r"^sent:",
+    r"^changed:",
+    r"^system$",
+    r"^historical notes",
+    r"^catalog task",
+    r"^request task",
+    r"^number$",
+    r"^item$",
+    r"^opened by",
+    r"^requested for",
+    r"^request item",
+    r"^state$",
+    r"^follow up",
+]
+
+_HELPER_RE = re.compile("|".join(_HELPER_TEXT_PATTERNS), re.IGNORECASE)
+
+_HELPER_WORDS = {
+    "more information", "pick-up address", "pick-up instructions",
+    "site type", "alternate address", "is valid address",
+    "equipment type", "equipment location", "general information",
+    "line of business", "service requested", "asset class",
+    "data upload", "financial location", "shipping and transport",
+    "additional information", "comments", "upload attachment",
+    "vendor", "cod required", "activities", "work notes",
+    "task slas", "affected user", "catalog item", "related attachments",
+    "table name", "table sys id", "file name", "content type",
+    "historical notes", "catalog task", "request task", "number",
+    "item", "opened by", "requested for", "request item", "state",
+    "assignment group", "assigned to", "due date", "integration task",
+    "kpi relief", "short description", "relevant article", "variables",
+    "requester", "project information", "project name", "disposal reason",
+    "security case", "hazardous material", "project number", "po number",
+    "general information", "line of business", "service requested",
+    "asset class", "data upload", "financial location",
+    "shipping and transport", "packaging acknowledgement",
+    "additional information", "comments", "upload attachment",
+    "vendor", "cod required",
+}
+
+
+def _is_helper_text(line: str) -> bool:
+    """Return True if line is just helper/label text, not actual data."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    # Skip if it matches helper patterns
+    if _HELPER_RE.search(stripped):
+        return True
+    # Skip table separators like "| - |" or "|  |"
+    if re.fullmatch(r"\|?\s*[-:]?\s*\|?", stripped):
+        return True
+    # Skip short label-like phrases
+    if len(stripped.split()) <= 3 and stripped.lower() in _HELPER_WORDS:
+        return True
+    return False
+
+
+def _first_line_after(text: str, label: str, skip_helpers: bool = True) -> str:
+    lines = (text or "").splitlines()
+    label_lower = label.casefold()
+    for index, line in enumerate(lines):
+        if label_lower in line.casefold():
+            # Try the same line first (e.g. "Location   205 Andrews Rd …")
+            remainder = re.sub(
+                rf".*?{re.escape(label)}\s*:?\s*", "", line, count=1,
+                flags=re.IGNORECASE,
+            ).strip()
+            if remainder and not (skip_helpers and _is_helper_text(remainder)):
+                return remainder
+            # Look ahead further (up to 12 lines) and skip helper text
+            for following in lines[index + 1:index + 13]:
+                if following.strip() and not (skip_helpers and _is_helper_text(following)):
+                    return following.strip()
+    return ""
+
+
+def _extract_address_from_pickup(text: str) -> str:
+    """
+    Extract address from Pick-up Address section, with fallback to Location.
+    Returns the best address found.
+    """
+    # Try Pick-up Address first
+    addr = _first_line_after(text, "Pick-up Address")
+    if addr:
+        return addr
+    # Fallback to Location field
+    addr = _first_line_after(text, "Location")
+    if addr:
+        return addr
+    # Last resort: try Pick-up Instructions
+    addr = _first_line_after(text, "Pick-up Instructions")
+    return addr
+
+
+# ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 _SCHEMA = """
@@ -180,7 +347,7 @@ def get_last_received_date(db_path: str | os.PathLike | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Attachment text extraction (unchanged helpers from old scanner)
+# Attachment text extraction
 # ---------------------------------------------------------------------------
 def _read_attachment_bytes(attachment) -> bytes | None:
     try:
@@ -220,22 +387,36 @@ def find_ritms_in_text(text: str) -> list[str]:
     })
 
 
-def _first_line_after(text: str, label: str) -> str:
-    lines = (text or "").splitlines()
-    label_lower = label.casefold()
-    for index, line in enumerate(lines):
-        if label_lower in line.casefold():
-            # Try the same line first (e.g. "Location   205 Andrews Rd …")
-            remainder = re.sub(
-                rf".*?{re.escape(label)}\s*:?\s*", "", line, count=1,
-                flags=re.IGNORECASE,
-            ).strip()
-            if remainder:
-                return remainder
-            for following in lines[index + 1:index + 4]:
-                if following.strip():
-                    return following.strip()
-    return ""
+def _split_asset_class_lines(text: str) -> list[str]:
+    """Return joined lines that contain 'AssetClass:…SerialNumber:…'."""
+    if not text:
+        return []
+    out: list[str] = []
+    buffer = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if buffer:
+                out.append(buffer)
+                buffer = ""
+            continue
+        buffer = f"{buffer} {stripped}".strip() if buffer else stripped
+        if "SerialNumber:" in buffer:
+            out.append(buffer)
+            buffer = ""
+    if buffer and "SerialNumber:" in buffer:
+        out.append(buffer)
+    return out
+
+
+def _match_or_none(pattern: re.Pattern, text: str) -> str | None:
+    match = pattern.search(text)
+    return match.group(1).strip() if match else None
+
+
+def _match_int(pattern: re.Pattern, text: str) -> int | None:
+    match = pattern.search(text)
+    return int(match.group(1)) if match else None
 
 
 def parse_ritm_pdf(text: str, filename: str) -> dict:
@@ -246,8 +427,7 @@ def parse_ritm_pdf(text: str, filename: str) -> dict:
     ritms = find_ritms_in_text(text)
     primary_ritm = ritms[0] if ritms else ""
 
-    location = _first_line_after(text, "Pick-up Address")
-
+    location = _extract_address_from_pickup(text)
 
     equipment_type = _first_line_after(text, "Equipment Type")
 
@@ -291,38 +471,6 @@ def parse_ritm_pdf(text: str, filename: str) -> dict:
     }
 
 
-def _split_asset_class_lines(text: str) -> list[str]:
-    """Return joined lines that contain 'AssetClass:…SerialNumber:…'."""
-    if not text:
-        return []
-    out: list[str] = []
-    buffer = ""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            if buffer:
-                out.append(buffer)
-                buffer = ""
-            continue
-        buffer = f"{buffer} {stripped}".strip() if buffer else stripped
-        if "SerialNumber:" in buffer:
-            out.append(buffer)
-            buffer = ""
-    if buffer and "SerialNumber:" in buffer:
-        out.append(buffer)
-    return out
-
-
-def _match_or_none(pattern: re.Pattern, text: str) -> str | None:
-    match = pattern.search(text)
-    return match.group(1).strip() if match else None
-
-
-def _match_int(pattern: re.Pattern, text: str) -> int | None:
-    match = pattern.search(text)
-    return int(match.group(1)) if match else None
-
-
 # ---------------------------------------------------------------------------
 # Outlook traversal
 # ---------------------------------------------------------------------------
@@ -343,9 +491,6 @@ def _walk_inbox_only(namespace) -> list:
         except Exception:
             continue
     return out
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +572,6 @@ def sync_delivery_emails(
                 "subject": subject,
                 "kind": kind,
             })
-
 
     emit(f"Matched {len(candidates)} delivery/pickup email(s) to ingest.")
 
@@ -554,8 +698,6 @@ def _ingest_one_email(
                 return False  # already in DB (UNIQUE on Entry_ID, Store_ID)
             email_pk = cur.lastrowid
 
-
-
             for parsed in parsed_ritms:
                 att_name = parsed["source_filename"]
                 cur = conn.execute(
@@ -656,7 +798,6 @@ def fetch_delivery_emails(
         items_by_ritm = _load_items_for_ritms(
             conn, [row[10] for row in rows if row[10]]
         )
-
 
         out: list[dict] = []
         for row in rows:

@@ -25,8 +25,8 @@ from PySide6.QtGui import QIntValidator, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QRadioButton, QScrollArea, QStyle, QTabWidget, QTableWidget,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QRadioButton, QScrollArea, QStyle, QSizePolicy, QTabWidget, QTableWidget,
     QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 import win32com.client
@@ -1891,6 +1891,194 @@ class ItemRitmPickerDialog(QDialog):
         self.accept()
 
 
+class EmailSearchResultsDialog(QDialog):
+    """Popup showing email search results with count and details."""
+    def __init__(self, parent, results: list[dict]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Email Search Results")
+        self.setMinimumSize(900, 550)
+        self.setModal(True)
+
+        self._results = results  # Store for reel popup access
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        # Header with count
+        count = len(results)
+        header = QLabel(f"Found {count} matching email{'s' if count != 1 else ''}")
+        header.setStyleSheet("font-size: 14pt; font-weight: bold; color: #20332e;")
+        layout.addWidget(header)
+
+        if count == 0:
+            empty = QLabel("No emails matched your criteria.")
+            empty.setStyleSheet("color: #53645e; padding: 20px;")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(empty)
+        else:
+            # Table of results - 6 columns now (added Reels)
+            table = QTableWidget(count, 6)
+            table.setHorizontalHeaderLabels([
+                "RITM", "Sender", "Subject", "Received", "Folder", "Reels"
+            ])
+            table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+            table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            table.setAlternatingRowColors(True)
+            table.verticalHeader().setVisible(False)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # Subject wider
+            table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)  # Reels button column
+
+            for row, r in enumerate(results):
+                sender = r["sender"]
+                if r["sender_email"] and r["sender_email"].casefold() not in sender.casefold():
+                    sender = f"{sender} <{r['sender_email']}>".strip()
+
+                # Columns 0-4: standard data
+                static_values = (
+                    r["ritm"] or "—",
+                    sender,
+                    r["subject"] or "—",
+                    r["received"] or "—",
+                    r["folder"] or "—",
+                )
+                for col, val in enumerate(static_values):
+                    item = QTableWidgetItem(str(val))
+                    item.setToolTip(str(val))
+                    table.setItem(row, col, item)
+
+                # Column 5: Reels button
+                reel_items = r.get("items", [])  # from fetch_delivery_emails
+                reel_btn = QPushButton("Reels")
+                reel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                reel_btn.setStyleSheet("""
+                    QPushButton {
+                        background: #315b52; color: white; border: none;
+                        border-radius: 3px; padding: 4px 12px; font-weight: bold;
+                    }
+                    QPushButton:hover { background: #25473e; }
+                    QPushButton:disabled { background: #9baea6; color: #e2e9e5; }
+                """)
+                if reel_items:
+                    reel_btn.clicked.connect(
+                        lambda checked=False, items=reel_items, ritm=r["ritm"]: self._show_reel_popup(items, ritm)
+                    )
+                else:
+                    reel_btn.setEnabled(False)
+                    reel_btn.setToolTip("No reel data available")
+                table.setCellWidget(row, 5, reel_btn)
+
+            layout.addWidget(table, 1)
+
+        # Close button
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet("font-weight: bold; padding: 8px 24px;")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _show_reel_popup(self, items: list[dict], ritm: str) -> None:
+        """Show a dialog listing all reel IDs with details."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Reels for {ritm or 'Unknown RITM'}")
+        dialog.setMinimumSize(700, 400)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        # Header
+        header = QLabel(f"{len(items)} reel(s) for {ritm}")
+        header.setStyleSheet("font-size: 12pt; font-weight: bold; color: #20332e;")
+        layout.addWidget(header)
+
+        # Table with reel details - 3 columns only
+        table = QTableWidget(len(items), 3)
+        table.setHorizontalHeaderLabels([
+            "Serial / Item ID", "Type", "Description"
+        ])
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        table.setStyleSheet("""
+            QTableWidget { 
+                font-family: 'Consolas', 'Monospace'; 
+                font-size: 10pt; 
+                gridline-color: #d7dfda;
+            }
+            QTableWidget::item { padding: 6px; }
+            QTableWidget::item:selected { background: #d5e1da; color: #20332e; }
+            QHeaderView::section { background: #e2e9e5; padding: 6px; border: none; font-weight: bold; }
+        """)
+
+        for row, item in enumerate(items):
+            serial = item.get("item_id") or item.get("description") or "—"
+            asset_class = item.get("asset_class") or item.get("equipment_type") or "—"
+            desc = item.get("description") or ""
+            
+            values = (serial, asset_class, desc)
+            for col, val in enumerate(values):
+                table_item = QTableWidgetItem(str(val))
+                table_item.setToolTip(str(val))
+                table.setItem(row, col, table_item)
+
+        layout.addWidget(table, 1)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy Selected Serials")
+        copy_btn.setToolTip("Copy selected reel serial numbers to clipboard")
+        copy_btn.clicked.connect(lambda: self._copy_table_selection(table))
+        btn_row.addWidget(copy_btn)
+        
+        copy_all_btn = QPushButton("Copy All Serials")
+        copy_all_btn.setToolTip("Copy all reel serial numbers to clipboard")
+        copy_all_btn.clicked.connect(lambda: self._copy_all_serials(items))
+        btn_row.addWidget(copy_all_btn)
+        
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet("font-weight: bold; padding: 8px 24px;")
+        close_btn.clicked.connect(dialog.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        # Enable Ctrl+C on table
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        table.installEventFilter(self)
+        dialog._reel_table = table
+        
+        dialog.exec()
+
+    def _copy_table_selection(self, table: QTableWidget) -> None:
+        """Copy selected serials (column 0) to clipboard."""
+        selected = table.selectedItems()
+        if not selected:
+            return
+        rows = set(item.row() for item in selected)
+        serials = []
+        for row in sorted(rows):
+            item = table.item(row, 0)
+            if item:
+                serials.append(item.text())
+        if serials:
+            QApplication.clipboard().setText("\n".join(serials))
+
+    def _copy_all_serials(self, items: list[dict]) -> None:
+        """Copy all reel serials to clipboard."""
+        serials = [item.get("item_id") or item.get("description") or "" for item in items]
+        serials = [s for s in serials if s]
+        if serials:
+            QApplication.clipboard().setText("\n".join(serials))
+
+
 # ---------------------------------------------------------------------------
 # Incoming Packing List popup dialog
 # ---------------------------------------------------------------------------
@@ -3394,7 +3582,7 @@ class PackingListApp(QMainWindow):
         root.addLayout(folder_row)
 
         # ------------------------------------------------------------------
-        # Search panel — replaces the old reply-button region
+        # Search panel — dropdown mode selector
         # ------------------------------------------------------------------
         search_box = QGroupBox("Search for")
         search_box.setStyleSheet(
@@ -3414,33 +3602,48 @@ class PackingListApp(QMainWindow):
         search_help.setStyleSheet("color: #53645e;")
         search_layout.addWidget(search_help)
 
-        self.search_ritm_check = QCheckBox("RITM")
-        self.search_addr_check = QCheckBox("Address")
-        self.search_reel_check = QCheckBox("Reel ID")
+        # --- Mode dropdown -------------------------------------------------
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode:"))
+        self.search_mode_combo = QComboBox()
+        self.search_mode_combo.addItems(["RITM", "Address", "Reel ID", "Input Data"])
+        self.search_mode_combo.setFixedWidth(180)
+        self.search_mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(self.search_mode_combo)
+        mode_row.addStretch(1)
+        search_layout.addLayout(mode_row)
 
+        # --- Input widgets (stacked) --------------------------------------
         self.search_ritm_edit = QLineEdit()
         self.search_ritm_edit.setPlaceholderText("e.g. RITM0011836256")
+
         self.search_addr_edit = QLineEdit()
         self.search_addr_edit.setPlaceholderText("e.g. 123 Main St, Dallas, TX 75201")
+
         self.search_reel_edit = QLineEdit()
-        self.search_reel_edit.setPlaceholderText("e.g. REEL12345A or 12345")
+        self.search_reel_edit.setPlaceholderText("e.g. VZ1965437LMK")
 
-        def _make_search_row(cb: QCheckBox, edit: QLineEdit) -> QWidget:
-            w = QWidget()
-            h = QHBoxLayout(w)
-            h.setContentsMargins(0, 0, 0, 0)
-            cb.setFixedWidth(110)
-            h.addWidget(cb)
-            h.addWidget(edit, 1)
-            return w
+        self.search_input_data_button = QPushButton("Open Input Data")
+        self.search_input_data_button.setStyleSheet(
+            "font-weight: bold; background: #315b52; color: white; padding: 8px 16px;"
+        )
+        # Keep button compact — no horizontal stretch
+        self.search_input_data_button.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self.search_input_data_button.clicked.connect(self._open_input_dialog)
 
-        self._search_ritm_row = _make_search_row(self.search_ritm_check, self.search_ritm_edit)
-        self._search_addr_row = _make_search_row(self.search_addr_check, self.search_addr_edit)
-        self._search_reel_row = _make_search_row(self.search_reel_check, self.search_reel_edit)
-        search_layout.addWidget(self._search_ritm_row)
-        search_layout.addWidget(self._search_addr_row)
-        search_layout.addWidget(self._search_reel_row)
+        # Stack them in the layout; we’ll hide/show via _on_mode_changed
+        self._mode_widgets = [
+            self.search_ritm_edit,
+            self.search_addr_edit,
+            self.search_reel_edit,
+            self.search_input_data_button,
+        ]
+        for w in self._mode_widgets:
+            search_layout.addWidget(w)
 
+        # --- Action buttons (Sync / Search) -------------------------------
         search_btn_row = QHBoxLayout()
         self.sync_button = QPushButton("Sync Email DB")
         self.sync_button.setToolTip(
@@ -3452,29 +3655,18 @@ class PackingListApp(QMainWindow):
 
         self.search_button = QPushButton("Search Email Database")
         self.search_button.setStyleSheet(
-            "font-weight: bold; background: #4a6a93; color: white;"
-            " padding: 8px 16px;"
+            "font-weight: bold; background: #4a6a93; color: white; padding: 8px 16px;"
         )
         self.search_button.setToolTip(
             "Search messages already saved in the Email Database."
         )
         self.search_button.clicked.connect(self._run_email_search)
         search_btn_row.addWidget(self.search_button)
-
-        self.search_input_data_button = QPushButton("Open Input Data")
-        self.search_input_data_button.setStyleSheet(
-            "font-weight: bold; background: #315b52; color: white;"
-            " padding: 8px 16px;"
-        )
-        self.search_input_data_button.clicked.connect(self._open_input_dialog)
-        search_btn_row.addWidget(self.search_input_data_button)
-
         search_btn_row.addStretch(1)
         search_layout.addLayout(search_btn_row)
 
-        for cb in (self.search_ritm_check, self.search_addr_check, self.search_reel_check):
-            cb.toggled.connect(self._refresh_search_panel)
-        self._refresh_search_panel()
+        # Initial visibility
+        self._on_mode_changed(0)
 
         root.addWidget(search_box)
 
@@ -3551,8 +3743,11 @@ class PackingListApp(QMainWindow):
         self.email_table = QTableWidget(0, 8)
         self.email_table.setHorizontalHeaderLabels([
             "RITM", "Address", "Reel ID", "Sender", "Subject",
-            "Received", "Outlook Folder", "Attachment(s)",
+            "Received", "Outlook Folder", "Attachment(s)"
         ])
+        # Enable custom context menu for right-click
+        self.email_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.email_table.customContextMenuRequested.connect(self._show_email_context_menu)
         self.email_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
@@ -3569,24 +3764,11 @@ class PackingListApp(QMainWindow):
         )
         self.email_table.setMaximumHeight(190)
         self.email_table.itemSelectionChanged.connect(self._update_reply_button)
+        # Click handler for Reel ID column (column 2)
+        self.email_table.itemClicked.connect(self._on_reel_id_clicked)
         root.addWidget(self.email_table)
 
-        email_actions = QHBoxLayout()
-        self.reply_button = QPushButton("Reply to Selected Email")
-        self.reply_button.clicked.connect(self._reply_to_selected_email)
-        self.reply_button.setEnabled(False)
-        self.reply_button.setVisible(False)
-        email_actions.addWidget(self.reply_button)
-
-        self.download_attachments_button = QPushButton("Download Attachments")
-        self.download_attachments_button.clicked.connect(
-            self._download_selected_attachments
-        )
-        self.download_attachments_button.setEnabled(False)
-        self.download_attachments_button.setVisible(False)
-        email_actions.addWidget(self.download_attachments_button)
-        email_actions.addStretch(1)
-        root.addLayout(email_actions)
+        # Reply/Download now in right-click context menu on email table
 
 
         self.table = QTableWidget(0, 9)
@@ -3643,6 +3825,9 @@ class PackingListApp(QMainWindow):
 
         root.addLayout(footer)
         self._update_db_toggle_state()
+
+        # Default to Input Data mode (index 3 in the dropdown)
+        self.search_mode_combo.setCurrentIndex(3)
 
     def _update_db_toggle_state(self, *_args) -> None:
         configured = db_configured()
@@ -3951,8 +4136,9 @@ class PackingListApp(QMainWindow):
             "font-weight: bold; background: #315b52; color: white;"
         )
         load_btn.setEnabled(False)
+        from functools import partial
         load_btn.clicked.connect(
-            lambda: self._recall_load_into_input(selected_pl["number"], dialog)
+            partial(self._recall_load_into_input, selected_pl, dialog)
         )
         footer.addWidget(load_btn)
         close_btn = QPushButton("Close")
@@ -3964,9 +4150,21 @@ class PackingListApp(QMainWindow):
         search_input.setFocus()
         dialog.exec()
 
+    def eventFilter(self, watched: QWidget, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.KeyPress and event.matches(QKeySequence.StandardKey.Copy):
+            if hasattr(watched, 'parent') and hasattr(watched.parent(), '_reel_table'):
+                if watched is watched.parent()._reel_table:
+                    self._copy_table_selection(watched)
+                    return True
+        return super().eventFilter(watched, event)
+
+
     def _recall_load_into_input(
-        self, packing_list_number: str, dialog: QDialog,
+        self, selected_pl: dict, dialog: QDialog,
     ) -> None:
+        packing_list_number = selected_pl.get("number", "")
+        if not packing_list_number:
+            return
         if not packing_list_number:
             return
         try:
@@ -4026,32 +4224,39 @@ class PackingListApp(QMainWindow):
         )
         dialog.accept()
 
-    def _refresh_search_panel(self) -> None:
-        any_checked = any((
-            self.search_ritm_check.isChecked(),
-            self.search_addr_check.isChecked(),
-            self.search_reel_check.isChecked(),
-        ))
-        self._search_ritm_row.setVisible(self.search_ritm_check.isChecked())
-        self._search_addr_row.setVisible(self.search_addr_check.isChecked())
-        self._search_reel_row.setVisible(self.search_reel_check.isChecked())
-        self.search_button.setVisible(any_checked)
-        self.search_input_data_button.setVisible(not any_checked)
+    def _on_mode_changed(self, index: int) -> None:
+        """
+        Show only the widget that matches the selected dropdown index.
+        Hide the 'Search Email Database' button when Input Data (index 3) is active.
+        """
+        for i, w in enumerate(self._mode_widgets):
+            w.setVisible(i == index)
 
+        # Search button only for RITM / Address / Reel ID (indices 0,1,2)
+        self.search_button.setVisible(index != 3)
     def _run_email_search(self) -> None:
-        criteria = {
-            "ritm": self.search_ritm_edit.text().strip()
-            if self.search_ritm_check.isChecked() else "",
-            "address": self.search_addr_edit.text().strip()
-            if self.search_addr_check.isChecked() else "",
-            "reel_id": self.search_reel_edit.text().strip()
-            if self.search_reel_check.isChecked() else "",
-        }
-        criteria = {key: value for key, value in criteria.items() if value}
+        mode = self.search_mode_combo.currentIndex()   # 0=RITM, 1=Address, 2=Reel ID
+        criteria = {}
+
+        if mode == 0:
+            val = self.search_ritm_edit.text().strip()
+            if val:
+                criteria["ritm"] = val
+        elif mode == 1:
+            val = self.search_addr_edit.text().strip()
+            if val:
+                criteria["address"] = val
+        elif mode == 2:
+            val = self.search_reel_edit.text().strip()
+            if val:
+                criteria["reel_id"] = val
+        else:
+            return
+
         if not criteria:
             QMessageBox.information(
                 self, "Nothing to search",
-                "Fill in at least one of the checked fields.",
+                "Fill in the field before searching."
             )
             return
         self.search_button.setEnabled(False)
@@ -4068,6 +4273,43 @@ class PackingListApp(QMainWindow):
 
     def _display_email_search_results(self, results: list[dict]) -> None:
         self.search_button.setEnabled(True)
+
+        # Fetch reel items for each result (from Email_Item table via RITM)
+        for result in results:
+            ritm = result.get("ritm", "")
+            if ritm:
+                try:
+                    conn = email_db_connect()
+                    try:
+                        rows = conn.execute(
+                            "SELECT Item_ID, Asset_Class, Job_Type, Equipment_Type, Quantity, "
+                            "       Description, Gross, Tare, Net "
+                            "FROM Email_Item WHERE Ritm = ?",
+                            (ritm,),
+                        ).fetchall()
+                        items = []
+                        for r in rows:
+                            items.append({
+                                "item_id": r[0],
+                                "asset_class": r[1],
+                                "job_type": r[2],
+                                "equipment_type": r[3],
+                                "quantity": r[4],
+                                "description": r[5],
+                                "gross": r[6] or 0,
+                                "tare": r[7] or 0,
+                                "net": r[8] if r[8] is not None else max((r[6] or 0) - (r[7] or 0), 0),
+                            })
+                        result["items"] = items
+                    finally:
+                        conn.close()
+                except Exception as e:
+                    _APP_LOGGER.exception("Failed to fetch reel items for RITM %s", ritm)
+                    result["items"] = []
+            else:
+                result["items"] = []
+
+        # 1) Populate the main table
         self.email_table.setRowCount(0)
         self.email_search_results_by_key.clear()
         for result in results:
@@ -4081,8 +4323,9 @@ class PackingListApp(QMainWindow):
                 and result["sender_email"].casefold() not in sender.casefold()
             ):
                 sender = f"{sender} <{result['sender_email']}>".strip()
+
             values = (
-                result["ritm"], result["address"], result["reel_id"],
+                result["ritm"], result["address"], "Reels",  # Column 2 always says "Reels"
                 sender, result["subject"], result["received"], result["folder"],
                 ", ".join(result["attachments"]),
             )
@@ -4090,7 +4333,30 @@ class PackingListApp(QMainWindow):
                 item = QTableWidgetItem(str(value))
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, key)
+                # Column 2 (Reel ID) — clickable "Reels" hyperlink with tooltip
+                if column == 2:
+                    reel_items = result.get("items", [])
+                    if reel_items:
+                        # Style as hyperlink
+                        item.setForeground(Qt.GlobalColor.blue)
+                        font = item.font()
+                        font.setUnderline(True)
+                        item.setFont(font)
+                        preview = self._build_reel_preview_text(reel_items)
+                        item.setToolTip(f"Click to view reels\n\n{preview}")
+                        # Store reel data for click handler
+                        item.setData(Qt.ItemDataRole.UserRole + 1, reel_items)
+                        item.setData(Qt.ItemDataRole.UserRole + 2, result["ritm"])
+                    else:
+                        item.setForeground(Qt.GlobalColor.gray)
+                        item.setToolTip("No reel data available")
                 self.email_table.setItem(row, column, item)
+
+        # 2) Show the popup dialog
+        dialog = EmailSearchResultsDialog(self, results)
+        dialog.exec()
+
+        # 3) Update status labels
         if results:
             self.scan_results_label.setText(
                 f"Found {len(results)} matching email result(s). "
@@ -4100,6 +4366,7 @@ class PackingListApp(QMainWindow):
         else:
             self.scan_results_label.setText("No matching emails were found.")
             self.status_label.setText("No matching emails found.")
+
         self._update_reply_button()
 
     def _email_search_failed(self, error: str) -> None:
@@ -4117,29 +4384,308 @@ class PackingListApp(QMainWindow):
         return key if isinstance(key, str) else None
 
     def _update_reply_button(self) -> None:
-        key = self._selected_email_key()
+        """Kept for compatibility but buttons removed — context menu used instead."""
+        pass
+
+    @staticmethod
+
+    # ============================================================
+    # EMAIL TABLE INTERACTIONS — Complete Working Implementation
+    # ============================================================
+
+    def _on_reel_id_clicked(self, item: QTableWidgetItem) -> None:
+        """Handle click on Reel ID column (column 2)."""
+        if item is None or item.column() != 2:
+            return
+        reel_items = item.data(Qt.ItemDataRole.UserRole + 1)
+        ritm = item.data(Qt.ItemDataRole.UserRole + 2)
+        if reel_items:
+            self._show_reel_popup(reel_items, ritm or "")
+        else:
+            # Fallback: find by RITM in row
+            ritm_item = self.email_table.item(item.row(), 0)
+            if ritm_item:
+                self._show_reels_for_ritm(ritm_item.text())
+
+    def _show_reels_for_ritm(self, ritm: str) -> None:
+        """Find reel items for a RITM and show popup."""
+        reel_items = []
+        # Search in matched emails (scan results)
+        for email in self.visible_email_matches:
+            if email.ritm == ritm:
+                for record in self.records:
+                    if (record["packing_list"].casefold() == email.packing_list.casefold() and
+                        (record["ritm"] or "").casefold() == email.ritm.casefold()):
+                        for it in record.get("items", []):
+                            reel_items.append({
+                                "item_id": it.get("description", ""),
+                                "asset_class": it.get("type", ""),
+                                "job_type": "",
+                                "equipment_type": it.get("type", ""),
+                                "quantity": 1,
+                                "description": it.get("description", ""),
+                                "gross": it.get("gross", 0),
+                                "tare": it.get("tare", 0),
+                                "net": it.get("net", 0),
+                            })
+                if reel_items:
+                    break
+        # Search in search results
+        if not reel_items:
+            for key, result in self.email_search_results_by_key.items():
+                if result.get("ritm") == ritm:
+                    reel_items = result.get("items", [])
+                    break
+        if reel_items:
+            self._show_reel_popup(reel_items, ritm)
+
+    def _show_email_context_menu(self, pos) -> None:
+        """Right-click context menu on email table with blue highlight."""
+        from functools import partial
+        
+        row = self.email_table.rowAt(pos.y())
+        if row < 0:
+            return
+        
+        # Select and highlight the row
+        self.email_table.clearSelection()
+        self.email_table.selectRow(row)
+        
+        item = self.email_table.item(row, 0)
+        key = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if not key:
+            return
+
+        # Get reel data for this row
+        reel_item = self.email_table.item(row, 2)
+        reel_items = reel_item.data(Qt.ItemDataRole.UserRole + 1) if reel_item else None
+        ritm = reel_item.data(Qt.ItemDataRole.UserRole + 2) if reel_item else None
+
+        # Create menu with stylesheet for blue highlight
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background: white;
+                border: 1px solid #9baea6;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 8px 24px 8px 16px;
+                border-radius: 3px;
+                color: #20332e;
+            }
+            QMenu::item:selected {
+                background: #315b52;
+                color: white;
+            }
+            QMenu::item:disabled {
+                color: #9baea6;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #d7dfda;
+                margin: 4px 8px;
+            }
+        """)
+
+        # Check capabilities
         search_result = self.email_search_results_by_key.get(key or "")
         matched_email = self.matched_emails_by_key.get(key or "")
+        
         can_reply = bool(
-            (search_result and search_result.get("entry_id"))
-            or (
-                matched_email
-                and (matched_email.entry_id or (
-                    matched_email.subject and matched_email.folder
-                ))
-            )
+            (search_result and search_result.get("entry_id")) or
+            (matched_email and (matched_email.entry_id or (matched_email.subject and matched_email.folder)))
         )
         has_source = bool(
-            (search_result and search_result.get("entry_id"))
-            or (matched_email and (
-                matched_email.entry_id or matched_email.subject
-            ))
+            (search_result and search_result.get("entry_id")) or
+            (matched_email and (matched_email.entry_id or matched_email.subject))
         )
-        has_rows = self.email_table.rowCount() > 0
-        self.reply_button.setVisible(has_rows)
-        self.reply_button.setEnabled(can_reply)
-        self.download_attachments_button.setVisible(has_rows)
-        self.download_attachments_button.setEnabled(has_source)
+
+        # Reply action
+        reply_action = menu.addAction("Reply to Email")
+        reply_action.setEnabled(can_reply)
+        reply_action.triggered.connect(partial(self._reply_to_email_by_key, key))
+
+        # Download action
+        download_action = menu.addAction("Download Attachments")
+        download_action.setEnabled(has_source)
+        download_action.triggered.connect(partial(self._download_attachments_by_key, key))
+
+        menu.addSeparator()
+
+        # View Reels action
+        view_reels_action = menu.addAction("View Reels")
+        view_reels_action.setEnabled(bool(reel_items))
+        if reel_items:
+            view_reels_action.triggered.connect(partial(self._show_reel_popup, reel_items, ritm or ""))
+
+        # Show menu at cursor position
+        menu.exec(self.email_table.viewport().mapToGlobal(pos))
+
+    def _reply_to_email_by_key(self, key: str) -> None:
+        """Reply to email using a specific key."""
+        # Select the row for this key
+        for row in range(self.email_table.rowCount()):
+            item = self.email_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == key:
+                self.email_table.clearSelection()
+                self.email_table.selectRow(row)
+                break
+        self._reply_to_selected_email()
+
+    def _download_attachments_by_key(self, key: str) -> None:
+        """Download attachments using a specific key."""
+        for row in range(self.email_table.rowCount()):
+            item = self.email_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == key:
+                self.email_table.clearSelection()
+                self.email_table.selectRow(row)
+                break
+        self._download_selected_attachments()
+
+    @staticmethod
+    def _build_reel_preview_text(items: list[dict], max_lines: int = 5) -> str:
+        """Build a short preview string for tooltip."""
+        if not items:
+            return "No reel data"
+        lines = []
+        for i, item in enumerate(items[:max_lines]):
+            serial = item.get("item_id") or item.get("description") or "—"
+            gross = item.get("gross", 0)
+            net = item.get("net", 0)
+            lines.append(f"  • {serial}  (Gross: {gross:,}, Net: {net:,})")
+        if len(items) > max_lines:
+            lines.append(f"  … and {len(items) - max_lines} more")
+        return "\n".join(lines)
+
+    def _show_reel_popup(self, items: list[dict], ritm: str) -> None:
+        """Show a dialog listing all reel IDs with details."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Reels for {ritm or 'Unknown RITM'}")
+        dialog.setMinimumSize(700, 400)
+        dialog.setModal(True)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        # Header
+        header = QLabel(f"{len(items)} reel(s) for {ritm}")
+        header.setStyleSheet("font-size: 12pt; font-weight: bold; color: #20332e;")
+        layout.addWidget(header)
+
+        # Table with reel details - 3 columns only
+        table = QTableWidget(len(items), 3)
+        table.setHorizontalHeaderLabels([
+            "Serial / Item ID", "Type", "Description"
+        ])
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        table.setStyleSheet("""
+            QTableWidget { 
+                font-family: 'Consolas', 'Monospace'; 
+                font-size: 10pt; 
+                gridline-color: #d7dfda;
+            }
+            QTableWidget::item { padding: 6px; }
+            QTableWidget::item:selected { background: #d5e1da; color: #20332e; }
+            QHeaderView::section { background: #e2e9e5; padding: 6px; border: none; font-weight: bold; }
+        """)
+
+        for row, item in enumerate(items):
+            serial = item.get("item_id") or item.get("description") or "—"
+            asset_class = item.get("asset_class") or item.get("equipment_type") or "—"
+            desc = item.get("description") or ""
+            
+            values = (serial, asset_class, desc)
+            for col, val in enumerate(values):
+                table_item = QTableWidgetItem(str(val))
+                table_item.setToolTip(str(val))
+                table.setItem(row, col, table_item)
+
+        layout.addWidget(table, 1)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy Selected Serials")
+        copy_btn.setToolTip("Copy selected reel serial numbers to clipboard (Ctrl+C also works)")
+        copy_btn.clicked.connect(lambda: self._copy_table_selection(table))
+        btn_row.addWidget(copy_btn)
+        
+        copy_all_btn = QPushButton("Copy All Serials")
+        copy_all_btn.setToolTip("Copy all reel serial numbers to clipboard")
+        copy_all_btn.clicked.connect(lambda: self._copy_all_serials(items))
+        btn_row.addWidget(copy_all_btn)
+        
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet("font-weight: bold; padding: 8px 24px;")
+        close_btn.clicked.connect(dialog.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        # Enable Ctrl+C on table
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        table.installEventFilter(self)
+        dialog._reel_table = table  # Store for event filter
+        
+        dialog.exec()
+
+    def _copy_table_selection(self, table: QTableWidget) -> None:
+        """Copy selected serials (column 0) to clipboard."""
+        selected = table.selectedItems()
+        if not selected:
+            return
+        # Get unique rows from selection
+        rows = set(item.row() for item in selected)
+        serials = []
+        for row in sorted(rows):
+            item = table.item(row, 0)
+            if item:
+                serials.append(item.text())
+        if serials:
+            QApplication.clipboard().setText("\n".join(serials))
+            self.status_label.setText(f"Copied {len(serials)} reel serial(s) to clipboard")
+
+    def _copy_all_serials(self, items: list[dict]) -> None:
+        """Copy all reel serials to clipboard."""
+        serials = [item.get("item_id") or item.get("description") or "" for item in items]
+        serials = [s for s in serials if s]
+        if serials:
+            QApplication.clipboard().setText("\n".join(serials))
+            self.status_label.setText(f"Copied {len(serials)} reel serial(s) to clipboard")
+
+    # Add event filter for Ctrl+C on reel popup table
+    def eventFilter(self, watched: QWidget, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.KeyPress and event.matches(QKeySequence.StandardKey.Copy):
+            # Check if it's our reel popup table
+            if hasattr(watched, 'parent') and hasattr(watched.parent(), '_reel_table'):
+                if watched is watched.parent()._reel_table:
+                    self._copy_table_selection(watched)
+                    return True
+        return super().eventFilter(watched, event)
+
+    
+    def _copy_selected_reels(self, list_widget: QListWidget) -> None:
+        """Copy selected reel serials to clipboard."""
+        selected = list_widget.selectedItems()
+        if not selected:
+            return
+        serials = [item.data(Qt.ItemDataRole.UserRole).get("serial", "") for item in selected]
+        QApplication.clipboard().setText("\n".join(serials))
+        self.status_label.setText(f"Copied {len(serials)} reel serial(s) to clipboard")
+
+    def _copy_all_reels(self, items: list[dict]) -> None:
+        """Copy all reel serials to clipboard."""
+        serials = [item.get("item_id") or item.get("description") or "" for item in items]
+        serials = [s for s in serials if s]
+        QApplication.clipboard().setText("\n".join(serials))
+        self.status_label.setText(f"Copied {len(serials)} reel serial(s) to clipboard")
 
     def _reply_to_selected_email(self) -> None:
         key = self._selected_email_key()
@@ -4594,15 +5140,47 @@ class PackingListApp(QMainWindow):
                 "",
             )
             values = (
-                email.ritm, location_address,
-                ", ".join(sorted(email.item_terms)), sender, email.subject,
-                email.received, email.folder,
+                email.ritm, location_address, "Reels",  # Column 2 always says "Reels"
+                sender, email.subject, email.received, email.folder,
                 ", ".join(sorted(email.attachments)),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, email.key)
+                # Column 2 (Reel ID) — clickable "Reels" hyperlink with tooltip
+                if column == 2:
+                    # Gather reel items from staged records
+                    reel_items = []
+                    for record in self.records:
+                        if (record["packing_list"].casefold() == email.packing_list.casefold() and
+                            (record["ritm"] or "").casefold() == email.ritm.casefold()):
+                            for item in record.get("items", []):
+                                reel_items.append({
+                                    "item_id": item.get("description", ""),
+                                    "asset_class": item.get("type", ""),
+                                    "job_type": "",
+                                    "equipment_type": item.get("type", ""),
+                                    "quantity": 1,
+                                    "description": item.get("description", ""),
+                                    "gross": item.get("gross", 0),
+                                    "tare": item.get("tare", 0),
+                                    "net": item.get("net", 0),
+                                })
+                            break
+                    if reel_items:
+                        item.setForeground(Qt.GlobalColor.blue)
+                        font = item.font()
+                        font.setUnderline(True)
+                        item.setFont(font)
+                        item.setToolTip(
+                            f"Click to view reels\n\n{self._build_reel_preview_text(reel_items)}"
+                        )
+                        item.setData(Qt.ItemDataRole.UserRole + 1, reel_items)
+                        item.setData(Qt.ItemDataRole.UserRole + 2, email.ritm)
+                    else:
+                        item.setForeground(Qt.GlobalColor.gray)
+                        item.setToolTip("No reel data available")
                 self.email_table.setItem(row, column, item)
         self._update_reply_button()
 
