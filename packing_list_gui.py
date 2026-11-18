@@ -21,7 +21,7 @@ from typing import Any, TypedDict
 import pythoncom
 
 from PySide6.QtCore import QEvent, QThread, Qt, Signal
-from PySide6.QtGui import QIntValidator, QKeyEvent
+from PySide6.QtGui import QIntValidator, QKeyEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QPlainTextEdit,
@@ -904,6 +904,8 @@ class MatchedEmail:
     subject: str
     received: str
     folder: str
+    location: str = ""
+    location_address: str = ""
     attachments: set[str] = field(default_factory=set)
     item_terms: set[str] = field(default_factory=set)
 
@@ -2332,16 +2334,6 @@ class IncomingPackingListDialog(QDialog):
 
         # ---- Footer buttons -------------------------------------------
         footer = QHBoxLayout()
-        self.add_to_db_button = QPushButton("Add to Database")
-        self.add_to_db_button.setStyleSheet(
-            "font-weight: bold; background: #4a6a93; color: white;"
-        )
-        self.add_to_db_button.setToolTip(
-            "Write this packing list to the manual SQLite database."
-        )
-        self.add_to_db_button.clicked.connect(self._add_to_database)
-        footer.addWidget(self.add_to_db_button)
-
         footer.addStretch(1)
 
         cancel_btn = QPushButton("Cancel")
@@ -2673,44 +2665,7 @@ class IncomingPackingListDialog(QDialog):
             "items": [dict(item) for item in self.current_items],
         }
 
-    def _add_to_database(self) -> None:
-        record = self._build_record()
-        if record is None:
-            return
-        identifier = _packing_list_identifier(record)
-        path = manual_db_path()
 
-        # If this packing list already exists, ask before replacing.
-        if manual_db_record_exists(identifier):
-            answer = QMessageBox.question(
-                self,
-                "Replace in database?",
-                f"Packing list {identifier} is already in the manual "
-                f"database.\n\n"
-                f"Do you want to replace it with the values currently in "
-                f"this form?",
-                QMessageBox.StandardButton.Yes
-                | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            delete_manual_db_record(identifier)
-
-        inserted, skipped = insert_record_to_manual_db(record)
-        if inserted == 0 and skipped == 0:
-            QMessageBox.warning(
-                self, "Database write failed",
-                f"{identifier} could not be written. Check the log.",
-            )
-            return
-        QMessageBox.information(
-            self, "Added to manual database",
-            f"Packing list: {identifier}\n"
-            f"Database: {path}\n\n"
-            f"Items inserted: {inserted}\n"
-            f"Duplicates skipped: {skipped}",
-        )
 
     def _accept_form(self) -> None:
         if self._editing_index is not None:
@@ -3670,9 +3625,9 @@ class PackingListApp(QMainWindow):
 
         root.addWidget(search_box)
 
-        # Next Load / Recall Data live below the search box
+        # Next Load / Recall buttons
         input_row = QHBoxLayout()
-        self.next_load_button = QPushButton("Next Load")
+        self.next_load_button = QPushButton("Next Load / Reset")
         self.next_load_button.setStyleSheet(
             "font-weight: bold; background: #4a6a93; color: white;"
             " padding: 10px 20px; font-size: 11pt;"
@@ -3683,14 +3638,23 @@ class PackingListApp(QMainWindow):
         self.next_load_button.clicked.connect(self._next_load)
         input_row.addWidget(self.next_load_button)
 
-        self.recall_data_button = QPushButton("Recall Data")
-        self.recall_data_button.setStyleSheet(
+        self.recall_input_button = QPushButton("Recall Input Data")
+        self.recall_input_button.setStyleSheet(
             "font-weight: bold; background: #8a6d3b; color: white;"
             " padding: 10px 20px; font-size: 11pt;"
         )
-        self.recall_data_button.setToolTip("Browse rows from the manual database.")
-        self.recall_data_button.clicked.connect(self._recall_data)
-        input_row.addWidget(self.recall_data_button)
+        self.recall_input_button.setToolTip("Browse rows from the Input database (manual DB).")
+        self.recall_input_button.clicked.connect(self._recall_input_data)
+        input_row.addWidget(self.recall_input_button)
+
+        self.recall_export_button = QPushButton("Recall Exported Data")
+        self.recall_export_button.setStyleSheet(
+            "font-weight: bold; background: #2d5a8a; color: white;"
+            " padding: 10px 20px; font-size: 11pt;"
+        )
+        self.recall_export_button.setToolTip("Browse rows from the Export database (main DB).")
+        self.recall_export_button.clicked.connect(self._recall_export_data)
+        input_row.addWidget(self.recall_export_button)
 
         input_row.addStretch(1)
         root.addLayout(input_row)
@@ -3764,8 +3728,10 @@ class PackingListApp(QMainWindow):
         )
         self.email_table.setMaximumHeight(190)
         self.email_table.itemSelectionChanged.connect(self._update_reply_button)
-        # Click handler for Reel ID column (column 2)
+        # Click handler for Reel ID column (column 2) - passes QTableWidgetItem
         self.email_table.itemClicked.connect(self._on_reel_id_clicked)
+        # Double-click any column to open email in Outlook
+        self.email_table.itemDoubleClicked.connect(self._on_email_double_clicked)
         root.addWidget(self.email_table)
 
         # Reply/Download now in right-click context menu on email table
@@ -3914,6 +3880,43 @@ class PackingListApp(QMainWindow):
             "Click Scan Item List to match it against Outlook."
         )
 
+    def _build_current_record(self) -> PackingListRecord | None:
+        """
+        Build a record from the current input form state.
+        Uses pending_record if available, otherwise falls back to last_form.
+        """
+        # If we have a pending record from Input Data dialog, use it
+        if self.pending_record is not None:
+            return self.pending_record
+        
+        # Otherwise build from last_form (saved form data)
+        if self.last_form is not None:
+            items = self.last_form.get("items", [])
+            if not items:
+                QMessageBox.information(
+                    self, "No items",
+                    "No items in the saved form. Open Input Data to add items."
+                )
+                return None
+            return {
+                "items": items,
+                "packing_list": self.last_form.get("packing_list", ""),
+                "date": self.last_form.get("date", ""),
+                "driver_plate": self.last_form.get("driver_plate", ""),
+                "location": self.last_form.get("location", ""),
+                "location_address": self.last_form.get("location_address", ""),
+                "ritm": self.last_form.get("ritm", ""),
+                "letter": self.last_form.get("letter", ""),
+                "group": self.last_form.get("group", ""),
+            }
+        
+        # Nothing available
+        QMessageBox.information(
+            self, "No packing list loaded",
+            "Click Input Data to enter a packing list before scanning."
+        )
+        return None
+
     def _next_load(self) -> None:
         if self.last_form is None and self.pending_record is None:
             QMessageBox.information(
@@ -3926,6 +3929,7 @@ class PackingListApp(QMainWindow):
             "Next Load?",
             "This clears the saved form and any pending (unscanned) load.\n\n"
             "It does NOT clear the queue table or the email history.\n\n"
+            # "(Basically the same as restarting the application)"
             "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -3937,14 +3941,37 @@ class PackingListApp(QMainWindow):
         self.status_label.setText(
             "Cleared. Open Input Data to start the next load."
         )
+    def _recall_input_data(self) -> None:
+        """Recall from Input Database (manual DB)."""
+        self._recall_data_generic(
+            db_path=manual_db_path(),
+            db_connect_func=manual_db_connect,
+            title="Recall Input Data — manual database",
+            db_label="Input Database"
+        )
 
-    def _recall_data(self) -> None:
-        # Pull every packing list out of the manual DB once.
+    def _recall_export_data(self) -> None:
+        """Recall from Export Database (main DB)."""
+        if not db_configured():
+            QMessageBox.warning(
+                self, "No database configured",
+                "Configure the export database first using the Database button."
+            )
+            return
+        self._recall_data_generic(
+            db_path=db_path(),
+            db_connect_func=db_connect,
+            title="Recall Exported Data — main database",
+            db_label="Export Database"
+        )
+
+    def _recall_data_generic(self, db_path: Path, db_connect_func, title: str, db_label: str) -> None:
+        """Generic recall dialog for any database with Reel_Load_Database/Reel_Items tables."""
         try:
-            conn = manual_db_connect()
+            conn = db_connect_func()
         except Exception as error:
-            _APP_LOGGER.exception("Could not open manual DB for Recall Data.")
-            QMessageBox.critical(self, "Could not open database", str(error))
+            _APP_LOGGER.exception(f"Could not open {db_label} for Recall.")
+            QMessageBox.critical(self, f"Could not open {db_label}", str(error))
             return
 
         try:
@@ -3956,8 +3983,8 @@ class PackingListApp(QMainWindow):
                 "FROM Reel_Load_Database"
             ).fetchall()
         except Exception as error:
-            _APP_LOGGER.exception("Recall Data query failed.")
-            QMessageBox.critical(self, "Could not read database", str(error))
+            _APP_LOGGER.exception(f"Recall query failed for {db_label}.")
+            QMessageBox.critical(self, f"Could not read {db_label}", str(error))
             return
         finally:
             try:
@@ -3966,16 +3993,16 @@ class PackingListApp(QMainWindow):
                 pass
 
         dialog = QDialog(self)
-        dialog.setWindowTitle("Recall Data — manual database")
+        dialog.setWindowTitle(title)
         dialog.setMinimumWidth(1020)
         dialog.setMinimumHeight(620)
 
         layout = QVBoxLayout(dialog)
 
-        db_label = QLabel(f"Database: {manual_db_path()}")
-        db_label.setStyleSheet("color: #53645e;")
-        db_label.setWordWrap(True)
-        layout.addWidget(db_label)
+        db_label_widget = QLabel(f"Database: {db_path}")
+        db_label_widget.setStyleSheet("color: #53645e;")
+        db_label_widget.setWordWrap(True)
+        layout.addWidget(db_label_widget)
 
         # ---- Search + sort controls ----------------------------------
         controls = QHBoxLayout()
@@ -3998,9 +4025,7 @@ class PackingListApp(QMainWindow):
 
         layout.addLayout(controls)
 
-        # "Date Created" — we don't have a created-at column, so fall back to
-        # Receiving_Date. If you add a Created_At column later, swap it in.
-        created_key = lambda r: (r[1] or "")  # Receiving_Date as a stand-in
+        created_key = lambda r: (r[1] or "")  # Receiving_Date as stand-in
 
         counter_label = QLabel("")
         counter_label.setStyleSheet("color: #53645e;")
@@ -4101,7 +4126,7 @@ class PackingListApp(QMainWindow):
             if not pl_number:
                 return
             try:
-                conn2 = manual_db_connect()
+                conn2 = db_connect_func()
                 try:
                     item_rows = conn2.execute(
                         "SELECT Item_Description, Item_Type, Gross, Tare, Net "
@@ -4113,7 +4138,7 @@ class PackingListApp(QMainWindow):
                     conn2.close()
             except Exception:
                 _APP_LOGGER.exception(
-                    "Recall Data item query failed for %s.", pl_number,
+                    f"Recall item query failed for {pl_number} in {db_label}.",
                 )
                 return
             for description, item_type, gross, tare, net in item_rows:
@@ -4150,21 +4175,13 @@ class PackingListApp(QMainWindow):
         search_input.setFocus()
         dialog.exec()
 
-    def eventFilter(self, watched: QWidget, event: QEvent) -> bool:
-        if event.type() == QEvent.Type.KeyPress and event.matches(QKeySequence.StandardKey.Copy):
-            if hasattr(watched, 'parent') and hasattr(watched.parent(), '_reel_table'):
-                if watched is watched.parent()._reel_table:
-                    self._copy_table_selection(watched)
-                    return True
-        return super().eventFilter(watched, event)
+
 
 
     def _recall_load_into_input(
         self, selected_pl: dict, dialog: QDialog,
     ) -> None:
         packing_list_number = selected_pl.get("number", "")
-        if not packing_list_number:
-            return
         if not packing_list_number:
             return
         try:
@@ -4360,7 +4377,8 @@ class PackingListApp(QMainWindow):
         if results:
             self.scan_results_label.setText(
                 f"Found {len(results)} matching email result(s). "
-                "Select a row to reply or download its attachments."
+                "Right Click a row to reply or download its attachments."
+                "Double Click a row to Open Email in Outlook"
             )
             self.status_label.setText(f"{len(results)} matching email(s).")
         else:
@@ -4406,6 +4424,46 @@ class PackingListApp(QMainWindow):
             ritm_item = self.email_table.item(item.row(), 0)
             if ritm_item:
                 self._show_reels_for_ritm(ritm_item.text())
+
+    def _on_email_double_clicked(self, item: QTableWidgetItem) -> None:
+        """Double-click any column to open email in Outlook."""
+        row = item.row()
+        ritm_item = self.email_table.item(row, 0)
+        if not ritm_item:
+            return
+        key = ritm_item.data(Qt.ItemDataRole.UserRole)
+        if not key:
+            return
+        
+        # Try search results first
+        result = self.email_search_results_by_key.get(key)
+        if result and result.get("entry_id"):
+            self._open_outlook_message(result["entry_id"], result.get("store_id", ""))
+            return
+        
+        # Try matched emails
+        email = self.matched_emails_by_key.get(key)
+        if email and email.entry_id:
+            self._open_outlook_message(email.entry_id, email.store_id)
+
+    def _open_outlook_message(self, entry_id: str, store_id: str = "") -> None:
+        """Open email in Outlook by EntryID."""
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            namespace = outlook.GetNamespace("MAPI")
+            message = None
+            if store_id:
+                try:
+                    message = namespace.GetItemFromID(entry_id, store_id)
+                except Exception:
+                    pass
+            if message is None:
+                message = namespace.GetItemFromID(entry_id)
+            if message:
+                message.Display()
+        except Exception as e:
+            _APP_LOGGER.exception("Failed to open email in Outlook")
+            QMessageBox.warning(self, "Could not open email", str(e))
 
     def _show_reels_for_ritm(self, ritm: str) -> None:
         """Find reel items for a RITM and show popup."""
@@ -5072,12 +5130,24 @@ class PackingListApp(QMainWindow):
         for widget in (
             self.search_input_data_button,
             self.search_button,
+            self.sync_button,              # Added
             self.next_load_button,
-            self.recall_data_button,
+            self.recall_input_button,      # ✅ Fixed
+            self.recall_export_button,     # ✅ Fixed
             self.scan_button,
             self.export_folder_button,
+            self.database_button,          # Added
+            self.view_database_button,     # Added
+            self.range_selector,           # Added
+            self.ignore_db_checkbox,       # Added
+            self.repeat_load_checkbox,     # Added
+            self.search_mode_combo,        # Added
+            self.search_ritm_edit,         # Added
+            self.search_addr_edit,         # Added
+            self.search_reel_edit,         # Added
         ):
-            widget.setEnabled(enabled)
+            if widget is not None:
+                widget.setEnabled(enabled)
 
     # ------------------------------------------------------------------
     # Email merge / reply
@@ -5137,7 +5207,7 @@ class PackingListApp(QMainWindow):
                     and (record["ritm"] or "").casefold()
                     == email.ritm.casefold()
                 ),
-                "",
+                email.location_address or email.location or "",
             )
             values = (
                 email.ritm, location_address, "Reels",  # Column 2 always says "Reels"
@@ -5168,6 +5238,21 @@ class PackingListApp(QMainWindow):
                                     "net": item.get("net", 0),
                                 })
                             break
+                    
+                    # Fallback: use email's item_terms if no staged records found
+                    if not reel_items and email.item_terms:
+                        for term in email.item_terms:
+                            reel_items.append({
+                                "item_id": term,
+                                "asset_class": "",
+                                "job_type": "",
+                                "equipment_type": "",
+                                "quantity": 1,
+                                "description": term,
+                                "gross": 0,
+                                "tare": 0,
+                                "net": 0,
+                            })
                     if reel_items:
                         item.setForeground(Qt.GlobalColor.blue)
                         font = item.font()
@@ -5278,12 +5363,8 @@ class PackingListApp(QMainWindow):
     def _start_scan(self) -> None:
         if self.scan_worker is not None and self.scan_worker.isRunning():
             return
-        record = self.pending_record
+        record = self._build_current_record()
         if record is None:
-            QMessageBox.information(
-                self, "No packing list loaded",
-                "Click Input Data to enter a packing list before scanning.",
-            )
             return
         search_terms = list(dict.fromkeys(
             item["description"] for item in record["items"]
@@ -5295,6 +5376,16 @@ class PackingListApp(QMainWindow):
                 "Enter at least one item description to scan.",
             )
             return
+        _APP_LOGGER.info(
+            "Outlook scan requested: packing_list=%s date=%s item_count=%d "
+            "time_range=%s database_ignored=%s",
+            record.get("packing_list", ""),
+            record.get("date", ""),
+            len(record.get("items") or []),
+            self.range_selector.currentData(),
+            self.ignore_db_checkbox.isChecked(),
+        )
+        self.pending_record = record
         self._set_processing_state(False)
         self.status_label.setText(
             f"Searching Outlook for {len(search_terms)} item description(s)..."
@@ -5304,6 +5395,7 @@ class PackingListApp(QMainWindow):
         self.scan_worker.scan_complete.connect(self._scan_finished)
         self.scan_worker.scan_failed.connect(self._scan_failed)
         self.scan_worker.start()
+
 
     def _confirm_near_matches(
         self, near_matches: list[NearMatch],
@@ -5646,18 +5738,9 @@ class PackingListApp(QMainWindow):
         self._merge_matched_emails(
             subject_matches, ritm_letters, record["packing_list"],
         )
-        self.scan_results_label.setText(
-            f"Packing list IDs: {', '.join(queued_packing_lists)}\n"
-            f"Exact item matches across {matched_email_count} email(s):\n"
-            f"{chr(10).join(exact_summary)}\n"
-            + (
-                f"Skipped {len(skipped_item_indexes)} item(s).\n"
-                if skipped_item_indexes else ""
-            )
-            + f"Accepted near-match attachments: {total_accepted_files}."
-        )
+        self.scan_results_label.setText("Finished Scanning")
         self.status_label.setText(
-            f"Processed packing list IDs {', '.join(queued_packing_lists)}."
+            f"Processed {len(queued_packing_lists)} packing list(s)."
         )
 
     def _commit_dialog_state(
