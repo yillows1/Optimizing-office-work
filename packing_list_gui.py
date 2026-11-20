@@ -872,6 +872,12 @@ class NearMatch:
     subject: str
     received: str
     subject_ritms: list[str]
+    sender: str = ""
+    sender_email: str = ""
+    entry_id: str = ""
+    store_id: str = ""
+    location: str = ""
+    item_context: str = ""
 
 
 @dataclass(frozen=True)
@@ -889,6 +895,8 @@ class ExactMatch:
     subject_ritms: list[str]
     location: str
     location_address: str
+    is_near_match: bool = False
+    attachment_item_id: str = ""
 
 
 @dataclass
@@ -908,6 +916,7 @@ class MatchedEmail:
     location_address: str = ""
     attachments: set[str] = field(default_factory=set)
     item_terms: set[str] = field(default_factory=set)
+    attachment_item_ids: dict[str, set[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -1711,11 +1720,16 @@ class NearMatchConfirmDialog(QDialog):
         layout.addWidget(theirs)
         detail = QLabel(
             f"Similarity: {candidate.similarity:.0%}\n"
+            f"RITM(s): {', '.join(candidate.subject_ritms) or '(none)'}\n"
+            f"From: {candidate.sender} <{candidate.sender_email}>\n"
+            f"Location: {candidate.location or '(not in email database)'}\n"
+            f"Matched item details:\n{candidate.item_context or '(none)'}\n"
             f"File: {candidate.folder} / {candidate.filename}\n"
             f"Email: {candidate.subject}\n"
             f"Received: {candidate.received}"
         )
         detail.setStyleSheet("color: #53645e; padding-top: 6px;")
+        detail.setWordWrap(True)
         layout.addWidget(detail)
         layout.addWidget(QLabel("\nAre these the same item?"))
         buttons = QDialogButtonBox()
@@ -3240,29 +3254,123 @@ class ScannerWorker(QThread):
         try:
             import improvedScanner
             rows = improvedScanner.fetch_delivery_emails(db_path=email_db_path())
-            exact_matches = [
-                ExactMatch(
-                    term=row["term"],
-                    filename=row["filename"],
-                    folder=row["folder"],
-                    subject=row["subject"],
-                    received=row["received"],
-                    sender=row["sender"],
-                    sender_email=row["sender_email"],
-                    entry_id=row["entry_id"],
-                    store_id=row["store_id"],
-                    ritms=row["ritms"],
-                    subject_ritms=row["subject_ritms"],
-                    location=row["location"],
-                    location_address=row["location_address"],
-                )
-                for row in rows
-            ]
+            normalized_terms = {
+                re.sub(r"[^a-z0-9]", "", term.casefold()): term
+                for term in self.search_terms
+                if term.strip()
+            }
+            range_days = {"1": 90, "2": 180, "3": 365}.get(self.time_range)
+            cutoff = datetime.now() - timedelta(days=range_days) if range_days else None
+            exact_matches: list[ExactMatch] = []
+            near_by_key: dict[tuple[str, str, str, str], NearMatch] = {}
+            for row in rows:
+                if cutoff is not None:
+                    try:
+                        received_dt = datetime.fromisoformat(row["received"])
+                        if received_dt.replace(tzinfo=None) < cutoff:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+
+                email_items = row.get("items") or []
+                item_ids = [
+                    (item, str(item.get("item_id") or item.get("description") or ""))
+                    for item in email_items
+                ]
+                for term_key, term in normalized_terms.items():
+                    if not term_key:
+                        continue
+                    exact_items = [
+                        (item, item_id)
+                        for item, item_id in item_ids
+                        if re.sub(r"[^a-z0-9]", "", item_id.casefold()) == term_key
+                    ]
+                    if exact_items:
+                        for _item, _item_id in exact_items:
+                            exact_matches.append(ExactMatch(
+                                term=term,
+                                filename=row["filename"],
+                                folder=row["folder"],
+                                subject=row["subject"],
+                                received=row["received"],
+                                sender=row["sender"],
+                                sender_email=row["sender_email"],
+                                entry_id=row["entry_id"],
+                                store_id=row["store_id"],
+                                ritms=row["ritms"],
+                                subject_ritms=row["subject_ritms"],
+                                location=row["location"],
+                                location_address=row["location_address"],
+                                attachment_item_id=_item_id,
+                            ))
+                        continue
+
+                    if len(term_key) < 6:
+                        continue
+                    best = None
+                    for item, item_id in item_ids:
+                        guess_key = re.sub(r"[^a-z0-9]", "", item_id.casefold())
+                        if not guess_key:
+                            continue
+                        similarity = SequenceMatcher(None, term_key, guess_key).ratio()
+                        if similarity >= 0.85 and (
+                            best is None or similarity > best[0]
+                        ):
+                            best = (similarity, item, item_id)
+                    if best is None:
+                        continue
+
+                    similarity, item, item_id = best
+                    item_details = [f"Item ID: {item_id}"]
+                    item_type = item.get("type") or item.get("asset_class") or ""
+                    if item_type:
+                        item_details.append(f"Material / type: {item_type}")
+                    description = (
+                        item.get("item_description") or item.get("description") or ""
+                    )
+                    if description and description != item_id:
+                        item_details.append(f"Description: {description}")
+                    item_details.append(
+                        "Quantity: "
+                        f"{item.get('quantity') or 1}; Gross: {item.get('gross') or 0}; "
+                        f"Tare: {item.get('tare') or 0}; Net: {item.get('net') or 0}"
+                    )
+                    candidate = NearMatch(
+                        term=term,
+                        guess=item_id,
+                        similarity=similarity,
+                        filename=row["filename"],
+                        folder=row["folder"],
+                        subject=row["subject"],
+                        received=row["received"],
+                        subject_ritms=row["subject_ritms"],
+                        sender=row["sender"],
+                        sender_email=row["sender_email"],
+                        entry_id=row["entry_id"],
+                        store_id=row["store_id"],
+                        location=row["location"],
+                        item_context="\n".join(item_details),
+                    )
+                    source_key = row["entry_id"] or (
+                        f"{row['subject']}|{row['received']}"
+                    )
+                    key = (
+                        term_key, row["folder"].casefold(),
+                        row["filename"].casefold(), source_key,
+                    )
+                    previous = near_by_key.get(key)
+                    if previous is None or candidate.similarity > previous.similarity:
+                        near_by_key[key] = candidate
+
             exact_matches.sort(key=lambda m: (
                 m.received, m.folder.casefold(), m.subject.casefold(),
                 m.filename.casefold(), m.term.casefold(),
             ))
-            self.scan_complete.emit(ScanResults(exact_matches, []))
+            near_matches = sorted(near_by_key.values(), key=lambda m: (
+                m.received, m.folder.casefold(), m.subject.casefold(),
+                m.filename.casefold(), m.term.casefold(), -m.similarity,
+            ))
+            self.scan_complete.emit(ScanResults(exact_matches, near_matches))
         except Exception as error:
             _APP_LOGGER.exception("Email DB scan worker failed.")
             self.scan_failed.emit(str(error))
@@ -3918,29 +4026,37 @@ class PackingListApp(QMainWindow):
         return None
 
     def _next_load(self) -> None:
-        if self.last_form is None and self.pending_record is None:
-            QMessageBox.information(
-                self, "Nothing to clear",
-                "There is no saved form or pending load to wipe.",
-            )
-            return
         answer = QMessageBox.question(
             self,
-            "Next Load?",
-            "This clears the saved form and any pending (unscanned) load.\n\n"
-            "It does NOT clear the queue table or the email history.\n\n"
-            # "(Basically the same as restarting the application)"
-            "Continue?",
+            "Reset current work?",
+            "This clears the visible queue, email results, search fields, and "
+            "current input form. Saved database records and application "
+            "settings will not be deleted.\n\nContinue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+
         self.last_form = None
         self.pending_record = None
-        self.status_label.setText(
-            "Cleared. Open Input Data to start the next load."
+        self.records.clear()
+        self.exported_record_ids_by_directory.clear()
+        self.groups.clear()
+        self.matched_emails_by_key.clear()
+        self.email_search_results_by_key.clear()
+        self.visible_email_matches.clear()
+        self.record_source_matches.clear()
+        self.table.setRowCount(0)
+        self.email_table.setRowCount(0)
+        self.search_ritm_edit.clear()
+        self.search_addr_edit.clear()
+        self.search_reel_edit.clear()
+        self.scan_results_label.setText(
+            "Matching emails and attachments will appear here."
         )
+        self.status_label.setText("Ready for the next load.")
+        self._update_reply_button()
     def _recall_input_data(self) -> None:
         """Recall from Input Database (manual DB)."""
         self._recall_data_generic(
@@ -4163,7 +4279,7 @@ class PackingListApp(QMainWindow):
         load_btn.setEnabled(False)
         from functools import partial
         load_btn.clicked.connect(
-            partial(self._recall_load_into_input, selected_pl, dialog)
+            partial(self._recall_load_into_input, selected_pl, dialog, db_connect_func)
         )
         footer.addWidget(load_btn)
         close_btn = QPushButton("Close")
@@ -4179,13 +4295,13 @@ class PackingListApp(QMainWindow):
 
 
     def _recall_load_into_input(
-        self, selected_pl: dict, dialog: QDialog,
+        self, selected_pl: dict, dialog: QDialog, db_connect_func,
     ) -> None:
         packing_list_number = selected_pl.get("number", "")
         if not packing_list_number:
             return
         try:
-            conn = manual_db_connect()
+            conn = db_connect_func()
             try:
                 master = conn.execute(
                     "SELECT Receiving_Date, Truck, Truck_Number "
@@ -4231,6 +4347,7 @@ class PackingListApp(QMainWindow):
             "items": items,
             "_received_from": DEFAULT_RECEIVED_FROM,
         }
+        self.pending_record = None
         _APP_LOGGER.info(
             "Recall Data loaded into form: packing_list=%s item_count=%d",
             packing_list_number, len(items),
@@ -4404,8 +4521,6 @@ class PackingListApp(QMainWindow):
     def _update_reply_button(self) -> None:
         """Kept for compatibility but buttons removed — context menu used instead."""
         pass
-
-    @staticmethod
 
     # ============================================================
     # EMAIL TABLE INTERACTIONS — Complete Working Implementation
@@ -4632,11 +4747,18 @@ class PackingListApp(QMainWindow):
         header.setStyleSheet("font-size: 12pt; font-weight: bold; color: #20332e;")
         layout.addWidget(header)
 
-        # Table with reel details - 3 columns only
+        has_attachment_ids = any(
+            item.get("attachment_item_id") for item in items
+        )
         table = QTableWidget(len(items), 3)
-        table.setHorizontalHeaderLabels([
-            "Serial / Item ID", "Type", "Description"
-        ])
+        if has_attachment_ids:
+            table.setHorizontalHeaderLabels([
+                "Reel ID entered", "Type", "Reel ID from attachment"
+            ])
+        else:
+            table.setHorizontalHeaderLabels([
+                "Serial / Item ID", "Type", "Description"
+            ])
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -4658,7 +4780,10 @@ class PackingListApp(QMainWindow):
         for row, item in enumerate(items):
             serial = item.get("item_id") or item.get("description") or "—"
             asset_class = item.get("asset_class") or item.get("equipment_type") or "—"
-            desc = item.get("description") or ""
+            desc = (
+                item.get("attachment_item_id", "")
+                if has_attachment_ids else item.get("description") or ""
+            )
             
             values = (serial, asset_class, desc)
             for col, val in enumerate(values):
@@ -5178,10 +5303,28 @@ class PackingListApp(QMainWindow):
                         store_id=match.store_id, sender=match.sender,
                         sender_email=match.sender_email, subject=match.subject,
                         received=match.received, folder=match.folder,
+                        location=match.location,
+                        location_address=match.location_address,
                     )
                     self.matched_emails_by_key[email_key] = email
+                else:
+                    email.entry_id = match.entry_id or email.entry_id
+                    email.store_id = match.store_id or email.store_id
+                    email.sender = match.sender or email.sender
+                    email.sender_email = match.sender_email or email.sender_email
+                    email.subject = match.subject or email.subject
+                    email.received = match.received or email.received
+                    email.folder = match.folder or email.folder
+                    email.location = match.location or email.location
+                    email.location_address = (
+                        match.location_address or email.location_address
+                    )
                 email.attachments.add(match.filename)
                 email.item_terms.add(match.term)
+                if match.attachment_item_id:
+                    email.attachment_item_ids.setdefault(
+                        match.term.casefold(), set()
+                    ).add(match.attachment_item_id)
         self.visible_email_matches = sorted(
             self.matched_emails_by_key.values(),
             key=lambda email: (
@@ -5210,7 +5353,8 @@ class PackingListApp(QMainWindow):
                 email.location_address or email.location or "",
             )
             values = (
-                email.ritm, location_address, "Reels",  # Column 2 always says "Reels"
+                email.ritm, location_address,
+                ", ".join(sorted(email.item_terms)),
                 sender, email.subject, email.received, email.folder,
                 ", ".join(sorted(email.attachments)),
             )
@@ -5225,17 +5369,23 @@ class PackingListApp(QMainWindow):
                     for record in self.records:
                         if (record["packing_list"].casefold() == email.packing_list.casefold() and
                             (record["ritm"] or "").casefold() == email.ritm.casefold()):
-                            for item in record.get("items", []):
+                            for record_item in record.get("items", []):
+                                input_item_id = record_item.get("description", "")
                                 reel_items.append({
-                                    "item_id": item.get("description", ""),
-                                    "asset_class": item.get("type", ""),
+                                    "item_id": input_item_id,
+                                    "attachment_item_id": ", ".join(sorted(
+                                        email.attachment_item_ids.get(
+                                            input_item_id.casefold(), set()
+                                        )
+                                    )),
+                                    "asset_class": record_item.get("type", ""),
                                     "job_type": "",
-                                    "equipment_type": item.get("type", ""),
+                                    "equipment_type": record_item.get("type", ""),
                                     "quantity": 1,
-                                    "description": item.get("description", ""),
-                                    "gross": item.get("gross", 0),
-                                    "tare": item.get("tare", 0),
-                                    "net": item.get("net", 0),
+                                    "description": record_item.get("description", ""),
+                                    "gross": record_item.get("gross", 0),
+                                    "tare": record_item.get("tare", 0),
+                                    "net": record_item.get("net", 0),
                                 })
                             break
                     
@@ -5244,6 +5394,11 @@ class PackingListApp(QMainWindow):
                         for term in email.item_terms:
                             reel_items.append({
                                 "item_id": term,
+                                "attachment_item_id": ", ".join(sorted(
+                                    email.attachment_item_ids.get(
+                                        term.casefold(), set()
+                                    )
+                                )),
                                 "asset_class": "",
                                 "job_type": "",
                                 "equipment_type": "",
@@ -5259,7 +5414,8 @@ class PackingListApp(QMainWindow):
                         font.setUnderline(True)
                         item.setFont(font)
                         item.setToolTip(
-                            f"Click to view reels\n\n{self._build_reel_preview_text(reel_items)}"
+                            f"Click to view reels\n\n"
+                            f"{self._build_reel_preview_text(reel_items)}"
                         )
                         item.setData(Qt.ItemDataRole.UserRole + 1, reel_items)
                         item.setData(Qt.ItemDataRole.UserRole + 2, email.ritm)
@@ -5399,16 +5555,12 @@ class PackingListApp(QMainWindow):
 
     def _confirm_near_matches(
         self, near_matches: list[NearMatch],
-    ) -> set[tuple[str, str, str]]:
-        accepted: set[tuple[str, str, str]] = set()
-        seen: set[tuple[str, str, str]] = set()
+    ) -> set[tuple[str, str, str, str]]:
+        accepted: set[tuple[str, str, str, str]] = set()
+        seen: set[tuple[str, str, str, str]] = set()
         candidates: list[NearMatch] = []
         for candidate in near_matches:
-            key = (
-                candidate.term.casefold(),
-                candidate.folder.casefold(),
-                candidate.filename.casefold(),
-            )
+            key = self._near_match_key(candidate)
             if key in seen:
                 continue
             seen.add(key)
@@ -5420,12 +5572,18 @@ class PackingListApp(QMainWindow):
             dialog = NearMatchConfirmDialog(self, candidate, index, total)
             dialog.exec()
             if dialog.accepted:
-                accepted.add((
-                    candidate.term.casefold(),
-                    candidate.folder.casefold(),
-                    candidate.filename.casefold(),
-                ))
+                accepted.add(self._near_match_key(candidate))
         return accepted
+
+    @staticmethod
+    def _near_match_key(candidate: NearMatch) -> tuple[str, str, str, str]:
+        source_key = candidate.entry_id or (
+            f"{candidate.subject}|{candidate.received}"
+        )
+        return (
+            candidate.term.casefold(), candidate.folder.casefold(),
+            candidate.filename.casefold(), source_key,
+        )
 
     @staticmethod
     def _parse_received(text: str) -> datetime:
@@ -5502,7 +5660,36 @@ class PackingListApp(QMainWindow):
             for item in record_items
             if item.get("description", "").strip()
         ))
-        subject_matches = [match for match in results.exact_matches if match.subject_ritms]
+        subject_matches = [
+            match for match in results.exact_matches if match.subject_ritms
+        ]
+        accepted_near_keys = self._confirm_near_matches(results.near_matches)
+        accepted_near_matches = [
+            candidate for candidate in results.near_matches
+            if self._near_match_key(candidate) in accepted_near_keys
+        ]
+        subject_matches.extend(
+            ExactMatch(
+                term=candidate.term,
+                filename=candidate.filename,
+                folder=candidate.folder,
+                subject=candidate.subject,
+                received=candidate.received,
+                sender=candidate.sender,
+                sender_email=candidate.sender_email,
+                entry_id=candidate.entry_id,
+                store_id=candidate.store_id,
+                ritms=candidate.subject_ritms,
+                subject_ritms=candidate.subject_ritms,
+                location=candidate.location,
+                location_address=candidate.location,
+                is_near_match=True,
+                attachment_item_id=candidate.guess,
+            )
+            for candidate in accepted_near_matches
+            if candidate.subject_ritms
+        )
+        email_display_matches = list(subject_matches)
         if not subject_matches:
             dialog = AddressBatchDialog(
                 self, record_items, [], record,
@@ -5520,7 +5707,6 @@ class PackingListApp(QMainWindow):
             self._set_processing_state(True)
             return
 
-        accepted_near_keys = self._confirm_near_matches(results.near_matches)
         subject_matches, skipped_ritms = self._resolve_resent_emails(subject_matches)
         if not subject_matches:
             self.pending_record = None
@@ -5538,6 +5724,7 @@ class PackingListApp(QMainWindow):
         exact_summary = sorted({
             f"{match.term}: {match.folder} / {match.filename}"
             for match in subject_matches
+            if not match.is_near_match
         })
         item_ritm_candidates: dict[int, set[str]] = {}
         found_ritms_by_key = {ritm.casefold(): ritm for ritm in found_ritms}
@@ -5553,11 +5740,7 @@ class PackingListApp(QMainWindow):
                 ritm
                 for candidate in results.near_matches
                 if candidate.term.casefold() == description_key
-                and (
-                    candidate.term.casefold(),
-                    candidate.folder.casefold(),
-                    candidate.filename.casefold(),
-                ) in accepted_near_keys
+                and self._near_match_key(candidate) in accepted_near_keys
                 for ritm in candidate.subject_ritms
             )
             item_ritm_candidates[index] = {
@@ -5640,15 +5823,14 @@ class PackingListApp(QMainWindow):
             if not ritm_matches:
                 continue
             current_matched_terms = {match.term.casefold() for match in ritm_matches}
-            exact_files = {f"{match.folder} / {match.filename}" for match in ritm_matches}
+            exact_files = {
+                f"{match.folder} / {match.filename}"
+                for match in ritm_matches if not match.is_near_match
+            }
             accepted_files: set[str] = set()
             accepted_terms = set()
             for candidate in results.near_matches:
-                candidate_key = (
-                    candidate.term.casefold(),
-                    candidate.folder.casefold(),
-                    candidate.filename.casefold(),
-                )
+                candidate_key = self._near_match_key(candidate)
                 if candidate_key not in accepted_near_keys:
                     continue
                 if ritm not in candidate.subject_ritms:
@@ -5736,7 +5918,15 @@ class PackingListApp(QMainWindow):
                 if not _is_no_request_item(r.get("ritm")):
                     ritm_letters[r["ritm"].casefold()] = r["letter"]
         self._merge_matched_emails(
-            subject_matches, ritm_letters, record["packing_list"],
+            [
+                match for match in email_display_matches
+                if not any(
+                    ritm.casefold() in skipped_ritms
+                    for ritm in match.subject_ritms
+                )
+            ],
+            ritm_letters,
+            record["packing_list"],
         )
         self.scan_results_label.setText("Finished Scanning")
         self.status_label.setText(

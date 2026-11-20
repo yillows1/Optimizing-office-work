@@ -795,9 +795,7 @@ def fetch_delivery_emails(
 
         rows = conn.execute(sql, params).fetchall()
 
-        items_by_ritm = _load_items_for_ritms(
-            conn, [row[10] for row in rows if row[10]]
-        )
+        items_by_email_ritm = _load_items_for_email_ritms(conn)
 
         out: list[dict] = []
         for row in rows:
@@ -823,30 +821,29 @@ def fetch_delivery_emails(
                 "location_address": address or "",
                 "type": type_value or "",
                 "status": status_value or "",
-                "items": items_by_ritm.get(ritm or "", []),
+                "items": items_by_email_ritm.get((email_id, ritm or ""), []),
             })
         return out
     finally:
         conn.close()
 
 
-def _load_items_for_ritms(conn, ritms: list[str]) -> dict[str, list[dict]]:
-    if not ritms:
-        return {}
-    placeholders = ",".join("?" * len(ritms))
+def _load_items_for_email_ritms(conn) -> dict[tuple[int, str], list[dict]]:
     rows = conn.execute(
-        f"SELECT Ritm, Item_ID, Receiving_Date, Asset_Class, Job_Type, "
-        f"       Equipment_Type, Quantity, Description, Gross, Tare, Net "
-        f"FROM Email_Item WHERE Ritm IN ({placeholders})",
-        ritms,
+        "SELECT r.Email_ID, i.Ritm, i.Item_ID, i.Receiving_Date, "
+        "       i.Asset_Class, i.Job_Type, i.Equipment_Type, i.Quantity, "
+        "       i.Description, i.Gross, i.Tare, i.Net "
+        "FROM Email_Item i "
+        "JOIN Email_Ritm r ON r.Email_Ritm_ID = i.Email_Ritm_ID"
     ).fetchall()
-    out: dict[str, list[dict]] = {}
+    out: dict[tuple[int, str], list[dict]] = {}
     for (
-        ritm, item_id, received, asset_class, job_type,
+        email_id, ritm, item_id, received, asset_class, job_type,
         equipment_type, quantity, description, gross, tare, net,
     ) in rows:
-        out.setdefault(ritm, []).append({
+        out.setdefault((email_id, ritm), []).append({
             "description": item_id,
+            "item_description": description or "",
             "type": asset_class or equipment_type or "",
             "gross": gross or 0,
             "tare": tare or 0,
